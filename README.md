@@ -9,7 +9,7 @@ Built as a daily driver — the feature set is what I actually reach for, nothin
 Requires Rust (stable, 2024 edition or newer).
 
 ```sh
-git clone https://github.com/<you>/sacrament
+git clone https://github.com/tboddy/sacrament
 cd sacrament
 cargo install --path .
 ```
