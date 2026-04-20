@@ -975,6 +975,7 @@ pub struct Editor {
     fs_rx: mpsc::Receiver<PathBuf>,
     watched_paths: HashSet<PathBuf>,
     last_click: Option<LastClick>,
+    tabs_scroll: usize,
 }
 
 impl Editor {
@@ -1018,6 +1019,7 @@ impl Editor {
             fs_rx,
             watched_paths: HashSet::new(),
             last_click: None,
+            tabs_scroll: 0,
         }
     }
 
@@ -1411,7 +1413,7 @@ impl Editor {
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if point_in(ev.column, ev.row, tab_area) {
-                    if let Some(idx) = self.tab_at_column(ev.column, tab_area) {
+                    if let Some(idx) = self.tab_at_row(ev.row, tab_area) {
                         self.switch_to(idx);
                     }
                 } else if layout.gutter.width > 0 && point_in(ev.column, ev.row, layout.gutter) {
@@ -1456,6 +1458,16 @@ impl Editor {
                     b.reset_coalesce();
                 }
             }
+            MouseEventKind::ScrollUp if point_in(ev.column, ev.row, tab_area) => {
+                self.tabs_scroll = self.tabs_scroll.saturating_sub(1);
+            }
+            MouseEventKind::ScrollDown if point_in(ev.column, ev.row, tab_area) => {
+                let h = tab_area.height as usize;
+                let max = self.buffers.len().saturating_sub(h);
+                if self.tabs_scroll < max {
+                    self.tabs_scroll += 1;
+                }
+            }
             MouseEventKind::ScrollUp => {
                 let b = self.active_mut();
                 if let Some(r) = b.prev_visible_row(b.cursor_row) {
@@ -1486,17 +1498,13 @@ impl Editor {
         (doc_row, doc_col)
     }
 
-    fn tab_at_column(&self, column: u16, tab_area: Rect) -> Option<usize> {
-        let mut x = tab_area.x as usize;
-        for (i, buf) in self.buffers.iter().enumerate() {
-            let w = self.tab_width(i, buf);
-            let hit = column as usize;
-            if hit >= x && hit < x + w {
-                return Some(i);
-            }
-            x += w;
+    fn tab_at_row(&self, row: u16, tab_area: Rect) -> Option<usize> {
+        if row < tab_area.y || row >= tab_area.y + tab_area.height {
+            return None;
         }
-        None
+        let screen_row = (row - tab_area.y) as usize;
+        let idx = self.tabs_scroll + screen_row;
+        (idx < self.buffers.len()).then_some(idx)
     }
 
     fn switch_to(&mut self, idx: usize) {
@@ -1769,23 +1777,29 @@ impl Editor {
         let area = frame.area();
         let show_bottom = matches!(self.mode, Mode::Prompt(_)) || !self.status.is_empty();
 
-        let (tab_area, body, bottom) = if show_bottom {
+        let (upper, bottom) = if show_bottom {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(1),
-                    Constraint::Length(1),
-                ])
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
                 .split(area);
-            (chunks[0], chunks[1], Some(chunks[2]))
+            (chunks[0], Some(chunks[1]))
         } else {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(1)])
-                .split(area);
-            (chunks[0], chunks[1], None)
+            (area, None)
         };
+
+        self.ensure_active_tab_visible(upper.height);
+        let tab_col_w = self.tab_column_width();
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(tab_col_w),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(upper);
+        let tab_area = h_chunks[0];
+        let sep_area = h_chunks[1];
+        let body = h_chunks[2];
 
         let gw = self.gutter_width();
         let gutter = Rect::new(body.x, body.y, gw.min(body.width), body.height);
@@ -1801,6 +1815,7 @@ impl Editor {
             .adjust_scroll(text_area.height as usize, text_area.width as usize, tw);
 
         self.render_tab_bar(frame, tab_area);
+        self.render_tab_separator(frame, sep_area);
         if gw > 0 {
             self.render_gutter(frame, gutter);
         }
@@ -1881,57 +1896,91 @@ impl Editor {
         (digits + 4) as u16
     }
 
-    fn tab_inner(&self, _i: usize, buf: &Buffer) -> String {
-        let name = buf.display_name();
-        if buf.dirty {
-            format!(" {} • ", name)
-        } else {
-            format!(" {} ", name)
-        }
+    fn tab_column_width(&self) -> u16 {
+        let widest = self
+            .buffers
+            .iter()
+            .map(tab_label_inner_width)
+            .max()
+            .unwrap_or(1);
+        // +1 trailing pad so the bullet doesn't kiss the separator.
+        ((widest + 1) as u16).min(TAB_COL_MAX).max(1)
     }
 
-    fn tab_width(&self, i: usize, buf: &Buffer) -> usize {
-        self.tab_inner(i, buf).chars().count() + 2
+    fn ensure_active_tab_visible(&mut self, height: u16) {
+        let h = height as usize;
+        if h == 0 {
+            return;
+        }
+        if self.active < self.tabs_scroll {
+            self.tabs_scroll = self.active;
+        } else if self.active >= self.tabs_scroll + h {
+            self.tabs_scroll = self.active + 1 - h;
+        }
+        let max_scroll = self.buffers.len().saturating_sub(h);
+        if self.tabs_scroll > max_scroll {
+            self.tabs_scroll = max_scroll;
+        }
     }
 
     fn render_tab_bar(&self, frame: &mut Frame, area: Rect) {
-        let mut top = String::new();
-        let mut mid: Vec<Span> = Vec::new();
-        let mut bot = String::new();
-        for (i, buf) in self.buffers.iter().enumerate() {
-            let name = buf.display_name();
-            let name_len = name.chars().count();
-            let inner_len = if buf.dirty { name_len + 4 } else { name_len + 2 };
+        let n = self.buffers.len();
+        let height = area.height as usize;
+        let col_w = area.width as usize;
+        let scroll = self.tabs_scroll;
+        let max_shown = height.min(n.saturating_sub(scroll));
+
+        let mut lines: Vec<Line> = Vec::with_capacity(height);
+        for row in 0..max_shown {
+            let i = scroll + row;
+            let buf = &self.buffers[i];
             let active = i == self.active;
-            if active {
-                top.push('┌');
-                top.extend(std::iter::repeat('─').take(inner_len));
-                top.push('┐');
-                mid.push(Span::raw("│"));
-                bot.push('└');
-                bot.extend(std::iter::repeat('─').take(inner_len));
-                bot.push('┘');
+
+            // Reserve: leading space + name + at-least-1 gap + bullet slot + trailing pad.
+            let name_budget = col_w.saturating_sub(4).max(1);
+            let name = truncate_with_ellipsis(&buf.display_name(), name_budget);
+            let name_len = name.chars().count();
+
+            let name_style = if active {
+                Style::default().fg(Color::White)
             } else {
-                top.extend(std::iter::repeat(' ').take(inner_len + 2));
-                mid.push(Span::raw(" "));
-                bot.extend(std::iter::repeat(' ').take(inner_len + 2));
+                Style::default().fg(Color::Gray)
+            };
+
+            let mut spans: Vec<Span> = Vec::new();
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(name, name_style));
+            // Pad so the bullet slot lands at col_w - 2 (trailing space at col_w - 1).
+            let before_bullet = 1 + name_len;
+            let bullet_col = col_w.saturating_sub(2);
+            if before_bullet < bullet_col {
+                spans.push(Span::raw(" ".repeat(bullet_col - before_bullet)));
             }
-            mid.push(Span::raw(format!(" {}", name)));
             if buf.dirty {
-                mid.push(Span::raw(" "));
-                mid.push(Span::styled(
+                spans.push(Span::styled(
                     "•",
                     Style::default().fg(Color::LightYellow),
                 ));
-            }
-            mid.push(Span::raw(" "));
-            if active {
-                mid.push(Span::raw("│"));
             } else {
-                mid.push(Span::raw(" "));
+                spans.push(Span::raw(" "));
             }
+            spans.push(Span::raw(" "));
+            lines.push(Line::from(spans));
         }
-        let lines = vec![Line::from(top), Line::from(mid), Line::from(bot)];
+        while lines.len() < height {
+            lines.push(Line::from(" ".repeat(col_w)));
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn render_tab_separator(&self, frame: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let style = Style::default().fg(Color::DarkGray);
+        let lines: Vec<Line> = (0..area.height)
+            .map(|_| Line::from(Span::styled("│", style)))
+            .collect();
         frame.render_widget(Paragraph::new(lines), area);
     }
 
@@ -2071,6 +2120,25 @@ fn compute_fold_end(text: &[String], row: usize, tab_width: usize) -> Option<usi
 
 fn read_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
+}
+
+const TAB_COL_MAX: u16 = 30;
+
+fn tab_label_inner_width(buf: &Buffer) -> usize {
+    // Leading space + name + at-least-one gap + bullet slot (rightmost col).
+    1 + buf.display_name().chars().count() + 2
+}
+
+fn truncate_with_ellipsis(s: &str, budget: usize) -> String {
+    if s.chars().count() <= budget {
+        return s.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(budget - 1).collect();
+    out.push('…');
+    out
 }
 
 fn digits_in(n: usize) -> usize {

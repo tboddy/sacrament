@@ -43,9 +43,9 @@ In `handle_key_normal` / `handle_key_prompt` the `ctrl` flag is `CONTROL || SUPE
 
 - **Undo/redo** stores full `Snapshot`s (text + cursor + dirty + folds). Consecutive character inserts coalesce into one step via `last_edit: Option<EditKind>`. `MAX_UNDO = 500`.
 - **File watching** uses `notify` with one watcher shared across buffers. `reload_if_changed` compares mtime and skips reloads for the buffer's own saves by tracking `known_mtime`.
-- **Tab rendering** uses three rows of box-drawing chars (`┌─┐ │ └─┘`) for the active tab; inactive tabs are spaces. `tab_inner` / `tab_width` are shared between rendering and mouse hit-testing so they can't drift. Dirty marker is a `•` in light yellow after the tab name.
+- **Tab rendering** is a vertical column on the left, one row per tab. Active tab is white text, inactive tabs are `Color::DarkGray` (same tone as comments). Column width = widest label + 1 pad, capped at `TAB_COL_MAX` (30 cols); longer names truncate with `…` via `truncate_with_ellipsis`. Dirty marker is a `•` in light yellow after the tab name. Active tab auto-scrolls into view (`ensure_active_tab_visible`); mouse-wheel over the column scrolls `tabs_scroll` manually without changing the active buffer.
 - **Tab characters** are expanded to spaces at render time via `char_display_width(c, vis_col, tab_width)`, which snaps to the next multiple of `tab_width`. Cursor math (`char_idx_to_vis_col`, `vis_col_to_char_idx`) uses the same function so click/arrow positions stay aligned.
-- **Layout**: a 3-row tab bar on top, a body with a line-number gutter + text area, and an optional 1-row bottom strip that appears only when there's a prompt or a transient status. No permanent status bar.
+- **Layout**: left-to-right — vertical tab column, a 1-col `│` separator, line-number gutter, text area. An optional 1-row status strip at the bottom spans the full width and appears only when there's a prompt or a transient status. No permanent status bar.
 
 ### Highlight cache (src/highlight.rs + Buffer fields)
 
