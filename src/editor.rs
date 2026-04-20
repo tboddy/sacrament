@@ -2341,7 +2341,7 @@ fn build_display_line(
 fn make_span(text: String, hl: Option<&HlSpan>, selected: bool) -> Span<'static> {
     let mut style = Style::default();
     if selected {
-        style = style.add_modifier(Modifier::REVERSED);
+        style = style.fg(Color::White).bg(Color::DarkGray);
     } else if let Some(h) = hl {
         if let Some(c) = h.color {
             style = style.fg(c);

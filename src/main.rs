@@ -16,11 +16,17 @@ fn main() -> Result<()> {
     let target = raw_arg.as_deref().map(parse_file_line);
 
     if let Some((path, line)) = &target {
+        if !path.exists() {
+            if let Err(e) = std::fs::File::create(path) {
+                eprintln!("sacrament: cannot create {}: {e}", path.display());
+                process::exit(1);
+            }
+        }
         match client::try_send_open(path, *line) {
             Ok(true) => return Ok(()),
             Ok(false) => {}
             Err(e) => {
-                eprintln!("te: {e}");
+                eprintln!("sacrament: {e}");
                 process::exit(1);
             }
         }
