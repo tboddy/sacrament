@@ -976,6 +976,7 @@ pub struct Editor {
     watched_paths: HashSet<PathBuf>,
     last_click: Option<LastClick>,
     tabs_scroll: usize,
+    tab_drag: Option<usize>,
 }
 
 impl Editor {
@@ -1020,6 +1021,7 @@ impl Editor {
             watched_paths: HashSet::new(),
             last_click: None,
             tabs_scroll: 0,
+            tab_drag: None,
         }
     }
 
@@ -1415,6 +1417,7 @@ impl Editor {
                 if point_in(ev.column, ev.row, tab_area) {
                     if let Some(idx) = self.tab_at_row(ev.row, tab_area) {
                         self.switch_to(idx);
+                        self.tab_drag = Some(idx);
                     }
                 } else if layout.gutter.width > 0 && point_in(ev.column, ev.row, layout.gutter) {
                     // Click in the gutter. Chevron sits in the second-to-last
@@ -1447,7 +1450,15 @@ impl Editor {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if point_in(ev.column, ev.row, text_area) {
+                if let Some(src) = self.tab_drag {
+                    let target = self.drag_target_index(ev.row, tab_area);
+                    if target != src && target < self.buffers.len() {
+                        let buf = self.buffers.remove(src);
+                        self.buffers.insert(target, buf);
+                        self.active = target;
+                        self.tab_drag = Some(target);
+                    }
+                } else if point_in(ev.column, ev.row, text_area) {
                     let (row, col) = self.screen_to_doc(ev.column, ev.row, text_area, tab_width);
                     let b = self.active_mut();
                     if b.selection_anchor.is_none() {
@@ -1457,6 +1468,9 @@ impl Editor {
                     b.cursor_col = col;
                     b.reset_coalesce();
                 }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.tab_drag = None;
             }
             MouseEventKind::ScrollUp if point_in(ev.column, ev.row, tab_area) => {
                 self.tabs_scroll = self.tabs_scroll.saturating_sub(1);
@@ -1505,6 +1519,24 @@ impl Editor {
         let screen_row = (row - tab_area.y) as usize;
         let idx = self.tabs_scroll + screen_row;
         (idx < self.buffers.len()).then_some(idx)
+    }
+
+    fn drag_target_index(&self, row: u16, tab_area: Rect) -> usize {
+        let n = self.buffers.len();
+        if n == 0 {
+            return 0;
+        }
+        let max = n - 1;
+        if row < tab_area.y {
+            return self.tabs_scroll.min(max);
+        }
+        let end = tab_area.y.saturating_add(tab_area.height);
+        if row >= end {
+            let last_visible = self.tabs_scroll + (tab_area.height as usize).saturating_sub(1);
+            return last_visible.min(max);
+        }
+        let screen_row = (row - tab_area.y) as usize;
+        (self.tabs_scroll + screen_row).min(max)
     }
 
     fn switch_to(&mut self, idx: usize) {
