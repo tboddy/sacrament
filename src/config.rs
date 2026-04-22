@@ -12,6 +12,7 @@ pub struct Config {
     pub line_numbers: bool,
     pub status_timeout_ms: u64,
     pub syntax_highlighting: bool,
+    pub word_wrap: bool,
 }
 
 impl Default for Config {
@@ -22,6 +23,7 @@ impl Default for Config {
             line_numbers: true,
             status_timeout_ms: 2000,
             syntax_highlighting: true,
+            word_wrap: true,
         }
     }
 }

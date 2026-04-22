@@ -31,12 +31,23 @@ impl Highlighter {
     pub fn syntax_for_path<'a>(&'a self, path: &Path) -> Option<&'a SyntaxReference> {
         let ext = path.extension().and_then(|e| e.to_str());
         if let Some(ext) = ext {
-            if let Some(s) = self.syntax_set.find_syntax_by_extension(ext) {
+            // Extensions not in syntect's defaults — alias to a close match.
+            let canonical = match ext {
+                "vue" => "html",
+                other => other,
+            };
+            if let Some(s) = self.syntax_set.find_syntax_by_extension(canonical) {
                 return Some(s);
             }
         }
         let name = path.file_name().and_then(|n| n.to_str())?;
         self.syntax_set.find_syntax_by_extension(name)
+    }
+
+    pub fn syntax_by_name<'a>(&'a self, token: &str) -> Option<&'a SyntaxReference> {
+        self.syntax_set
+            .find_syntax_by_name(token)
+            .or_else(|| self.syntax_set.find_syntax_by_token(token))
     }
 
     pub fn initial_state(&self, syntax: &SyntaxReference) -> LineState {
@@ -190,4 +201,26 @@ fn starts_with_any(name: &str, prefixes: &[&str]) -> bool {
         }
     }
     false
+}
+
+/// Line-comment prefix for a given syntect syntax name. Returns the bare
+/// prefix without trailing space — the caller decides whether to pad.
+pub fn line_comment_for(syntax_name: &str) -> Option<&'static str> {
+    match syntax_name {
+        "Rust" | "C" | "C++" | "Java" | "JavaScript" | "JavaScript (Babel)"
+        | "TypeScript" | "TypeScriptReact" | "JSX" | "Go" | "Swift" | "Kotlin"
+        | "Scala" | "C#" | "Dart" | "Objective-C" | "Objective-C++" | "Zig"
+        | "Groovy" | "Rust Enhanced" | "JSON with Comments" | "PHP"
+        | "PHP Source" | "F#" | "OCaml" => Some("//"),
+        "Python" | "Ruby" | "Shell-Unix-Generic" | "Bourne Again Shell (bash)"
+        | "Bash" | "YAML" | "TOML" | "R" | "Perl" | "Makefile" | "CMake"
+        | "Dockerfile" | "Nix" | "Elixir" | "Julia" | "Tcl" | "CoffeeScript"
+        | "Crystal" | "Fish" | "GDScript" => Some("#"),
+        "SQL" | "Haskell" | "Lua" | "Ada" | "Elm" | "PureScript" => Some("--"),
+        "Clojure" | "Lisp" | "Scheme" | "Assembly"
+        | "Assembly x86 (NASM)" | "INI" => Some(";"),
+        "LaTeX" | "TeX" | "Erlang" | "MATLAB" | "Matlab" => Some("%"),
+        "Visual Basic" | "VBScript" => Some("'"),
+        _ => None,
+    }
 }

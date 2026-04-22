@@ -7,7 +7,11 @@ pub fn socket_path() -> PathBuf {
 }
 
 pub enum Request {
-    Open { path: PathBuf, line: Option<usize> },
+    Open {
+        path: PathBuf,
+        line: Option<usize>,
+        syntax: Option<String>,
+    },
 }
 
 impl Request {
@@ -16,13 +20,24 @@ impl Request {
         let (cmd, rest) = line.split_once(' ')?;
         match cmd {
             "OPEN" => {
-                let (path_str, line_num) = match rest.split_once('\t') {
-                    Some((p, n)) => (p, n.parse::<usize>().ok()),
-                    None => (rest, None),
+                let mut parts = rest.split('\t');
+                let path_str = parts.next()?;
+                let line_field = parts.next().unwrap_or("");
+                let syntax_field = parts.next().unwrap_or("");
+                let line_num = if line_field.is_empty() {
+                    None
+                } else {
+                    line_field.parse::<usize>().ok()
+                };
+                let syntax = if syntax_field.is_empty() {
+                    None
+                } else {
+                    Some(syntax_field.to_string())
                 };
                 Some(Request::Open {
                     path: PathBuf::from(path_str),
                     line: line_num,
+                    syntax,
                 })
             }
             _ => None,
@@ -31,10 +46,18 @@ impl Request {
 
     pub fn encode(&self) -> String {
         match self {
-            Request::Open { path, line: Some(n) } => {
-                format!("OPEN {}\t{}\n", path.display(), n)
+            Request::Open {
+                path,
+                line,
+                syntax,
+            } => {
+                let line_field = line.map(|n| n.to_string()).unwrap_or_default();
+                match syntax {
+                    Some(s) => format!("OPEN {}\t{}\t{}\n", path.display(), line_field, s),
+                    None if line.is_some() => format!("OPEN {}\t{}\n", path.display(), line_field),
+                    None => format!("OPEN {}\n", path.display()),
+                }
             }
-            Request::Open { path, line: None } => format!("OPEN {}\n", path.display()),
         }
     }
 }

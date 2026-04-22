@@ -70,6 +70,13 @@ enum PromptKind {
     SaveAs,
 }
 
+enum CommentResult {
+    Commented,
+    Uncommented,
+    NoSyntax,
+    NoStyle(String),
+}
+
 impl PromptKind {
     fn label(&self) -> &'static str {
         match self {
@@ -89,6 +96,7 @@ struct Buffer {
     cursor_row: usize,
     cursor_col: usize,
     scroll_row: usize,
+    scroll_seg: usize,
     scroll_col: usize,
     path: Option<PathBuf>,
     dirty: bool,
@@ -101,11 +109,14 @@ struct Buffer {
     external_change: bool,
     last_disk_check: Option<Instant>,
     syntax_name: Option<String>,
+    syntax_override: Option<String>,
     line_state_before: Vec<Option<LineState>>,
     highlights: Vec<Option<Vec<HlSpan>>>,
     folds: Vec<Fold>,
     foldable_at: Vec<Option<usize>>,
     foldable_dirty: bool,
+    wrap: bool,
+    last_wrap_width: usize,
 }
 
 impl Buffer {
@@ -115,6 +126,7 @@ impl Buffer {
             cursor_row: 0,
             cursor_col: 0,
             scroll_row: 0,
+            scroll_seg: 0,
             scroll_col: 0,
             path: None,
             dirty: false,
@@ -127,11 +139,14 @@ impl Buffer {
             external_change: false,
             last_disk_check: None,
             syntax_name: None,
+            syntax_override: None,
             line_state_before: vec![None],
             highlights: vec![None],
             folds: Vec::new(),
             foldable_at: vec![None],
             foldable_dirty: true,
+            wrap: true,
+            last_wrap_width: 0,
         }
     }
 
@@ -152,6 +167,7 @@ impl Buffer {
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.scroll_row = 0;
+        self.scroll_seg = 0;
         self.scroll_col = 0;
         self.dirty = false;
         self.selection_anchor = None;
@@ -171,10 +187,11 @@ impl Buffer {
     }
 
     fn seed_syntax(&mut self, hl: &Highlighter) {
-        let Some(path) = &self.path else {
-            return;
-        };
-        let syntax = hl.syntax_for_path(path);
+        let syntax = self
+            .syntax_override
+            .as_deref()
+            .and_then(|name| hl.syntax_by_name(name))
+            .or_else(|| self.path.as_deref().and_then(|p| hl.syntax_for_path(p)));
         if let Some(syntax) = syntax {
             self.syntax_name = Some(syntax.name.clone());
             self.line_state_before[0] = Some(hl.initial_state(syntax));
@@ -278,50 +295,21 @@ impl Buffer {
         }
     }
 
-    /// Walk visible rows starting from `from` (inclusive) and return the
-    /// `n`-th visible row. If we run out, return the last visible row.
-    fn nth_visible_row_from(&self, from: usize, n: usize) -> usize {
-        let mut count = 0usize;
-        let mut r = from;
-        let mut last = from.min(self.text.len().saturating_sub(1));
-        while r < self.text.len() {
-            if !self.is_hidden(r) {
-                last = r;
-                if count == n {
-                    return r;
-                }
-                count += 1;
-                r = match self.collapsed_fold_at(r) {
-                    Some(f) => f.end + 1,
-                    None => r + 1,
-                };
-            } else {
-                r += 1;
-            }
+    fn segments_for(&self, row: usize, tab_width: usize) -> Vec<(usize, usize)> {
+        let line = self.text.get(row).map(String::as_str).unwrap_or("");
+        if !self.wrap || self.last_wrap_width == 0 {
+            return vec![(0, line.chars().count())];
         }
-        last
+        wrap_line(line, self.last_wrap_width, tab_width)
     }
 
-    /// Count visible rows from `from` up to but not including `to`.
-    /// Returns the visible distance (0 if `to == from` and `from` visible).
-    fn visible_offset(&self, from: usize, to: usize) -> usize {
-        if to <= from {
-            return 0;
-        }
-        let mut count = 0usize;
-        let mut r = from;
-        while r < to && r < self.text.len() {
-            if !self.is_hidden(r) {
-                count += 1;
-                r = match self.collapsed_fold_at(r) {
-                    Some(f) => f.end + 1,
-                    None => r + 1,
-                };
-            } else {
-                r += 1;
+    fn segment_of_col(segs: &[(usize, usize)], col: usize) -> usize {
+        for (i, &(_, e)) in segs.iter().enumerate() {
+            if col < e {
+                return i;
             }
         }
-        count
+        segs.len().saturating_sub(1)
     }
 
     fn ensure_highlights(&mut self, up_to: usize, hl: &Highlighter) {
@@ -472,18 +460,56 @@ impl Buffer {
         }
     }
 
-    fn move_up(&mut self, extend: bool) {
+    fn move_up(&mut self, extend: bool, tab_width: usize) {
         self.update_selection(extend);
         self.reset_coalesce();
+        if self.wrap && self.last_wrap_width > 0 {
+            let line = self.text[self.cursor_row].clone();
+            let segs = self.segments_for(self.cursor_row, tab_width);
+            let cur_seg = Buffer::segment_of_col(&segs, self.cursor_col);
+            let target_vis = vis_in_segment(&line, segs[cur_seg].0, self.cursor_col, tab_width);
+            if cur_seg > 0 {
+                let (ns, ne) = segs[cur_seg - 1];
+                self.cursor_col = col_at_vis_in_segment(&line, ns, ne, target_vis, tab_width);
+                return;
+            }
+            if let Some(prev_row) = self.prev_visible_row(self.cursor_row) {
+                self.cursor_row = prev_row;
+                let prev_line = self.text[prev_row].clone();
+                let prev_segs = self.segments_for(prev_row, tab_width);
+                let (ns, ne) = prev_segs[prev_segs.len() - 1];
+                self.cursor_col = col_at_vis_in_segment(&prev_line, ns, ne, target_vis, tab_width);
+            }
+            return;
+        }
         if let Some(r) = self.prev_visible_row(self.cursor_row) {
             self.cursor_row = r;
             self.cursor_col = self.cursor_col.min(self.current_line_len());
         }
     }
 
-    fn move_down(&mut self, extend: bool) {
+    fn move_down(&mut self, extend: bool, tab_width: usize) {
         self.update_selection(extend);
         self.reset_coalesce();
+        if self.wrap && self.last_wrap_width > 0 {
+            let line = self.text[self.cursor_row].clone();
+            let segs = self.segments_for(self.cursor_row, tab_width);
+            let cur_seg = Buffer::segment_of_col(&segs, self.cursor_col);
+            let target_vis = vis_in_segment(&line, segs[cur_seg].0, self.cursor_col, tab_width);
+            if cur_seg + 1 < segs.len() {
+                let (ns, ne) = segs[cur_seg + 1];
+                self.cursor_col = col_at_vis_in_segment(&line, ns, ne, target_vis, tab_width);
+                return;
+            }
+            if let Some(next_row) = self.next_visible_row(self.cursor_row) {
+                self.cursor_row = next_row;
+                let next_line = self.text[next_row].clone();
+                let next_segs = self.segments_for(next_row, tab_width);
+                let (ns, ne) = next_segs[0];
+                self.cursor_col = col_at_vis_in_segment(&next_line, ns, ne, target_vis, tab_width);
+            }
+            return;
+        }
         if let Some(r) = self.next_visible_row(self.cursor_row) {
             self.cursor_row = r;
             self.cursor_col = self.cursor_col.min(self.current_line_len());
@@ -562,6 +588,113 @@ impl Buffer {
                 (sr, last)
             }
             None => (self.cursor_row, self.cursor_row),
+        }
+    }
+
+    fn toggle_line_comment(&mut self) -> CommentResult {
+        let Some(syntax_name) = self.syntax_name.clone() else {
+            return CommentResult::NoSyntax;
+        };
+        let Some(prefix) = crate::highlight::line_comment_for(&syntax_name) else {
+            return CommentResult::NoStyle(syntax_name);
+        };
+
+        let (first, last) = self.indent_row_range();
+        let mut non_blank: Vec<usize> = Vec::new();
+        let mut min_indent = usize::MAX;
+        let mut all_commented = true;
+        for row in first..=last {
+            let line = &self.text[row];
+            let leading_ws = line.chars().take_while(|c| c.is_whitespace()).count();
+            let total = line.chars().count();
+            if leading_ws == total {
+                continue;
+            }
+            non_blank.push(row);
+            if leading_ws < min_indent {
+                min_indent = leading_ws;
+            }
+            let rest: String = line.chars().skip(leading_ws).collect();
+            if !rest.starts_with(prefix) {
+                all_commented = false;
+            }
+        }
+
+        self.checkpoint(EditKind::Other);
+
+        if non_blank.is_empty() {
+            let insert_str = format!("{prefix} ");
+            let insert_chars = insert_str.chars().count();
+            for row in first..=last {
+                self.text[row].insert_str(0, &insert_str);
+                self.shift_col_insert(row, 0, insert_chars);
+            }
+            self.finalize_comment_edit(first);
+            return CommentResult::Commented;
+        }
+
+        if all_commented {
+            let prefix_chars = prefix.chars().count();
+            for &row in &non_blank {
+                let line = &mut self.text[row];
+                let leading_ws = line.chars().take_while(|c| c.is_whitespace()).count();
+                let byte_start = char_idx_to_byte(line, leading_ws);
+                let after_prefix = &line[byte_start + prefix.len()..];
+                let strip_space = after_prefix.starts_with(' ');
+                let remove_bytes = prefix.len() + if strip_space { 1 } else { 0 };
+                let remove_chars = prefix_chars + if strip_space { 1 } else { 0 };
+                line.replace_range(byte_start..byte_start + remove_bytes, "");
+                self.shift_col_remove(row, leading_ws, remove_chars);
+            }
+            self.finalize_comment_edit(first);
+            CommentResult::Uncommented
+        } else {
+            let insert_str = format!("{prefix} ");
+            let insert_chars = insert_str.chars().count();
+            for &row in &non_blank {
+                let line = &mut self.text[row];
+                let byte_pos = char_idx_to_byte(line, min_indent);
+                line.insert_str(byte_pos, &insert_str);
+                self.shift_col_insert(row, min_indent, insert_chars);
+            }
+            self.finalize_comment_edit(first);
+            CommentResult::Commented
+        }
+    }
+
+    fn finalize_comment_edit(&mut self, from_row: usize) {
+        self.invalidate_highlights_from(from_row);
+        self.mark_foldable_dirty();
+        self.dirty = true;
+    }
+
+    fn shift_col_insert(&mut self, row: usize, at_col: usize, added: usize) {
+        if self.cursor_row == row && self.cursor_col >= at_col {
+            self.cursor_col += added;
+        }
+        if let Some((ar, ac)) = self.selection_anchor.as_mut() {
+            if *ar == row && *ac >= at_col {
+                *ac += added;
+            }
+        }
+    }
+
+    fn shift_col_remove(&mut self, row: usize, at_col: usize, removed: usize) {
+        if self.cursor_row == row {
+            if self.cursor_col >= at_col + removed {
+                self.cursor_col -= removed;
+            } else if self.cursor_col > at_col {
+                self.cursor_col = at_col;
+            }
+        }
+        if let Some((ar, ac)) = self.selection_anchor.as_mut() {
+            if *ar == row {
+                if *ac >= at_col + removed {
+                    *ac -= removed;
+                } else if *ac > at_col {
+                    *ac = at_col;
+                }
+            }
         }
     }
 
@@ -714,6 +847,34 @@ impl Buffer {
         }
     }
 
+    fn delete_forward(&mut self) {
+        if let Some(((sr, sc), (er, ec))) = self.selection_range() {
+            self.checkpoint(EditKind::Other);
+            self.delete_range(sr, sc, er, ec);
+            self.selection_anchor = None;
+            self.dirty = true;
+            return;
+        }
+        self.checkpoint(EditKind::Other);
+        let line_len = self.current_line_len();
+        if self.cursor_col < line_len {
+            let line = &mut self.text[self.cursor_row];
+            let byte_idx = char_idx_to_byte(line, self.cursor_col);
+            line.remove(byte_idx);
+            self.dirty = true;
+            self.invalidate_highlights_from(self.cursor_row);
+            self.mark_foldable_dirty();
+        } else if self.cursor_row + 1 < self.text.len() {
+            let next = self.text.remove(self.cursor_row + 1);
+            self.highlights.remove(self.cursor_row + 1);
+            self.line_state_before.remove(self.cursor_row + 1);
+            self.adjust_folds_for_edit(self.cursor_row + 1, 1, 0);
+            self.text[self.cursor_row].push_str(&next);
+            self.dirty = true;
+            self.invalidate_highlights_from(self.cursor_row);
+        }
+    }
+
     fn delete_range(&mut self, sr: usize, sc: usize, er: usize, ec: usize) {
         if sr == er {
             let line = &mut self.text[sr];
@@ -858,72 +1019,91 @@ impl Buffer {
     }
 
     fn adjust_scroll(&mut self, viewport_height: usize, viewport_width: usize, tab_width: usize) {
+        // If cursor landed inside a collapsed fold, hoist it to the header.
+        if self.is_hidden(self.cursor_row) {
+            if let Some(fold) = self
+                .folds
+                .iter()
+                .find(|f| self.cursor_row > f.start && self.cursor_row <= f.end)
+            {
+                self.cursor_row = fold.start;
+            }
+        }
+        if self.is_hidden(self.scroll_row) {
+            self.scroll_row = self
+                .folds
+                .iter()
+                .find(|f| self.scroll_row > f.start && self.scroll_row <= f.end)
+                .map(|f| f.end + 1)
+                .unwrap_or(self.scroll_row)
+                .min(self.text.len().saturating_sub(1));
+            self.scroll_seg = 0;
+        }
+
+        // Make the wrap width available to segment helpers during this call.
+        self.last_wrap_width = if self.wrap { viewport_width } else { 0 };
+
+        // Clamp scroll_seg against scroll_row's segment count.
+        let scroll_segs = self.segments_for(self.scroll_row, tab_width);
+        if self.scroll_seg >= scroll_segs.len() {
+            self.scroll_seg = scroll_segs.len().saturating_sub(1);
+        }
+
         if viewport_height > 0 {
-            // If cursor landed inside a collapsed fold, hoist it to the header.
-            if self.is_hidden(self.cursor_row) {
-                if let Some(fold) = self
-                    .folds
-                    .iter()
-                    .find(|f| self.cursor_row > f.start && self.cursor_row <= f.end)
-                {
-                    self.cursor_row = fold.start;
-                }
-            }
-            if self.is_hidden(self.scroll_row) {
-                self.scroll_row = self
-                    .folds
-                    .iter()
-                    .find(|f| self.scroll_row > f.start && self.scroll_row <= f.end)
-                    .map(|f| f.end + 1)
-                    .unwrap_or(self.scroll_row)
-                    .min(self.text.len().saturating_sub(1));
-            }
-            if self.cursor_row < self.scroll_row {
+            let cur_segs = self.segments_for(self.cursor_row, tab_width);
+            let cur_seg = Buffer::segment_of_col(&cur_segs, self.cursor_col);
+
+            let before = (self.cursor_row, cur_seg) < (self.scroll_row, self.scroll_seg);
+            if before {
                 self.scroll_row = self.cursor_row;
+                self.scroll_seg = cur_seg;
             } else {
-                // Walk visible rows from scroll_row; if cursor is beyond
-                // the viewport, advance scroll_row.
-                let mut visible = 0usize;
-                let mut found = false;
+                // Count screen rows from scroll to cursor; if we exceed the
+                // viewport, walk scroll back so cursor lands on the last row.
+                let mut count = 0usize;
                 let mut r = self.scroll_row;
-                while r < self.text.len() && visible < viewport_height {
-                    if !self.is_hidden(r) {
-                        if r == self.cursor_row {
+                let mut s = self.scroll_seg;
+                let mut found = false;
+                while r < self.text.len() {
+                    if self.is_hidden(r) {
+                        r += 1;
+                        s = 0;
+                        continue;
+                    }
+                    let segs = self.segments_for(r, tab_width);
+                    while s < segs.len() {
+                        if r == self.cursor_row && s == cur_seg {
                             found = true;
                             break;
                         }
-                        visible += 1;
-                        r = match self.collapsed_fold_at(r) {
-                            Some(f) => f.end + 1,
-                            None => r + 1,
-                        };
-                    } else {
-                        r += 1;
+                        count += 1;
+                        if count >= viewport_height {
+                            break;
+                        }
+                        s += 1;
                     }
+                    if found || count >= viewport_height {
+                        break;
+                    }
+                    r = match self.collapsed_fold_at(r) {
+                        Some(f) => f.end + 1,
+                        None => r + 1,
+                    };
+                    s = 0;
                 }
                 if !found {
-                    // Advance scroll until cursor is the last visible row.
-                    let mut visible_rows: Vec<usize> = Vec::new();
-                    let mut rr = 0usize;
-                    while rr < self.text.len() {
-                        if !self.is_hidden(rr) {
-                            visible_rows.push(rr);
-                            rr = match self.collapsed_fold_at(rr) {
-                                Some(f) => f.end + 1,
-                                None => rr + 1,
-                            };
-                        } else {
-                            rr += 1;
-                        }
-                    }
-                    if let Some(idx) = visible_rows.iter().position(|&x| x == self.cursor_row) {
-                        let start_idx = idx + 1 - viewport_height.min(idx + 1);
-                        self.scroll_row = visible_rows[start_idx];
-                    }
+                    let (nr, ns) = self.scroll_back_from(
+                        (self.cursor_row, cur_seg),
+                        viewport_height - 1,
+                        tab_width,
+                    );
+                    self.scroll_row = nr;
+                    self.scroll_seg = ns;
                 }
             }
         }
-        if viewport_width > 0 {
+
+        if !self.wrap && viewport_width > 0 {
             let line = self
                 .text
                 .get(self.cursor_row)
@@ -935,7 +1115,36 @@ impl Buffer {
             } else if vis >= self.scroll_col + viewport_width {
                 self.scroll_col = vis + 1 - viewport_width;
             }
+        } else {
+            self.scroll_col = 0;
         }
+    }
+
+    fn scroll_back_from(
+        &self,
+        from: (usize, usize),
+        back: usize,
+        tab_width: usize,
+    ) -> (usize, usize) {
+        let (mut r, mut s) = from;
+        let mut remaining = back;
+        while remaining > 0 {
+            if s > 0 {
+                s -= 1;
+                remaining -= 1;
+            } else {
+                match self.prev_visible_row(r) {
+                    Some(p) => {
+                        r = p;
+                        let segs = self.segments_for(r, tab_width);
+                        s = segs.len().saturating_sub(1);
+                        remaining -= 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        (r, s)
     }
 
     fn display_name(&self) -> String {
@@ -1002,7 +1211,7 @@ impl Editor {
             }
         })
         .ok();
-        Self {
+        let mut ed = Self {
             buffers: vec![Buffer::empty()],
             active: 0,
             status: String::new(),
@@ -1022,36 +1231,55 @@ impl Editor {
             last_click: None,
             tabs_scroll: 0,
             tab_drag: None,
-        }
+        };
+        ed.buffers[0].wrap = ed.config.word_wrap;
+        ed
     }
 
-    pub fn load(&mut self, path: &Path) -> Result<()> {
+    pub fn load(&mut self, path: &Path, syntax: Option<&str>) -> Result<()> {
         self.active_mut().load(path)?;
+        let idx = self.active;
+        self.buffers[idx].syntax_override = syntax.map(|s| s.to_string());
         if let Some(hl) = self.highlighter.as_ref() {
-            let idx = self.active;
             self.buffers[idx].seed_syntax(hl);
         }
         self.watch(path);
-        self.set_status(format!("opened {}", path.display()));
+        self.report_syntax_status(idx, syntax, path);
         Ok(())
     }
 
-    pub fn try_load_remote(&mut self, path: &Path) -> Result<()> {
+    pub fn try_load_remote(&mut self, path: &Path, syntax: Option<&str>) -> Result<()> {
         if self.active().is_fresh_and_clean() {
             self.active_mut().load(path)?;
         } else {
             let mut b = Buffer::empty();
+            b.wrap = self.config.word_wrap;
             b.load(path)?;
             self.buffers.push(b);
             self.active = self.buffers.len() - 1;
         }
+        let idx = self.active;
+        self.buffers[idx].syntax_override = syntax.map(|s| s.to_string());
         if let Some(hl) = self.highlighter.as_ref() {
-            let idx = self.active;
             self.buffers[idx].seed_syntax(hl);
         }
         self.watch(path);
-        self.set_status(format!("opened {}", path.display()));
+        self.report_syntax_status(idx, syntax, path);
         Ok(())
+    }
+
+    fn report_syntax_status(&mut self, idx: usize, requested: Option<&str>, path: &Path) {
+        let resolved = self.buffers[idx].syntax_name.clone();
+        match (requested, resolved) {
+            (Some(_), Some(name)) => {
+                self.set_status(format!("opened {} [{name}]", path.display()))
+            }
+            (Some(name), None) => self.set_status(format!(
+                "opened {} (unknown syntax '{name}')",
+                path.display()
+            )),
+            (None, _) => self.set_status(format!("opened {}", path.display())),
+        }
     }
 
     pub fn capture_session(&self) -> crate::session::Session {
@@ -1066,6 +1294,7 @@ impl Editor {
                     scroll_row: b.scroll_row,
                     scroll_col: b.scroll_col,
                     folds: b.folds.iter().map(|f| (f.start, f.end)).collect(),
+                    syntax_override: b.syntax_override.clone(),
                 })
             })
             .collect();
@@ -1094,6 +1323,7 @@ impl Editor {
                 continue;
             }
             let mut b = Buffer::empty();
+            b.wrap = self.config.word_wrap;
             if b.load(&sb.path).is_err() {
                 continue;
             }
@@ -1121,6 +1351,7 @@ impl Editor {
                 .collect();
             b.folds.sort_by_key(|f| f.start);
             b.foldable_dirty = true;
+            b.syntax_override = sb.syntax_override.clone();
             if let Some(hl) = self.highlighter.as_ref() {
                 b.seed_syntax(hl);
             }
@@ -1322,6 +1553,17 @@ impl Editor {
                     }
                 }
             }
+            (false, KeyCode::Char('z')) if alt && !shift => {
+                let b = self.active_mut();
+                b.wrap = !b.wrap;
+                b.scroll_seg = 0;
+                b.scroll_col = 0;
+                let on = b.wrap;
+                self.set_status(format!(
+                    "word wrap: {}",
+                    if on { "on" } else { "off" }
+                ));
+            }
             (true, KeyCode::Char('z')) if shift => {
                 if !self.active_mut().redo() {
                     self.set_status("nothing to redo");
@@ -1355,18 +1597,28 @@ impl Editor {
                 let tw = self.config.tab_width;
                 self.active_mut().outdent_selection(tw);
             }
+            (true, KeyCode::Char('/')) => self.toggle_comment(),
             (_, KeyCode::Esc) => {
                 self.active_mut().selection_anchor = None;
                 self.active_mut().reset_coalesce();
             }
+            (true, KeyCode::Left) => self.active_mut().move_home(shift),
+            (true, KeyCode::Right) => self.active_mut().move_end(shift),
             (_, KeyCode::Left) => self.active_mut().move_left(shift),
             (_, KeyCode::Right) => self.active_mut().move_right(shift),
-            (_, KeyCode::Up) => self.active_mut().move_up(shift),
-            (_, KeyCode::Down) => self.active_mut().move_down(shift),
+            (_, KeyCode::Up) => {
+                let tw = self.config.tab_width;
+                self.active_mut().move_up(shift, tw);
+            }
+            (_, KeyCode::Down) => {
+                let tw = self.config.tab_width;
+                self.active_mut().move_down(shift, tw);
+            }
             (_, KeyCode::Home) => self.active_mut().move_home(shift),
             (_, KeyCode::End) => self.active_mut().move_end(shift),
             (_, KeyCode::Enter) => self.active_mut().insert_newline(),
             (_, KeyCode::Backspace) => self.active_mut().backspace(),
+            (_, KeyCode::Delete) => self.active_mut().delete_forward(),
             (_, KeyCode::Tab) => {
                 if self.config.indent_with_tabs {
                     self.active_mut().insert_char('\t');
@@ -1376,7 +1628,10 @@ impl Editor {
                     }
                 }
             }
-            (_, KeyCode::Char(c)) if !ctrl => self.active_mut().insert_char(c),
+            (_, KeyCode::Char(c)) if !ctrl => {
+                let ch = if shift { apply_shift(c) } else { c };
+                self.active_mut().insert_char(ch);
+            }
             _ => {}
         }
     }
@@ -1384,6 +1639,7 @@ impl Editor {
     fn handle_key_prompt(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
             || key.modifiers.contains(KeyModifiers::SUPER);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match (ctrl, key.code) {
             (_, KeyCode::Esc) => self.mode = Mode::Normal,
             (_, KeyCode::Enter) => self.submit_prompt(),
@@ -1393,8 +1649,9 @@ impl Editor {
                 }
             }
             (false, KeyCode::Char(c)) => {
+                let ch = if shift { apply_shift(c) } else { c };
                 if let Mode::Prompt(state) = &mut self.mode {
-                    state.input.push(c);
+                    state.input.push(ch);
                 }
             }
             _ => {}
@@ -1427,8 +1684,12 @@ impl Editor {
                     if ev.column == chevron_x {
                         let screen_row = ev.row.saturating_sub(gutter.y) as usize;
                         let b = self.active();
-                        let doc_row = b.nth_visible_row_from(b.scroll_row, screen_row);
-                        self.toggle_fold_at_row(doc_row);
+                        let rows = build_screen_rows(b, screen_row + 1, tab_width);
+                        if let Some(sr) = rows.get(screen_row) {
+                            if sr.is_first_segment {
+                                self.toggle_fold_at_row(sr.doc_row);
+                            }
+                        }
                     }
                 } else if point_in(ev.column, ev.row, text_area) {
                     let (row, col) = self.screen_to_doc(ev.column, ev.row, text_area, tab_width);
@@ -1483,20 +1744,12 @@ impl Editor {
                 }
             }
             MouseEventKind::ScrollUp => {
-                let b = self.active_mut();
-                if let Some(r) = b.prev_visible_row(b.cursor_row) {
-                    b.cursor_row = r;
-                    b.cursor_col = b.cursor_col.min(b.current_line_len());
-                }
-                b.reset_coalesce();
+                let tw = self.config.tab_width;
+                self.active_mut().move_up(false, tw);
             }
             MouseEventKind::ScrollDown => {
-                let b = self.active_mut();
-                if let Some(r) = b.next_visible_row(b.cursor_row) {
-                    b.cursor_row = r;
-                    b.cursor_col = b.cursor_col.min(b.current_line_len());
-                }
-                b.reset_coalesce();
+                let tw = self.config.tab_width;
+                self.active_mut().move_down(false, tw);
             }
             _ => {}
         }
@@ -1505,11 +1758,21 @@ impl Editor {
     fn screen_to_doc(&self, sx: u16, sy: u16, text_area: Rect, tab_width: usize) -> (usize, usize) {
         let b = self.active();
         let screen_row = sy.saturating_sub(text_area.y) as usize;
-        let doc_row = b.nth_visible_row_from(b.scroll_row, screen_row);
-        let line = b.text.get(doc_row).map(String::as_str).unwrap_or("");
-        let target_vis = b.scroll_col + sx.saturating_sub(text_area.x) as usize;
-        let doc_col = vis_col_to_char_idx(line, target_vis, tab_width);
-        (doc_row, doc_col)
+        let height = (text_area.height as usize).max(screen_row + 1);
+        let rows = build_screen_rows(b, height, tab_width);
+        let sr = rows.get(screen_row).or_else(|| rows.last());
+        let Some(sr) = sr else {
+            return (b.scroll_row, 0);
+        };
+        let line = b.text.get(sr.doc_row).map(String::as_str).unwrap_or("");
+        let screen_col = sx.saturating_sub(text_area.x) as usize;
+        let doc_col = if b.wrap {
+            col_at_vis_in_segment(line, sr.seg_start, sr.seg_end, screen_col, tab_width)
+        } else {
+            let target_vis = b.scroll_col + screen_col;
+            vis_col_to_char_idx(line, target_vis, tab_width)
+        };
+        (sr.doc_row, doc_col)
     }
 
     fn tab_at_row(&self, row: u16, tab_area: Rect) -> Option<usize> {
@@ -1728,6 +1991,17 @@ impl Editor {
         }
     }
 
+    fn toggle_comment(&mut self) {
+        let result = self.active_mut().toggle_line_comment();
+        match result {
+            CommentResult::Commented | CommentResult::Uncommented => {}
+            CommentResult::NoSyntax => self.set_status("no syntax — cannot toggle comment"),
+            CommentResult::NoStyle(name) => {
+                self.set_status(format!("no comment style for '{name}'"))
+            }
+        }
+    }
+
     fn cut_selection(&mut self) {
         let sel = self.active().selection_range();
         let Some(((sr, sc), (er, ec))) = sel else {
@@ -1872,34 +2146,30 @@ impl Editor {
     fn render_gutter(&self, frame: &mut Frame, area: Rect) {
         let b = self.active();
         let digits = (area.width as usize).saturating_sub(4);
-        let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
-        let mut visible: Vec<usize> = Vec::with_capacity(area.height as usize);
-        let mut r = b.scroll_row;
-        while visible.len() < area.height as usize && r < b.text.len() {
-            if !b.is_hidden(r) {
-                visible.push(r);
-                r = match b.collapsed_fold_at(r) {
-                    Some(f) => f.end + 1,
-                    None => r + 1,
-                };
-            } else {
-                r += 1;
-            }
-        }
-        for i in 0..area.height as usize {
-            let Some(&doc_row) = visible.get(i) else {
-                lines.push(Line::from(" ".repeat(area.width as usize)));
+        let height = area.height as usize;
+        let tab_width = self.config.tab_width;
+        let rows = build_screen_rows(b, height, tab_width);
+        let blank = " ".repeat(area.width as usize);
+        let mut lines: Vec<Line> = Vec::with_capacity(height);
+        for i in 0..height {
+            let Some(sr) = rows.get(i) else {
+                lines.push(Line::from(blank.clone()));
                 continue;
             };
-            let chevron = if b.collapsed_fold_at(doc_row).is_some() {
+            if !sr.is_first_segment {
+                let pad = " ".repeat((digits + 2).max(area.width as usize).min(area.width as usize));
+                lines.push(Line::from(pad));
+                continue;
+            }
+            let chevron = if b.collapsed_fold_at(sr.doc_row).is_some() {
                 '▸'
-            } else if b.foldable_at.get(doc_row).copied().flatten().is_some() {
+            } else if b.foldable_at.get(sr.doc_row).copied().flatten().is_some() {
                 '▾'
             } else {
                 ' '
             };
-            let label = format!(" {:>width$} {} ", doc_row + 1, chevron, width = digits);
-            let style = if doc_row == b.cursor_row {
+            let label = format!(" {:>width$} {} ", sr.doc_row + 1, chevron, width = digits);
+            let style = if sr.doc_row == b.cursor_row {
                 Style::default()
             } else {
                 Style::default().add_modifier(Modifier::DIM)
@@ -2021,21 +2291,20 @@ impl Editor {
         let height = text_area.height as usize;
         let width = text_area.width as usize;
 
-        let b = self.active();
-        let mut visible_rows: Vec<usize> = Vec::with_capacity(height);
-        let mut r = b.scroll_row;
-        while visible_rows.len() < height && r < b.text.len() {
-            if !b.is_hidden(r) {
-                visible_rows.push(r);
-                r = match b.collapsed_fold_at(r) {
-                    Some(f) => f.end + 1,
-                    None => r + 1,
-                };
-            } else {
-                r += 1;
-            }
+        // Update the wrap width for this frame so segment helpers agree.
+        let idx = self.active;
+        let new_wrap_width = if self.buffers[idx].wrap { width } else { 0 };
+        self.buffers[idx].last_wrap_width = new_wrap_width;
+        if self.buffers[idx].wrap {
+            self.buffers[idx].scroll_col = 0;
         }
-        let last_doc = visible_rows.last().copied().unwrap_or(b.scroll_row);
+
+        let b = self.active();
+        let screen_rows = build_screen_rows(b, height, tab_width);
+        let last_doc = screen_rows
+            .last()
+            .map(|r| r.doc_row)
+            .unwrap_or(b.scroll_row);
 
         if let Some(hl) = self.highlighter.as_ref() {
             let idx = self.active;
@@ -2044,18 +2313,21 @@ impl Editor {
         }
 
         let b = self.active();
-        let mut lines: Vec<Line> = Vec::with_capacity(visible_rows.len());
-        for &row in &visible_rows {
-            let line = &b.text[row];
+        let mut lines: Vec<Line> = Vec::with_capacity(screen_rows.len());
+        for sr in &screen_rows {
+            let line = &b.text[sr.doc_row];
+            let start_vis = if b.wrap { 0 } else { b.scroll_col };
             let mut display = build_display_line(
                 line,
-                b.highlights.get(row).and_then(|o| o.as_deref()),
-                b.scroll_col,
+                b.highlights.get(sr.doc_row).and_then(|o| o.as_deref()),
+                sr.seg_start,
+                sr.seg_end,
+                start_vis,
                 width,
-                b.line_sel_range(row),
+                b.line_sel_range(sr.doc_row),
                 tab_width,
             );
-            if b.collapsed_fold_at(row).is_some() {
+            if sr.is_last_segment && b.collapsed_fold_at(sr.doc_row).is_some() {
                 display.spans.push(Span::styled(
                     " …",
                     Style::default().fg(Color::DarkGray),
@@ -2082,16 +2354,30 @@ impl Editor {
         match &self.mode {
             Mode::Normal => {
                 let b = self.active();
-                let line = b.text.get(b.cursor_row).map(String::as_str).unwrap_or("");
-                let vis = char_idx_to_vis_col(line, b.cursor_col, self.config.tab_width);
-                if vis < b.scroll_col
-                    || b.cursor_row < b.scroll_row
-                    || b.is_hidden(b.cursor_row)
-                {
+                if b.is_hidden(b.cursor_row) || b.cursor_row < b.scroll_row {
                     return;
                 }
-                let screen_row = b.visible_offset(b.scroll_row, b.cursor_row) as u16;
-                let screen_col = (vis - b.scroll_col) as u16;
+                let tab_width = self.config.tab_width;
+                let line = b.text.get(b.cursor_row).map(String::as_str).unwrap_or("");
+                let height = text_area.height as usize;
+                let rows = build_screen_rows(b, height + 1, tab_width);
+                let Some((screen_row, sr)) = rows.iter().enumerate().find(|(_, r)| {
+                    r.doc_row == b.cursor_row
+                        && b.cursor_col >= r.seg_start
+                        && (b.cursor_col < r.seg_end || (r.is_last_segment && b.cursor_col <= r.seg_end))
+                }) else {
+                    return;
+                };
+                let screen_col = if b.wrap {
+                    vis_in_segment(line, sr.seg_start, b.cursor_col, tab_width) as u16
+                } else {
+                    let vis = char_idx_to_vis_col(line, b.cursor_col, tab_width);
+                    if vis < b.scroll_col {
+                        return;
+                    }
+                    (vis - b.scroll_col) as u16
+                };
+                let screen_row = screen_row as u16;
                 if screen_row < text_area.height && screen_col < text_area.width {
                     frame.set_cursor_position((
                         text_area.x + screen_col,
@@ -2123,6 +2409,131 @@ fn char_idx_to_byte(s: &str, char_idx: usize) -> usize {
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Apply shift to a base Unicode codepoint reported by the kitty keyboard
+/// protocol (REPORT_ALL_KEYS_AS_ESCAPE_CODES sends base codepoints with
+/// SHIFT in the modifier mask instead of the shifted char). US-layout table.
+fn apply_shift(c: char) -> char {
+    if c.is_ascii_lowercase() {
+        return c.to_ascii_uppercase();
+    }
+    match c {
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        '`' => '~',
+        _ => c,
+    }
+}
+
+struct ScreenRow {
+    doc_row: usize,
+    seg_start: usize,
+    seg_end: usize,
+    is_first_segment: bool,
+    is_last_segment: bool,
+}
+
+/// Walk visible rows from `(b.scroll_row, b.scroll_seg)`, emitting one
+/// `ScreenRow` per screen line up to `height`. Segments come from the wrap
+/// width cached in `b.last_wrap_width`.
+fn build_screen_rows(b: &Buffer, height: usize, tab_width: usize) -> Vec<ScreenRow> {
+    let mut out = Vec::with_capacity(height);
+    if height == 0 {
+        return out;
+    }
+    let mut doc_row = b.scroll_row;
+    let mut seg_idx = b.scroll_seg;
+    while out.len() < height && doc_row < b.text.len() {
+        if b.is_hidden(doc_row) {
+            doc_row += 1;
+            seg_idx = 0;
+            continue;
+        }
+        let segs = b.segments_for(doc_row, tab_width);
+        let n = segs.len();
+        while seg_idx < n && out.len() < height {
+            let (s, e) = segs[seg_idx];
+            out.push(ScreenRow {
+                doc_row,
+                seg_start: s,
+                seg_end: e,
+                is_first_segment: seg_idx == 0,
+                is_last_segment: seg_idx + 1 == n,
+            });
+            seg_idx += 1;
+        }
+        if seg_idx < n {
+            break;
+        }
+        doc_row = match b.collapsed_fold_at(doc_row) {
+            Some(f) => f.end + 1,
+            None => doc_row + 1,
+        };
+        seg_idx = 0;
+    }
+    out
+}
+
+/// Word-boundary wrap with a hard-break fallback for over-long runs.
+/// Returns char-index ranges [start, end) covering the whole line. For an
+/// empty line, returns a single [0, 0) segment.
+fn wrap_line(line: &str, width: usize, tab_width: usize) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+    if n == 0 || width == 0 {
+        return vec![(0, n)];
+    }
+    let mut segs = Vec::new();
+    let mut start = 0usize;
+    while start < n {
+        let mut vis = 0usize;
+        let mut last_ws_end: Option<usize> = None;
+        let mut j = start;
+        while j < n {
+            let w = char_display_width(chars[j], vis, tab_width);
+            if vis + w > width && j > start {
+                break;
+            }
+            vis += w;
+            j += 1;
+            if chars[j - 1].is_whitespace() {
+                last_ws_end = Some(j);
+            }
+        }
+        let end = if j < n {
+            match last_ws_end {
+                Some(b) if b > start => b,
+                _ => j.max(start + 1),
+            }
+        } else {
+            j
+        };
+        segs.push((start, end));
+        start = end;
+    }
+    if segs.is_empty() {
+        segs.push((0, 0));
+    }
+    segs
 }
 
 fn indent_cols(line: &str, tab_width: usize) -> Option<usize> {
@@ -2221,6 +2632,38 @@ fn vis_col_to_char_idx(s: &str, target_vis: usize, tab_width: usize) -> usize {
     s.chars().count()
 }
 
+/// Visual col of char `col` measured from segment start (vis resets to 0 at seg_start).
+fn vis_in_segment(line: &str, seg_start: usize, col: usize, tab_width: usize) -> usize {
+    let mut vis = 0usize;
+    for c in line.chars().skip(seg_start).take(col.saturating_sub(seg_start)) {
+        vis += char_display_width(c, vis, tab_width);
+    }
+    vis
+}
+
+/// Find the char idx within `[seg_start, seg_end)` whose vis-col-from-seg-start
+/// best matches `target_vis`. Clamps to `seg_end`.
+fn col_at_vis_in_segment(
+    line: &str,
+    seg_start: usize,
+    seg_end: usize,
+    target_vis: usize,
+    tab_width: usize,
+) -> usize {
+    let mut vis = 0usize;
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = seg_start;
+    while i < seg_end && i < chars.len() {
+        let w = char_display_width(chars[i], vis, tab_width);
+        if vis + w > target_vis {
+            return i;
+        }
+        vis += w;
+        i += 1;
+    }
+    i
+}
+
 fn point_in(x: u16, y: u16, r: Rect) -> bool {
     x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
 }
@@ -2281,6 +2724,8 @@ fn find_from(text: &[String], start: Pos, needle_lc: &str) -> Option<Pos> {
 fn build_display_line(
     line: &str,
     hl: Option<&[HlSpan]>,
+    char_start: usize,
+    char_end: usize,
     start_vis: usize,
     max_width: usize,
     sel_range: Option<(usize, usize)>,
@@ -2296,10 +2741,17 @@ fn build_display_line(
     let viewport_end = start_vis.saturating_add(max_width);
 
     for (byte_offset, c) in line.char_indices() {
+        if char_idx >= char_end {
+            break;
+        }
         if let Some(spans_ref) = hl {
             while hl_cursor < spans_ref.len() && byte_offset >= spans_ref[hl_cursor].byte_end {
                 hl_cursor += 1;
             }
+        }
+        if char_idx < char_start {
+            char_idx += 1;
+            continue;
         }
         let active_hl = match hl {
             Some(spans_ref) if hl_cursor < spans_ref.len()

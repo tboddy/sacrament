@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::protocol::{Request, Response, socket_path};
 
-pub fn try_send_open(path: &Path, line: Option<usize>) -> Result<bool> {
+pub fn try_send_open(path: &Path, line: Option<usize>, syntax: Option<&str>) -> Result<bool> {
     let sock = socket_path();
     if !sock.exists() {
         return Ok(false);
@@ -24,7 +24,11 @@ pub fn try_send_open(path: &Path, line: Option<usize>) -> Result<bool> {
     let abs: PathBuf = fs::canonicalize(path)
         .with_context(|| format!("cannot resolve path: {}", path.display()))?;
 
-    let req = Request::Open { path: abs, line };
+    let req = Request::Open {
+        path: abs,
+        line,
+        syntax: syntax.map(|s| s.to_string()),
+    };
     stream.write_all(req.encode().as_bytes())?;
 
     let mut reader = BufReader::new(&stream);

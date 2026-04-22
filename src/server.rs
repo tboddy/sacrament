@@ -24,10 +24,17 @@ use crate::editor::Editor;
 use crate::protocol::{Request, Response, socket_path};
 use crate::session;
 
+pub struct InitialOpen {
+    pub path: PathBuf,
+    pub line: Option<usize>,
+    pub syntax: Option<String>,
+}
+
 pub enum RemoteCommand {
     Open {
         path: PathBuf,
         line: Option<usize>,
+        syntax: Option<String>,
         reply: Sender<Response>,
     },
 }
@@ -39,7 +46,7 @@ impl Drop for SocketGuard {
     }
 }
 
-pub fn run(initial: Option<(PathBuf, Option<usize>)>, config: Config) -> Result<()> {
+pub fn run(initial: Option<InitialOpen>, config: Config) -> Result<()> {
     let sock_path = socket_path();
     if sock_path.exists() {
         let _ = fs::remove_file(&sock_path);
@@ -52,10 +59,10 @@ pub fn run(initial: Option<(PathBuf, Option<usize>)>, config: Config) -> Result<
     spawn_listener_thread(listener, tx);
 
     let mut editor = Editor::new(config);
-    if let Some((path, line)) = initial {
-        if let Err(e) = editor.load(&path) {
+    if let Some(open) = initial {
+        if let Err(e) = editor.load(&open.path, open.syntax.as_deref()) {
             editor.set_status(format!("load failed: {e}"));
-        } else if let Some(n) = line {
+        } else if let Some(n) = open.line {
             editor.goto_line(n);
         }
     } else if let Some(sess) = session::load() {
@@ -90,11 +97,12 @@ fn handle_client(mut stream: UnixStream, tx: Sender<RemoteCommand>) -> Result<()
     }
 
     let response = match Request::parse(&line) {
-        Some(Request::Open { path, line }) => {
+        Some(Request::Open { path, line, syntax }) => {
             let (reply_tx, reply_rx) = mpsc::channel();
             tx.send(RemoteCommand::Open {
                 path,
                 line,
+                syntax,
                 reply: reply_tx,
             })
             .ok();
@@ -236,8 +244,13 @@ fn drain_escape_tail() -> Result<()> {
 
 fn apply_remote(editor: &mut Editor, cmd: RemoteCommand) {
     match cmd {
-        RemoteCommand::Open { path, line, reply } => {
-            let response = match editor.try_load_remote(&path) {
+        RemoteCommand::Open {
+            path,
+            line,
+            syntax,
+            reply,
+        } => {
+            let response = match editor.try_load_remote(&path, syntax.as_deref()) {
                 Ok(()) => {
                     if let Some(n) = line {
                         editor.goto_line(n);

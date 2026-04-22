@@ -26,6 +26,8 @@ pub struct SessionBuffer {
     pub scroll_col: usize,
     #[serde(default)]
     pub folds: Vec<(usize, usize)>,
+    #[serde(default)]
+    pub syntax_override: Option<String>,
 }
 
 fn session_path() -> Option<PathBuf> {
