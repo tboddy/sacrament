@@ -1018,6 +1018,10 @@ impl Buffer {
         true
     }
 
+    fn update_wrap_width(&mut self, viewport_width: usize) {
+        self.last_wrap_width = if self.wrap { viewport_width } else { 0 };
+    }
+
     fn adjust_scroll(&mut self, viewport_height: usize, viewport_width: usize, tab_width: usize) {
         // If cursor landed inside a collapsed fold, hoist it to the header.
         if self.is_hidden(self.cursor_row) {
@@ -1040,8 +1044,7 @@ impl Buffer {
             self.scroll_seg = 0;
         }
 
-        // Make the wrap width available to segment helpers during this call.
-        self.last_wrap_width = if self.wrap { viewport_width } else { 0 };
+        self.update_wrap_width(viewport_width);
 
         // Clamp scroll_seg against scroll_row's segment count.
         let scroll_segs = self.segments_for(self.scroll_row, tab_width);
@@ -1120,6 +1123,26 @@ impl Buffer {
         }
     }
 
+    fn scroll_viewport_down(&mut self, tab_width: usize) {
+        let segs = self.segments_for(self.scroll_row, tab_width);
+        if self.scroll_seg + 1 < segs.len() {
+            self.scroll_seg += 1;
+        } else if let Some(next) = self.next_visible_row(self.scroll_row) {
+            self.scroll_row = next;
+            self.scroll_seg = 0;
+        }
+    }
+
+    fn scroll_viewport_up(&mut self, tab_width: usize) {
+        if self.scroll_seg > 0 {
+            self.scroll_seg -= 1;
+        } else if let Some(prev) = self.prev_visible_row(self.scroll_row) {
+            self.scroll_row = prev;
+            let segs = self.segments_for(self.scroll_row, tab_width);
+            self.scroll_seg = segs.len().saturating_sub(1);
+        }
+    }
+
     fn scroll_back_from(
         &self,
         from: (usize, usize),
@@ -1186,6 +1209,7 @@ pub struct Editor {
     last_click: Option<LastClick>,
     tabs_scroll: usize,
     tab_drag: Option<usize>,
+    needs_cursor_adjust: bool,
 }
 
 impl Editor {
@@ -1231,6 +1255,7 @@ impl Editor {
             last_click: None,
             tabs_scroll: 0,
             tab_drag: None,
+            needs_cursor_adjust: true,
         };
         ed.buffers[0].wrap = ed.config.word_wrap;
         ed
@@ -1245,6 +1270,7 @@ impl Editor {
         }
         self.watch(path);
         self.report_syntax_status(idx, syntax, path);
+        self.needs_cursor_adjust = true;
         Ok(())
     }
 
@@ -1265,6 +1291,7 @@ impl Editor {
         }
         self.watch(path);
         self.report_syntax_status(idx, syntax, path);
+        self.needs_cursor_adjust = true;
         Ok(())
     }
 
@@ -1368,6 +1395,7 @@ impl Editor {
             self.watch(&p);
         }
         self.set_status(format!("restored {count} buffers"));
+        self.needs_cursor_adjust = true;
     }
 
     fn watch(&mut self, path: &Path) {
@@ -1472,6 +1500,7 @@ impl Editor {
             Mode::Normal => self.handle_key_normal(key),
             Mode::Prompt(_) => self.handle_key_prompt(key),
         }
+        self.needs_cursor_adjust = true;
     }
 
     fn handle_key_normal(&mut self, key: KeyEvent) {
@@ -1708,6 +1737,7 @@ impl Editor {
                         b.selection_anchor = None;
                         b.reset_coalesce();
                     }
+                    self.needs_cursor_adjust = true;
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -1728,6 +1758,7 @@ impl Editor {
                     b.cursor_row = row;
                     b.cursor_col = col;
                     b.reset_coalesce();
+                    self.needs_cursor_adjust = true;
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -1745,11 +1776,11 @@ impl Editor {
             }
             MouseEventKind::ScrollUp => {
                 let tw = self.config.tab_width;
-                self.active_mut().move_up(false, tw);
+                self.active_mut().scroll_viewport_up(tw);
             }
             MouseEventKind::ScrollDown => {
                 let tw = self.config.tab_width;
-                self.active_mut().move_down(false, tw);
+                self.active_mut().scroll_viewport_down(tw);
             }
             _ => {}
         }
@@ -2032,6 +2063,7 @@ impl Editor {
     }
 
     pub fn handle_paste(&mut self, text: String) {
+        self.needs_cursor_adjust = true;
         if !matches!(self.mode, Mode::Normal) {
             return;
         }
@@ -2117,8 +2149,17 @@ impl Editor {
         );
 
         let tw = self.config.tab_width;
-        self.active_mut()
-            .adjust_scroll(text_area.height as usize, text_area.width as usize, tw);
+        if self.needs_cursor_adjust {
+            self.active_mut().adjust_scroll(
+                text_area.height as usize,
+                text_area.width as usize,
+                tw,
+            );
+            self.needs_cursor_adjust = false;
+        } else {
+            self.active_mut()
+                .update_wrap_width(text_area.width as usize);
+        }
 
         self.render_tab_bar(frame, tab_area);
         self.render_tab_separator(frame, sep_area);
