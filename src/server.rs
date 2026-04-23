@@ -162,7 +162,11 @@ fn event_loop(
     loop {
         terminal.draw(|f| editor.render(f))?;
 
-        if event::poll(Duration::from_millis(50))? {
+        // Drain PTY output from background reader threads; vt100 parsers
+        // update and OSC 7 cwd updates are applied in apply_shell_output.
+        editor.drain_shell_output();
+
+        if event::poll(Duration::from_millis(20))? {
             loop {
                 let ev = event::read()?;
                 if let Event::Key(key) = &ev {

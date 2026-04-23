@@ -1187,6 +1187,10 @@ struct LayoutRects {
     tab_area: Rect,
     text_area: Rect,
     gutter: Rect,
+    bottom_tabs: Rect,
+    bottom_body: Rect,
+    right_tabs: Rect,
+    right_body: Rect,
 }
 
 pub struct Editor {
@@ -1210,6 +1214,12 @@ pub struct Editor {
     tabs_scroll: usize,
     tab_drag: Option<usize>,
     needs_cursor_adjust: bool,
+    pub bottom_pane: crate::shell::ShellPane,
+    pub right_pane: crate::shell::ShellPane,
+    pub focus: crate::shell::PaneFocus,
+    shell_tx: mpsc::Sender<crate::shell::ShellMsg>,
+    pub shell_rx: mpsc::Receiver<crate::shell::ShellMsg>,
+    next_shell_id: u64,
 }
 
 impl Editor {
@@ -1235,6 +1245,7 @@ impl Editor {
             }
         })
         .ok();
+        let (shell_tx, shell_rx) = mpsc::channel::<crate::shell::ShellMsg>();
         let mut ed = Self {
             buffers: vec![Buffer::empty()],
             active: 0,
@@ -1256,9 +1267,120 @@ impl Editor {
             tabs_scroll: 0,
             tab_drag: None,
             needs_cursor_adjust: true,
+            bottom_pane: crate::shell::ShellPane::new(),
+            right_pane: crate::shell::ShellPane::new(),
+            focus: crate::shell::PaneFocus::Editor,
+            shell_tx,
+            shell_rx,
+            next_shell_id: 0,
         };
         ed.buffers[0].wrap = ed.config.word_wrap;
+        // Auto-spawn one shell in each pane with the process cwd.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if let Ok(s) = ed.spawn_shell_in(crate::shell::PaneFocus::Bottom, &cwd) {
+            ed.bottom_pane.shells.push(s);
+        }
+        if let Ok(s) = ed.spawn_shell_in(crate::shell::PaneFocus::Right, &cwd) {
+            ed.right_pane.shells.push(s);
+        }
         ed
+    }
+
+    fn spawn_shell_in(
+        &mut self,
+        _pane: crate::shell::PaneFocus,
+        cwd: &Path,
+    ) -> anyhow::Result<crate::shell::Shell> {
+        let id = self.next_shell_id;
+        self.next_shell_id += 1;
+        // Placeholder size — gets resized on first render.
+        crate::shell::spawn_shell(id, cwd, 24, 80, self.shell_tx.clone())
+    }
+
+    pub fn drain_shell_output(&mut self) {
+        while let Ok(msg) = self.shell_rx.try_recv() {
+            match msg {
+                crate::shell::ShellMsg::Bytes { id, data } => {
+                    if let Some(new_cwd) = crate::shell::extract_osc7_cwd(&data) {
+                        self.update_shell_cwd(id, new_cwd);
+                    }
+                    self.apply_shell_bytes(id, &data);
+                }
+                crate::shell::ShellMsg::Exited { id } => {
+                    self.mark_shell_dead(id);
+                }
+            }
+        }
+        self.poll_shell_cwds();
+    }
+
+    fn poll_shell_cwds(&mut self) {
+        let updates: Vec<(u64, PathBuf)> = self
+            .bottom_pane
+            .shells
+            .iter()
+            .chain(self.right_pane.shells.iter())
+            .filter_map(|s| {
+                let pid = s.pid()?;
+                let cwd = crate::shell::query_process_cwd(pid)?;
+                if cwd != s.cwd {
+                    Some((s.id, cwd))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (id, cwd) in updates {
+            self.update_shell_cwd(id, cwd);
+        }
+    }
+
+    fn apply_shell_bytes(&mut self, id: u64, bytes: &[u8]) {
+        for shell in self.bottom_pane.shells.iter_mut() {
+            if shell.id == id {
+                shell.parser.process(bytes);
+                return;
+            }
+        }
+        for shell in self.right_pane.shells.iter_mut() {
+            if shell.id == id {
+                shell.parser.process(bytes);
+                return;
+            }
+        }
+    }
+
+    fn update_shell_cwd(&mut self, id: u64, cwd: PathBuf) {
+        let label = crate::shell::derive_label(&cwd);
+        for shell in self
+            .bottom_pane
+            .shells
+            .iter_mut()
+            .chain(self.right_pane.shells.iter_mut())
+        {
+            if shell.id == id {
+                shell.cwd = cwd;
+                shell.label = label;
+                return;
+            }
+        }
+    }
+
+    fn mark_shell_dead(&mut self, id: u64) {
+        // Exit in a shell tab auto-removes the tab.
+        if let Some(pos) = self.bottom_pane.shells.iter().position(|s| s.id == id) {
+            self.bottom_pane.shells.remove(pos);
+            if self.bottom_pane.active >= self.bottom_pane.shells.len() {
+                self.bottom_pane.active = self.bottom_pane.shells.len().saturating_sub(1);
+            }
+            return;
+        }
+        if let Some(pos) = self.right_pane.shells.iter().position(|s| s.id == id) {
+            self.right_pane.shells.remove(pos);
+            if self.right_pane.active >= self.right_pane.shells.len() {
+                self.right_pane.active = self.right_pane.shells.len().saturating_sub(1);
+            }
+        }
     }
 
     pub fn load(&mut self, path: &Path, syntax: Option<&str>) -> Result<()> {
@@ -1340,7 +1462,27 @@ impl Editor {
             seen += 1;
         }
 
-        crate::session::Session { active, buffers }
+        let bottom_shells = self
+            .bottom_pane
+            .shells
+            .iter()
+            .map(|s| crate::session::ShellTabSession { cwd: s.cwd.clone() })
+            .collect();
+        let right_shells = self
+            .right_pane
+            .shells
+            .iter()
+            .map(|s| crate::session::ShellTabSession { cwd: s.cwd.clone() })
+            .collect();
+
+        crate::session::Session {
+            active,
+            buffers,
+            bottom_shells,
+            bottom_active: self.bottom_pane.active,
+            right_shells,
+            right_active: self.right_pane.active,
+        }
     }
 
     pub fn restore_session(&mut self, session: crate::session::Session) {
@@ -1385,17 +1527,57 @@ impl Editor {
             loaded.push(b);
         }
         if loaded.is_empty() {
-            return;
+            // No buffers restored — still try shells below.
+        } else {
+            let count = loaded.len();
+            self.buffers = loaded;
+            self.active = session.active.min(count - 1);
+            let paths: Vec<PathBuf> = self.buffers.iter().filter_map(|b| b.path.clone()).collect();
+            for p in paths {
+                self.watch(&p);
+            }
+            self.set_status(format!("restored {count} buffers"));
         }
-        let count = loaded.len();
-        self.buffers = loaded;
-        self.active = session.active.min(count - 1);
-        let paths: Vec<PathBuf> = self.buffers.iter().filter_map(|b| b.path.clone()).collect();
-        for p in paths {
-            self.watch(&p);
-        }
-        self.set_status(format!("restored {count} buffers"));
         self.needs_cursor_adjust = true;
+
+        // Restore shells per pane: replace the auto-spawned default shell
+        // (created in Editor::new) with the persisted list.
+        self.bottom_pane.shells.clear();
+        self.right_pane.shells.clear();
+        for sb in &session.bottom_shells {
+            let cwd = if sb.cwd.is_dir() {
+                sb.cwd.clone()
+            } else {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            };
+            if let Ok(s) = self.spawn_shell_in(crate::shell::PaneFocus::Bottom, &cwd) {
+                self.bottom_pane.shells.push(s);
+            }
+        }
+        for sb in &session.right_shells {
+            let cwd = if sb.cwd.is_dir() {
+                sb.cwd.clone()
+            } else {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            };
+            if let Ok(s) = self.spawn_shell_in(crate::shell::PaneFocus::Right, &cwd) {
+                self.right_pane.shells.push(s);
+            }
+        }
+        if self.bottom_pane.shells.is_empty() {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if let Ok(s) = self.spawn_shell_in(crate::shell::PaneFocus::Bottom, &cwd) {
+                self.bottom_pane.shells.push(s);
+            }
+        }
+        if self.right_pane.shells.is_empty() {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if let Ok(s) = self.spawn_shell_in(crate::shell::PaneFocus::Right, &cwd) {
+                self.right_pane.shells.push(s);
+            }
+        }
+        self.bottom_pane.active = session.bottom_active.min(self.bottom_pane.shells.len().saturating_sub(1));
+        self.right_pane.active = session.right_active.min(self.right_pane.shells.len().saturating_sub(1));
     }
 
     fn watch(&mut self, path: &Path) {
@@ -1496,11 +1678,176 @@ impl Editor {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        match self.mode {
-            Mode::Normal => self.handle_key_normal(key),
-            Mode::Prompt(_) => self.handle_key_prompt(key),
+        if self.try_handle_global_key(key) {
+            return;
         }
-        self.needs_cursor_adjust = true;
+        match self.focus {
+            crate::shell::PaneFocus::Editor => {
+                match self.mode {
+                    Mode::Normal => self.handle_key_normal(key),
+                    Mode::Prompt(_) => self.handle_key_prompt(key),
+                }
+                self.needs_cursor_adjust = true;
+            }
+            crate::shell::PaneFocus::Bottom | crate::shell::PaneFocus::Right => {
+                if self.try_handle_shell_reserved(key) {
+                    return;
+                }
+                self.forward_key_to_shell(key);
+            }
+        }
+    }
+
+    fn try_handle_global_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if !ctrl || shift {
+            return false;
+        }
+        if let KeyCode::Char(c) = key.code {
+            match c {
+                '1' => {
+                    self.focus = crate::shell::PaneFocus::Editor;
+                    self.needs_cursor_adjust = true;
+                    return true;
+                }
+                '2' => {
+                    self.focus = crate::shell::PaneFocus::Bottom;
+                    return true;
+                }
+                '3' => {
+                    self.focus = crate::shell::PaneFocus::Right;
+                    return true;
+                }
+                'q' | 'Q' => {
+                    let any_dirty = self.buffers.iter().any(|b| b.dirty);
+                    if any_dirty && !self.quit_pending {
+                        self.quit_pending = true;
+                        self.set_status("unsaved changes — Ctrl-Q again to quit");
+                    } else {
+                        self.should_quit = true;
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn try_handle_shell_reserved(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Ctrl+Shift+T: new shell tab in focused pane.
+        if ctrl && shift && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T')) {
+            self.new_shell_in_focused_pane();
+            return true;
+        }
+        // Ctrl+Shift+W: close active shell tab in focused pane.
+        if ctrl && shift && matches!(key.code, KeyCode::Char('w') | KeyCode::Char('W')) {
+            self.close_active_shell_in_focused_pane();
+            return true;
+        }
+        // Alt+1..9: switch to shell tab N in focused pane.
+        if alt && !ctrl {
+            if let KeyCode::Char(c) = key.code {
+                if let Some(d) = c.to_digit(10) {
+                    if (1..=9).contains(&d) {
+                        let idx = (d - 1) as usize;
+                        let pane = self.focused_shell_pane_mut();
+                        if let Some(p) = pane {
+                            if idx < p.shells.len() {
+                                p.active = idx;
+                            }
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn forward_key_to_shell(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER);
+        // Cmd+V / Ctrl+V: paste clipboard into shell as bracketed paste.
+        if ctrl
+            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            let text = self
+                .clipboard
+                .as_mut()
+                .and_then(|cb| cb.get_text().ok())
+                .unwrap_or_default();
+            if !text.is_empty() {
+                let mut bytes = Vec::with_capacity(text.len() + 12);
+                bytes.extend_from_slice(b"\x1b[200~");
+                bytes.extend_from_slice(text.as_bytes());
+                bytes.extend_from_slice(b"\x1b[201~");
+                if let Some(shell) = self.focused_shell_mut() {
+                    shell.write(&bytes);
+                }
+            }
+            return;
+        }
+        let bytes = crate::shell::key_to_bytes(key, apply_shift);
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(shell) = self.focused_shell_mut() {
+            shell.write(&bytes);
+        }
+    }
+
+    fn focused_shell_pane_mut(&mut self) -> Option<&mut crate::shell::ShellPane> {
+        match self.focus {
+            crate::shell::PaneFocus::Bottom => Some(&mut self.bottom_pane),
+            crate::shell::PaneFocus::Right => Some(&mut self.right_pane),
+            _ => None,
+        }
+    }
+
+    fn focused_shell_mut(&mut self) -> Option<&mut crate::shell::Shell> {
+        self.focused_shell_pane_mut().and_then(|p| p.active_shell_mut())
+    }
+
+    fn new_shell_in_focused_pane(&mut self) {
+        let cwd = self
+            .focused_shell_pane_mut()
+            .and_then(|p| p.active_shell().map(|s| s.cwd.clone()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let which = self.focus;
+        let shell = match self.spawn_shell_in(which, &cwd) {
+            Ok(s) => s,
+            Err(e) => {
+                self.set_status(format!("spawn failed: {e}"));
+                return;
+            }
+        };
+        if let Some(pane) = self.focused_shell_pane_mut() {
+            pane.shells.push(shell);
+            pane.active = pane.shells.len() - 1;
+        }
+    }
+
+    fn close_active_shell_in_focused_pane(&mut self) {
+        if let Some(pane) = self.focused_shell_pane_mut() {
+            if pane.shells.is_empty() {
+                return;
+            }
+            let idx = pane.active;
+            let _ = pane.shells.remove(idx);
+            if pane.shells.is_empty() {
+                pane.active = 0;
+            } else if pane.active >= pane.shells.len() {
+                pane.active = pane.shells.len() - 1;
+            }
+        }
     }
 
     fn handle_key_normal(&mut self, key: KeyEvent) {
@@ -1698,10 +2045,16 @@ impl Editor {
         let text_area = layout.text_area;
         let tab_width = self.config.tab_width;
 
+        // Shell-pane mouse routing — check before default editor hits.
+        if let Some(which) = self.shell_pane_at_point(ev.column, ev.row, layout) {
+            self.handle_shell_mouse(ev, which);
+            return;
+        }
+
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if point_in(ev.column, ev.row, tab_area) {
-                    if let Some(idx) = self.tab_at_row(ev.row, tab_area) {
+                    if let Some(idx) = self.tab_at_column(ev.column, tab_area) {
                         self.switch_to(idx);
                         self.tab_drag = Some(idx);
                     }
@@ -1721,6 +2074,7 @@ impl Editor {
                         }
                     }
                 } else if point_in(ev.column, ev.row, text_area) {
+                    self.focus = crate::shell::PaneFocus::Editor;
                     let (row, col) = self.screen_to_doc(ev.column, ev.row, text_area, tab_width);
                     let now = Instant::now();
                     let is_double = self.last_click.is_some_and(|lc| {
@@ -1742,7 +2096,7 @@ impl Editor {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(src) = self.tab_drag {
-                    let target = self.drag_target_index(ev.row, tab_area);
+                    let target = self.drag_target_index(ev.column, tab_area);
                     if target != src && target < self.buffers.len() {
                         let buf = self.buffers.remove(src);
                         self.buffers.insert(target, buf);
@@ -1764,15 +2118,17 @@ impl Editor {
             MouseEventKind::Up(MouseButton::Left) => {
                 self.tab_drag = None;
             }
-            MouseEventKind::ScrollUp if point_in(ev.column, ev.row, tab_area) => {
-                self.tabs_scroll = self.tabs_scroll.saturating_sub(1);
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollUp
+                if point_in(ev.column, ev.row, tab_area) =>
+            {
+                self.tabs_scroll = self.tabs_scroll.saturating_sub(2);
             }
-            MouseEventKind::ScrollDown if point_in(ev.column, ev.row, tab_area) => {
-                let h = tab_area.height as usize;
-                let max = self.buffers.len().saturating_sub(h);
-                if self.tabs_scroll < max {
-                    self.tabs_scroll += 1;
-                }
+            MouseEventKind::ScrollRight | MouseEventKind::ScrollDown
+                if point_in(ev.column, ev.row, tab_area) =>
+            {
+                let total = buffer_tabs_total_width(&self.buffers);
+                let max = total.saturating_sub(tab_area.width as usize);
+                self.tabs_scroll = (self.tabs_scroll + 2).min(max);
             }
             MouseEventKind::ScrollUp => {
                 let tw = self.config.tab_width;
@@ -1783,6 +2139,125 @@ impl Editor {
                 self.active_mut().scroll_viewport_down(tw);
             }
             _ => {}
+        }
+    }
+
+    fn shell_pane_at_point(
+        &self,
+        col: u16,
+        row: u16,
+        layout: &LayoutRects,
+    ) -> Option<crate::shell::PaneFocus> {
+        if point_in(col, row, layout.bottom_tabs) || point_in(col, row, layout.bottom_body) {
+            Some(crate::shell::PaneFocus::Bottom)
+        } else if point_in(col, row, layout.right_tabs) || point_in(col, row, layout.right_body) {
+            Some(crate::shell::PaneFocus::Right)
+        } else {
+            None
+        }
+    }
+
+    fn handle_shell_mouse(&mut self, ev: MouseEvent, which: crate::shell::PaneFocus) {
+        let layout = match self.layout.as_ref() {
+            Some(l) => l,
+            None => return,
+        };
+        let (tabs_rect, body_rect) = match which {
+            crate::shell::PaneFocus::Bottom => (layout.bottom_tabs, layout.bottom_body),
+            crate::shell::PaneFocus::Right => (layout.right_tabs, layout.right_body),
+            _ => return,
+        };
+
+        // Wheel on the tab strip scrolls it horizontally.
+        if point_in(ev.column, ev.row, tabs_rect)
+            && matches!(
+                ev.kind,
+                MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+            )
+        {
+            let pane_ref = match which {
+                crate::shell::PaneFocus::Bottom => &self.bottom_pane,
+                _ => &self.right_pane,
+            };
+            let total = shell_tabs_total_width(pane_ref);
+            let visible = tabs_rect.width as usize;
+            let max_scroll = total.saturating_sub(visible);
+            let pane = match which {
+                crate::shell::PaneFocus::Bottom => &mut self.bottom_pane,
+                _ => &mut self.right_pane,
+            };
+            let step: usize = 2;
+            match ev.kind {
+                MouseEventKind::ScrollLeft | MouseEventKind::ScrollUp => {
+                    pane.tabs_scroll = pane.tabs_scroll.saturating_sub(step);
+                }
+                MouseEventKind::ScrollRight | MouseEventKind::ScrollDown => {
+                    pane.tabs_scroll = (pane.tabs_scroll + step).min(max_scroll);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Click on tab strip: switch active, or `+` to spawn a new shell.
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
+            && point_in(ev.column, ev.row, tabs_rect)
+        {
+            self.focus = which;
+            let pane_ref = match which {
+                crate::shell::PaneFocus::Bottom => &self.bottom_pane,
+                _ => &self.right_pane,
+            };
+            let x_off =
+                ev.column.saturating_sub(tabs_rect.x) as usize + pane_ref.tabs_scroll;
+            if let Some(hit) = shell_tab_hit_at(pane_ref, x_off) {
+                match hit {
+                    ShellTabHit::Tab(idx) => {
+                        let pane = self.focused_shell_pane_mut().unwrap();
+                        if idx < pane.shells.len() {
+                            pane.active = idx;
+                        }
+                    }
+                    ShellTabHit::NewShellButton => {
+                        self.new_shell_in_focused_pane();
+                    }
+                }
+            }
+            return;
+        }
+
+        // Click on body: focus pane + forward mouse.
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
+            && point_in(ev.column, ev.row, body_rect)
+        {
+            self.focus = which;
+        }
+
+        if point_in(ev.column, ev.row, body_rect) {
+            let mouse_on = self
+                .focused_shell()
+                .map(|s| s.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
+                .unwrap_or(false);
+            if mouse_on {
+                if let Some(bytes) =
+                    crate::shell::mouse_to_bytes(ev, (body_rect.x, body_rect.y))
+                {
+                    if let Some(shell) = self.focused_shell_mut() {
+                        shell.write(&bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    fn focused_shell(&self) -> Option<&crate::shell::Shell> {
+        match self.focus {
+            crate::shell::PaneFocus::Bottom => self.bottom_pane.active_shell(),
+            crate::shell::PaneFocus::Right => self.right_pane.active_shell(),
+            _ => None,
         }
     }
 
@@ -1806,31 +2281,17 @@ impl Editor {
         (sr.doc_row, doc_col)
     }
 
-    fn tab_at_row(&self, row: u16, tab_area: Rect) -> Option<usize> {
-        if row < tab_area.y || row >= tab_area.y + tab_area.height {
+    fn tab_at_column(&self, column: u16, tab_area: Rect) -> Option<usize> {
+        if column < tab_area.x || column >= tab_area.x + tab_area.width {
             return None;
         }
-        let screen_row = (row - tab_area.y) as usize;
-        let idx = self.tabs_scroll + screen_row;
-        (idx < self.buffers.len()).then_some(idx)
+        let x_off = (column - tab_area.x) as usize + self.tabs_scroll;
+        buffer_tab_at_column(&self.buffers, x_off)
     }
 
-    fn drag_target_index(&self, row: u16, tab_area: Rect) -> usize {
-        let n = self.buffers.len();
-        if n == 0 {
-            return 0;
-        }
-        let max = n - 1;
-        if row < tab_area.y {
-            return self.tabs_scroll.min(max);
-        }
-        let end = tab_area.y.saturating_add(tab_area.height);
-        if row >= end {
-            let last_visible = self.tabs_scroll + (tab_area.height as usize).saturating_sub(1);
-            return last_visible.min(max);
-        }
-        let screen_row = (row - tab_area.y) as usize;
-        (self.tabs_scroll + screen_row).min(max)
+    fn drag_target_index(&self, column: u16, tab_area: Rect) -> usize {
+        let x_off = column.saturating_sub(tab_area.x) as usize + self.tabs_scroll;
+        buffer_tab_drag_target(&self.buffers, x_off)
     }
 
     fn switch_to(&mut self, idx: usize) {
@@ -2115,37 +2576,78 @@ impl Editor {
         let area = frame.area();
         let show_bottom = matches!(self.mode, Mode::Prompt(_)) || !self.status.is_empty();
 
-        let (upper, bottom) = if show_bottom {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(1)])
-                .split(area);
-            (chunks[0], Some(chunks[1]))
-        } else {
-            (area, None)
-        };
-
-        self.ensure_active_tab_visible(upper.height);
-        let tab_col_w = self.tab_column_width();
-        let h_chunks = Layout::default()
+        // Outer horizontal split: left block | 1-col gap | right shell pane.
+        let outer_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(tab_col_w),
+                Constraint::Fill(6),
+                Constraint::Length(1),
+                Constraint::Fill(4),
+            ])
+            .split(area);
+        let left_block = outer_chunks[0];
+        let right_pane_area = outer_chunks[2];
+
+        // Left vertical: tabs | gap | editor | gap | bottom pane (26 rows:
+        // 1 tab + 1 gap + 24 body).
+        let left_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(26),
+            ])
+            .split(left_block);
+        let tab_area = left_chunks[0];
+        let editor_outer = left_chunks[2];
+        let bottom_pane_area = left_chunks[4];
+
+        self.ensure_active_tab_visible(tab_area.width);
+
+        // Editor-local status strip sits at the bottom of the editor column
+        // (not the bottom of the window).
+        let (editor_area, bottom) = if show_bottom {
+            let e = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(editor_outer);
+            (e[0], Some(e[1]))
+        } else {
+            (editor_outer, None)
+        };
+
+        // Each shell pane: tab bar | 1-row gap | body.
+        let bottom_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Min(1),
             ])
-            .split(upper);
-        let tab_area = h_chunks[0];
-        let sep_area = h_chunks[1];
-        let body = h_chunks[2];
+            .split(bottom_pane_area);
+        let bottom_tabs = bottom_chunks[0];
+        let bottom_body = bottom_chunks[2];
+
+        let right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(right_pane_area);
+        let right_tabs = right_chunks[0];
+        let right_body = right_chunks[2];
 
         let gw = self.gutter_width();
-        let gutter = Rect::new(body.x, body.y, gw.min(body.width), body.height);
+        let gutter = Rect::new(editor_area.x, editor_area.y, gw.min(editor_area.width), editor_area.height);
         let text_area = Rect::new(
-            body.x + gw.min(body.width),
-            body.y,
-            body.width.saturating_sub(gw),
-            body.height,
+            editor_area.x + gw.min(editor_area.width),
+            editor_area.y,
+            editor_area.width.saturating_sub(gw),
+            editor_area.height,
         );
 
         let tw = self.config.tab_width;
@@ -2162,11 +2664,19 @@ impl Editor {
         }
 
         self.render_tab_bar(frame, tab_area);
-        self.render_tab_separator(frame, sep_area);
         if gw > 0 {
             self.render_gutter(frame, gutter);
         }
         self.render_body(frame, text_area);
+
+        // Shell panes: resize shells to fit their new body rects, then render.
+        self.resize_pane_shells(crate::shell::PaneFocus::Bottom, bottom_body);
+        self.resize_pane_shells(crate::shell::PaneFocus::Right, right_body);
+        // Clamp horizontal tab-bar scroll to the current overflow.
+        clamp_tabs_scroll(&mut self.bottom_pane, bottom_tabs.width as usize);
+        clamp_tabs_scroll(&mut self.right_pane, right_tabs.width as usize);
+        self.render_shell_pane(frame, crate::shell::PaneFocus::Bottom, bottom_tabs, bottom_body);
+        self.render_shell_pane(frame, crate::shell::PaneFocus::Right, right_tabs, right_body);
 
         if let Some(area) = bottom {
             match &self.mode {
@@ -2176,17 +2686,21 @@ impl Editor {
         }
 
         let cursor_overlay = bottom.unwrap_or(Rect::new(0, 0, 0, 0));
-        self.place_cursor(frame, text_area, cursor_overlay);
+        self.place_cursor_unified(frame, text_area, cursor_overlay, bottom_body, right_body);
         self.layout = Some(LayoutRects {
             tab_area,
             text_area,
             gutter,
+            bottom_tabs,
+            bottom_body,
+            right_tabs,
+            right_body,
         });
     }
 
     fn render_gutter(&self, frame: &mut Frame, area: Rect) {
         let b = self.active();
-        let digits = (area.width as usize).saturating_sub(4);
+        let digits = (area.width as usize).saturating_sub(3);
         let height = area.height as usize;
         let tab_width = self.config.tab_width;
         let rows = build_screen_rows(b, height, tab_width);
@@ -2198,8 +2712,7 @@ impl Editor {
                 continue;
             };
             if !sr.is_first_segment {
-                let pad = " ".repeat((digits + 2).max(area.width as usize).min(area.width as usize));
-                lines.push(Line::from(pad));
+                lines.push(Line::from(blank.clone()));
                 continue;
             }
             let chevron = if b.collapsed_fold_at(sr.doc_row).is_some() {
@@ -2209,7 +2722,7 @@ impl Editor {
             } else {
                 ' '
             };
-            let label = format!(" {:>width$} {} ", sr.doc_row + 1, chevron, width = digits);
+            let label = format!("{:>width$} {} ", sr.doc_row + 1, chevron, width = digits);
             let style = if sr.doc_row == b.cursor_row {
                 Style::default()
             } else {
@@ -2236,95 +2749,59 @@ impl Editor {
         }
         let len = self.active().text.len().max(1);
         let digits = digits_in(len);
-        (digits + 4) as u16
+        (digits + 3) as u16
     }
 
-    fn tab_column_width(&self) -> u16 {
-        let widest = self
-            .buffers
-            .iter()
-            .map(tab_label_inner_width)
-            .max()
-            .unwrap_or(1);
-        // +1 trailing pad so the bullet doesn't kiss the separator.
-        ((widest + 1) as u16).min(TAB_COL_MAX).max(1)
-    }
-
-    fn ensure_active_tab_visible(&mut self, height: u16) {
-        let h = height as usize;
-        if h == 0 {
+    fn ensure_active_tab_visible(&mut self, width: u16) {
+        let w = width as usize;
+        if w == 0 || self.buffers.is_empty() {
             return;
         }
-        if self.active < self.tabs_scroll {
-            self.tabs_scroll = self.active;
-        } else if self.active >= self.tabs_scroll + h {
-            self.tabs_scroll = self.active + 1 - h;
+        let (active_start, active_end) = buffer_tab_extent(&self.buffers, self.active);
+        // Scroll left to keep the active tab start in view.
+        if active_start < self.tabs_scroll {
+            self.tabs_scroll = active_start;
         }
-        let max_scroll = self.buffers.len().saturating_sub(h);
+        // Scroll right so the active tab's end is in view.
+        else if active_end > self.tabs_scroll + w {
+            self.tabs_scroll = active_end.saturating_sub(w);
+        }
+        // Clamp to overflow.
+        let total = buffer_tabs_total_width(&self.buffers);
+        let max_scroll = total.saturating_sub(w);
         if self.tabs_scroll > max_scroll {
             self.tabs_scroll = max_scroll;
         }
     }
 
     fn render_tab_bar(&self, frame: &mut Frame, area: Rect) {
-        let n = self.buffers.len();
-        let height = area.height as usize;
-        let col_w = area.width as usize;
-        let scroll = self.tabs_scroll;
-        let max_shown = height.min(n.saturating_sub(scroll));
-
-        let mut lines: Vec<Line> = Vec::with_capacity(height);
-        for row in 0..max_shown {
-            let i = scroll + row;
-            let buf = &self.buffers[i];
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, buf) in self.buffers.iter().enumerate() {
             let active = i == self.active;
-
-            // Reserve: leading space + name + at-least-1 gap + bullet slot + trailing pad.
-            let name_budget = col_w.saturating_sub(4).max(1);
-            let name = truncate_with_ellipsis(&buf.display_name(), name_budget);
-            let name_len = name.chars().count();
-
+            let name = buf.display_name();
             let name_style = if active {
                 Style::default().fg(Color::White)
             } else {
                 Style::default().fg(Color::Gray)
             };
-
-            let mut spans: Vec<Span> = Vec::new();
-            spans.push(Span::raw(" "));
             spans.push(Span::styled(name, name_style));
-            // Pad so the bullet slot lands at col_w - 2 (trailing space at col_w - 1).
-            let before_bullet = 1 + name_len;
-            let bullet_col = col_w.saturating_sub(2);
-            if before_bullet < bullet_col {
-                spans.push(Span::raw(" ".repeat(bullet_col - before_bullet)));
-            }
             if buf.dirty {
+                spans.push(Span::raw(" "));
                 spans.push(Span::styled(
                     "•",
                     Style::default().fg(Color::LightYellow),
                 ));
-            } else {
-                spans.push(Span::raw(" "));
             }
             spans.push(Span::raw(" "));
-            lines.push(Line::from(spans));
         }
-        while lines.len() < height {
-            lines.push(Line::from(" ".repeat(col_w)));
-        }
-        frame.render_widget(Paragraph::new(lines), area);
-    }
-
-    fn render_tab_separator(&self, frame: &mut Frame, area: Rect) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let style = Style::default().fg(Color::DarkGray);
-        let lines: Vec<Line> = (0..area.height)
-            .map(|_| Line::from(Span::styled("│", style)))
-            .collect();
-        frame.render_widget(Paragraph::new(lines), area);
+        let scroll = self.tabs_scroll.min(u16::MAX as usize) as u16;
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).scroll((0, scroll)),
+            area,
+        );
     }
 
     fn render_body(&mut self, frame: &mut Frame, text_area: Rect) {
@@ -2434,6 +2911,282 @@ impl Editor {
                 }
             }
         }
+    }
+
+    fn place_cursor_unified(
+        &self,
+        frame: &mut Frame,
+        text_area: Rect,
+        status_bar: Rect,
+        bottom_body: Rect,
+        right_body: Rect,
+    ) {
+        use crate::shell::PaneFocus;
+        match self.focus {
+            PaneFocus::Editor => self.place_cursor(frame, text_area, status_bar),
+            PaneFocus::Bottom => self.place_shell_cursor(frame, &self.bottom_pane, bottom_body),
+            PaneFocus::Right => self.place_shell_cursor(frame, &self.right_pane, right_body),
+        }
+    }
+
+    fn place_shell_cursor(
+        &self,
+        frame: &mut Frame,
+        pane: &crate::shell::ShellPane,
+        body: Rect,
+    ) {
+        let Some(shell) = pane.active_shell() else {
+            return;
+        };
+        if shell.parser.screen().hide_cursor() {
+            return;
+        }
+        let (crow, ccol) = shell.parser.screen().cursor_position();
+        if crow < body.height && ccol < body.width {
+            frame.set_cursor_position((body.x + ccol, body.y + crow));
+        }
+    }
+
+    fn resize_pane_shells(&mut self, which: crate::shell::PaneFocus, body: Rect) {
+        let pane = match which {
+            crate::shell::PaneFocus::Bottom => &mut self.bottom_pane,
+            crate::shell::PaneFocus::Right => &mut self.right_pane,
+            _ => return,
+        };
+        for shell in pane.shells.iter_mut() {
+            shell.resize(body.height, body.width);
+        }
+    }
+
+    fn render_shell_pane(
+        &self,
+        frame: &mut Frame,
+        which: crate::shell::PaneFocus,
+        tabs: Rect,
+        body: Rect,
+    ) {
+        let pane = match which {
+            crate::shell::PaneFocus::Bottom => &self.bottom_pane,
+            crate::shell::PaneFocus::Right => &self.right_pane,
+            _ => return,
+        };
+        self.render_shell_tabs(frame, pane, tabs, which);
+        self.render_shell_body(frame, pane, body);
+    }
+
+    fn render_shell_tabs(
+        &self,
+        frame: &mut Frame,
+        pane: &crate::shell::ShellPane,
+        area: Rect,
+        _which: crate::shell::PaneFocus,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, shell) in pane.shells.iter().enumerate() {
+            let active = i == pane.active;
+            let style = if active {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            spans.push(Span::styled(shell.label.clone(), style));
+            if !shell.alive {
+                spans.push(Span::styled(
+                    " [dead]",
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled("+", Style::default().fg(Color::Gray)));
+        spans.push(Span::raw(" "));
+        let scroll = pane.tabs_scroll.min(u16::MAX as usize) as u16;
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).scroll((0, scroll)),
+            area,
+        );
+    }
+
+    fn render_shell_body(
+        &self,
+        frame: &mut Frame,
+        pane: &crate::shell::ShellPane,
+        area: Rect,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let Some(shell) = pane.active_shell() else {
+            return;
+        };
+        let screen = shell.parser.screen();
+        let buf = frame.buffer_mut();
+        for row in 0..area.height {
+            for col in 0..area.width {
+                if let Some(cell) = screen.cell(row, col) {
+                    let symbol = if cell.has_contents() {
+                        cell.contents()
+                    } else {
+                        " "
+                    };
+                    let style = vt_cell_style(cell);
+                    if let Some(tcell) = buf.cell_mut((area.x + col, area.y + row)) {
+                        tcell.set_symbol(symbol);
+                        tcell.set_style(style);
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum ShellTabHit {
+    Tab(usize),
+    NewShellButton,
+}
+
+fn buffer_tab_width(buf: &Buffer) -> usize {
+    // <name>(+ " •" if dirty) + " " — same layout as render_tab_bar.
+    let mut w = buf.display_name().chars().count();
+    if buf.dirty {
+        w += 2;
+    }
+    w += 1;
+    w
+}
+
+fn buffer_tabs_total_width(buffers: &[Buffer]) -> usize {
+    buffers.iter().map(buffer_tab_width).sum::<usize>()
+}
+
+fn buffer_tab_extent(buffers: &[Buffer], idx: usize) -> (usize, usize) {
+    let mut start = 0usize;
+    for (i, b) in buffers.iter().enumerate() {
+        let w = buffer_tab_width(b);
+        if i == idx {
+            return (start, start + w);
+        }
+        start += w;
+    }
+    (start, start)
+}
+
+fn buffer_tab_at_column(buffers: &[Buffer], x_off: usize) -> Option<usize> {
+    let mut start = 0usize;
+    for (i, b) in buffers.iter().enumerate() {
+        let w = buffer_tab_width(b);
+        if x_off >= start && x_off < start + w {
+            return Some(i);
+        }
+        start += w;
+    }
+    None
+}
+
+fn buffer_tab_drag_target(buffers: &[Buffer], x_off: usize) -> usize {
+    if buffers.is_empty() {
+        return 0;
+    }
+    let mut start = 0usize;
+    for (i, b) in buffers.iter().enumerate() {
+        let w = buffer_tab_width(b);
+        if x_off < start + w {
+            return i;
+        }
+        start += w;
+    }
+    buffers.len() - 1
+}
+
+fn shell_tab_hit_at(pane: &crate::shell::ShellPane, x_off: usize) -> Option<ShellTabHit> {
+    // Each tab: label (+ " [dead]" if dead) then a trailing space.
+    // Then a "+" (1 char) new-shell button at the end.
+    let mut x = 0usize;
+    for (i, shell) in pane.shells.iter().enumerate() {
+        let label_len = shell.label.chars().count();
+        let dead_len = if !shell.alive { " [dead]".len() } else { 0 };
+        let inner = label_len + dead_len;
+        if x_off >= x && x_off < x + inner {
+            return Some(ShellTabHit::Tab(i));
+        }
+        x += inner + 1;
+    }
+    if x_off >= x && x_off < x + 1 {
+        return Some(ShellTabHit::NewShellButton);
+    }
+    None
+}
+
+fn clamp_tabs_scroll(pane: &mut crate::shell::ShellPane, visible: usize) {
+    let total = shell_tabs_total_width(pane);
+    let max = total.saturating_sub(visible);
+    if pane.tabs_scroll > max {
+        pane.tabs_scroll = max;
+    }
+}
+
+fn shell_tabs_total_width(pane: &crate::shell::ShellPane) -> usize {
+    let mut w = 0usize;
+    for shell in &pane.shells {
+        let label_len = shell.label.chars().count();
+        let dead_len = if !shell.alive { " [dead]".len() } else { 0 };
+        w += label_len + dead_len + 1;
+    }
+    w + 2
+}
+
+fn vt_cell_style(cell: &vt100::Cell) -> Style {
+    let mut s = Style::default();
+    s = s.fg(vt_color_to_ratatui(cell.fgcolor(), false));
+    s = s.bg(vt_color_to_ratatui(cell.bgcolor(), true));
+    let mut m = Modifier::empty();
+    if cell.bold() {
+        m |= Modifier::BOLD;
+    }
+    if cell.italic() {
+        m |= Modifier::ITALIC;
+    }
+    if cell.underline() {
+        m |= Modifier::UNDERLINED;
+    }
+    if cell.inverse() {
+        m |= Modifier::REVERSED;
+    }
+    s.add_modifier(m)
+}
+
+fn vt_color_to_ratatui(c: vt100::Color, is_bg: bool) -> Color {
+    match c {
+        vt100::Color::Default => {
+            if is_bg {
+                Color::Reset
+            } else {
+                Color::Reset
+            }
+        }
+        vt100::Color::Idx(n) => match n {
+            0 => Color::Black,
+            1 => Color::Red,
+            2 => Color::Green,
+            3 => Color::Yellow,
+            4 => Color::Blue,
+            5 => Color::Magenta,
+            6 => Color::Cyan,
+            7 => Color::Gray,
+            8 => Color::DarkGray,
+            9 => Color::LightRed,
+            10 => Color::LightGreen,
+            11 => Color::LightYellow,
+            12 => Color::LightBlue,
+            13 => Color::LightMagenta,
+            14 => Color::LightCyan,
+            15 => Color::White,
+            _ => Color::Reset,
+        },
+        vt100::Color::Rgb(_, _, _) => Color::Reset,
     }
 }
 
@@ -2604,25 +3357,6 @@ fn compute_fold_end(text: &[String], row: usize, tab_width: usize) -> Option<usi
 
 fn read_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
-}
-
-const TAB_COL_MAX: u16 = 30;
-
-fn tab_label_inner_width(buf: &Buffer) -> usize {
-    // Leading space + name + at-least-one gap + bullet slot (rightmost col).
-    1 + buf.display_name().chars().count() + 2
-}
-
-fn truncate_with_ellipsis(s: &str, budget: usize) -> String {
-    if s.chars().count() <= budget {
-        return s.to_string();
-    }
-    if budget == 0 {
-        return String::new();
-    }
-    let mut out: String = s.chars().take(budget - 1).collect();
-    out.push('…');
-    out
 }
 
 fn digits_in(n: usize) -> usize {

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`sacrament` is a single-binary terminal text editor written in Rust, built on `ratatui` + `crossterm`. It uses `syntect` for syntax highlighting (no themes — ANSI 16-color mapping only, so the terminal palette drives colors).
+`sacrament` is a single-binary terminal text editor written in Rust, built on `ratatui` + `crossterm`. It uses `syntect` for syntax highlighting (no themes — ANSI 16-color mapping only, so the terminal palette drives colors). The window is a three-pane workspace: editor (top-left), a bottom shell pane, and a right-side shell pane. Each shell pane holds its own tabs of PTY-backed shells (`portable-pty` + `vt100`).
 
 ## Commands
 
@@ -28,10 +28,11 @@ This is why opening files from other terminals "joins" the live session rather t
 
 ### Event loop quirks (src/server.rs)
 
-Two non-obvious pieces of input handling live in `event_loop`:
+Three non-obvious pieces of input handling live in `event_loop`:
 
 1. **Kitty keyboard protocol** (`DISAMBIGUATE_ESCAPE_CODES | REPORT_ALL_KEYS_AS_ESCAPE_CODES`) is pushed on startup. This is what makes modifier combinations like `Ctrl+Shift+S`, `Ctrl+Shift+Z`, `Cmd+C`, `Cmd+Option+[` reach us with their full modifier bitmask. Terminals without kitty support fall back gracefully (`Alt+S`, `Ctrl+Y`, etc.).
 2. **CSI leak guard** (`is_csi_intro` / `drain_escape_tail`): when crossterm occasionally fails to parse an SGR mouse report (commonly during fast mouse-wheel scrolling), the raw bytes leak through as `Esc` + `[` + `<digits;digits;digits[Mm]`. Without the guard, `Esc` clears selection and the rest gets typed into the buffer. The guard detects `Esc` immediately followed in the same poll batch by `[` or `O` and drains chars up to the CSI terminator (ASCII letter or `~`). Same-batch is what separates leaked sequences from a user typing `Esc` then `[`.
+3. **Shell output drain**: each frame calls `editor.drain_shell_output()` *before* `event::poll`. The poll timeout is 20ms (down from the original 50ms) so shell output feels live. PTY reader threads push bytes onto an `mpsc` channel; `drain_shell_output` pulls them off, feeds them to the right shell's `vt100::Parser`, extracts OSC 7 cwd updates, and polls each shell's process cwd via `proc_pidinfo` (macOS) / `/proc/$pid/cwd` (Linux) so labels track `cd` even without OSC 7.
 
 ### Modifier unification
 
@@ -43,9 +44,9 @@ In `handle_key_normal` / `handle_key_prompt` the `ctrl` flag is `CONTROL || SUPE
 
 - **Undo/redo** stores full `Snapshot`s (text + cursor + dirty + folds). Consecutive character inserts coalesce into one step via `last_edit: Option<EditKind>`. `MAX_UNDO = 500`.
 - **File watching** uses `notify` with one watcher shared across buffers. `reload_if_changed` compares mtime and skips reloads for the buffer's own saves by tracking `known_mtime`.
-- **Tab rendering** is a vertical column on the left, one row per tab. Active tab is white text, inactive tabs are `Color::DarkGray` (same tone as comments). Column width = widest label + 1 pad, capped at `TAB_COL_MAX` (30 cols); longer names truncate with `…` via `truncate_with_ellipsis`. Dirty marker is a `•` in light yellow after the tab name. Active tab auto-scrolls into view (`ensure_active_tab_visible`); mouse-wheel over the column scrolls `tabs_scroll` manually without changing the active buffer.
+- **Tab rendering** is a single horizontal row across the top of the editor column, rendered by `render_tab_bar` as one `Paragraph` with a horizontal `scroll((0, tabs_scroll))` offset (measured in columns, not tab indices). Active tab is white text, inactive tabs are gray. Dirty marker is a `•` in light yellow after the name. Active tab auto-scrolls into view (`ensure_active_tab_visible`); mouse-wheel over the row scrolls `tabs_scroll` horizontally without changing the active buffer. Click-hit testing goes through `buffer_tab_at_column` / `buffer_tab_drag_target` which walk the same width arithmetic as the renderer (`buffer_tab_width` = name + `" •"` if dirty + trailing space).
 - **Tab characters** are expanded to spaces at render time via `char_display_width(c, vis_col, tab_width)`, which snaps to the next multiple of `tab_width`. Cursor math (`char_idx_to_vis_col`, `vis_col_to_char_idx`) uses the same function so click/arrow positions stay aligned.
-- **Layout**: left-to-right — vertical tab column, a 1-col `│` separator, line-number gutter, text area. An optional 1-row status strip at the bottom spans the full width and appears only when there's a prompt or a transient status. No permanent status bar.
+- **Layout**: the window splits horizontally into a **left block** (`Fill(6)`) | 1-col gap | **right shell pane** (`Fill(4)`). The left block splits vertically as: 1-row tab bar | 1-row gap | editor body (`Min(1)`) | 1-row gap | 26-row bottom shell pane. The editor body's inner layout is gutter + text area. An optional 1-row status strip sits at the bottom of the editor column (not the window) and appears only when there's a prompt or a transient status. No permanent status bar. Each shell pane splits vertically as: 1-row tab strip | 1-row gap | body.
 
 ### Highlight cache (src/highlight.rs + Buffer fields)
 
@@ -66,9 +67,19 @@ Folds are **metadata about visibility**, not content — `text`, `highlights`, a
 
 Fold state is part of the undo `Snapshot` and is also round-tripped through `session.toml` (with clamping on restore).
 
+### Shell panes (src/shell.rs + Editor::{bottom_pane, right_pane})
+
+Each pane is a `ShellPane` = `Vec<Shell>` + `active: usize` + `tabs_scroll`. A `Shell` owns a `portable_pty` master/writer/child plus a `vt100::Parser` (2000-row scrollback) that's the source of truth for what to render. `Editor` also owns a `PaneFocus` (Editor/Bottom/Right) and an `mpsc` channel (`shell_tx` / `shell_rx`) — each `spawn_shell` creates a reader thread that forwards PTY bytes as `ShellMsg::Bytes { id, data }` / `ShellMsg::Exited { id }`.
+
+- **Spawning**: `Editor::new` auto-spawns one shell per pane with the process cwd. `restore_session` replaces them with the persisted list (one shell per saved `ShellTabSession { cwd }`), falling back to current dir if the saved cwd no longer exists.
+- **Rendering**: `render_shell_body` reads cells directly from `vt100::Parser::screen()` and writes them into the ratatui buffer via `vt_cell_style` / `vt_color_to_ratatui`. Only the 16 ANSI colors are emitted — truecolor / indexed beyond 15 collapse to `Color::Reset`, matching the editor's no-RGB rule. Before rendering, `resize_pane_shells` calls `Shell::resize` to sync the PTY + parser to the current body rect.
+- **Input routing**: `handle_key` first runs `try_handle_global_key` (Ctrl+1/2/3 switch panes, Ctrl+Q quits). If focus is a shell pane, `try_handle_shell_reserved` handles Ctrl+Shift+T (new tab), Ctrl+Shift+W (close tab), Alt+1..9 (switch tab); otherwise keys go through `shell::key_to_bytes` and are written to the PTY. Cmd/Ctrl+V pastes the clipboard as a bracketed paste sequence (`\x1b[200~` … `\x1b[201~`). Mouse events in a pane body are forwarded as SGR mouse reports via `shell::mouse_to_bytes` *only* when the shell's vt100 parser reports a non-`None` `mouse_protocol_mode` — outside that, clicks just move focus.
+- **Cwd tracking**: two paths, both handled in `drain_shell_output`. OSC 7 (`\x1b]7;file://host/path\x07`) is parsed by `extract_osc7_cwd` on every chunk of PTY output; as a fallback (and to catch shells without OSC 7), `poll_shell_cwds` calls `query_process_cwd` (macOS `proc_pidinfo PROC_PIDVNODEPATHINFO` / Linux `/proc/$pid/cwd`) and updates the shell's `cwd` + `label` when it changes. The label is the cwd's basename via `derive_label`.
+- **Exit**: when the child process exits, `mark_shell_dead` removes the tab and clamps `active`.
+
 ### Session persistence (src/session.rs)
 
-On quit, `capture_session` serializes file-backed buffers (path, cursor, scroll, folds) to `$XDG_CONFIG_HOME/sacrament/session.toml` (falls back to `~/.config`). Untitled buffers are dropped; the active index is remapped past them. `restore_session` runs on launch *only* when no CLI path was given. Missing files are skipped silently; cursor/scroll are clamped to the new file bounds in case the file shrank.
+On quit, `capture_session` serializes file-backed buffers (path, cursor, scroll, folds) plus each shell pane's tab cwds (`bottom_shells`, `right_shells`, and their active indices) to `$XDG_CONFIG_HOME/sacrament/session.toml` (falls back to `~/.config`). Untitled buffers are dropped; the active index is remapped past them. `restore_session` runs on launch *only* when no CLI path was given. Missing files are skipped silently; cursor/scroll are clamped to the new file bounds in case the file shrank. Shells are re-spawned (not literally restored — PTYs are not persistable); the auto-spawned defaults in `Editor::new` are cleared and replaced. If a pane ends up empty after restore, one default shell is spawned so a pane always has a shell.
 
 ### Config (src/config.rs)
 
@@ -77,5 +88,6 @@ TOML at `$XDG_CONFIG_HOME/sacrament/config.toml`. All fields have defaults (`Con
 ## Conventions
 
 - No backwards-compat shims or feature flags. Behavior changes go straight in.
-- Terminal palette is the source of truth for colors — don't introduce RGB colors.
+- Terminal palette is the source of truth for colors — don't introduce RGB colors. This applies to the shell renderer too (`vt_color_to_ratatui` collapses `vt100::Color::Rgb` to `Color::Reset`).
 - Any code that mutates `Buffer::text` line count must also update `highlights` and `line_state_before` in the same step, then call `invalidate_highlights_from` and `adjust_folds_for_edit`.
+- Shell tab hit-testing and rendering share their width math — if you change one of `render_tab_bar` / `render_shell_tabs` or their helpers (`buffer_tab_width`, `shell_tabs_total_width`, `shell_tab_hit_at`), update the others in the same pass or clicks will miss the drawn tabs.

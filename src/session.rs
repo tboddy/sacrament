@@ -11,6 +11,19 @@ pub struct Session {
     pub active: usize,
     #[serde(default)]
     pub buffers: Vec<SessionBuffer>,
+    #[serde(default)]
+    pub bottom_shells: Vec<ShellTabSession>,
+    #[serde(default)]
+    pub bottom_active: usize,
+    #[serde(default)]
+    pub right_shells: Vec<ShellTabSession>,
+    #[serde(default)]
+    pub right_active: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ShellTabSession {
+    pub cwd: PathBuf,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -5,6 +5,7 @@ mod highlight;
 mod protocol;
 mod server;
 mod session;
+mod shell;
 
 use std::path::{Path, PathBuf};
 use std::process;
