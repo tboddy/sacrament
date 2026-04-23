@@ -34,6 +34,7 @@ impl Highlighter {
             // Extensions not in syntect's defaults — alias to a close match.
             let canonical = match ext {
                 "vue" => "html",
+                "fab" => "rs",
                 other => other,
             };
             if let Some(s) = self.syntax_set.find_syntax_by_extension(canonical) {
