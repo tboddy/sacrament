@@ -1220,6 +1220,7 @@ pub struct Editor {
     shell_tx: mpsc::Sender<crate::shell::ShellMsg>,
     pub shell_rx: mpsc::Receiver<crate::shell::ShellMsg>,
     next_shell_id: u64,
+    shell_mouse_drag: Option<crate::shell::PaneFocus>,
 }
 
 impl Editor {
@@ -1273,6 +1274,7 @@ impl Editor {
             shell_tx,
             shell_rx,
             next_shell_id: 0,
+            shell_mouse_drag: None,
         };
         ed.buffers[0].wrap = ed.config.word_wrap;
         // Auto-spawn one shell in each pane with the process cwd.
@@ -1751,6 +1753,46 @@ impl Editor {
             self.close_active_shell_in_focused_pane();
             return true;
         }
+        // Copy the shell selection: Cmd+C / Cmd+Shift+C on macOS, or
+        // Ctrl+Shift+C on Linux. Plain Ctrl+C stays reserved for SIGINT
+        // (handled below by forward_key_to_shell → key_to_bytes).
+        let super_held = key.modifiers.contains(KeyModifiers::SUPER);
+        let copy_combo = matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && (super_held
+                || (key.modifiers.contains(KeyModifiers::CONTROL) && shift));
+        if copy_combo {
+            if let Some(text) = self.focused_shell_mut().and_then(|s| s.selected_text()) {
+                if let Some(cb) = self.clipboard.as_mut() {
+                    let _ = cb.set_text(text);
+                }
+            }
+            return true;
+        }
+        // Paste into the shell: Cmd+V / Cmd+Shift+V on macOS, or
+        // Ctrl+Shift+V on Linux. Plain Ctrl+V is left to the shell
+        // (readline quoted-insert).
+        let paste_combo = matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+            && (super_held
+                || (key.modifiers.contains(KeyModifiers::CONTROL) && shift));
+        if paste_combo {
+            let text = self
+                .clipboard
+                .as_mut()
+                .and_then(|cb| cb.get_text().ok())
+                .unwrap_or_default();
+            if !text.is_empty() {
+                let mut bytes = Vec::with_capacity(text.len() + 12);
+                bytes.extend_from_slice(b"\x1b[200~");
+                bytes.extend_from_slice(text.as_bytes());
+                bytes.extend_from_slice(b"\x1b[201~");
+                if let Some(shell) = self.focused_shell_mut() {
+                    shell.reset_scrollback();
+                    shell.selection = None;
+                    shell.write(&bytes);
+                }
+            }
+            return true;
+        }
         // Alt+1..9: switch to shell tab N in focused pane.
         if alt && !ctrl {
             if let KeyCode::Char(c) = key.code {
@@ -1772,27 +1814,15 @@ impl Editor {
     }
 
     fn forward_key_to_shell(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
-            || key.modifiers.contains(KeyModifiers::SUPER);
-        // Cmd+V / Ctrl+V: paste clipboard into shell as bracketed paste.
-        if ctrl
-            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
-            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        // Cmd-based copy/paste is already intercepted upstream by
+        // try_handle_shell_reserved; Ctrl+key falls through here so the
+        // PTY sees real control bytes (Ctrl+C → SIGINT, Ctrl+V →
+        // readline quoted-insert, etc.).
+        // Swallow any other Cmd combo so it doesn't end up typed into
+        // the shell (e.g. Cmd+A on macOS).
+        if key.modifiers.contains(KeyModifiers::SUPER)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
         {
-            let text = self
-                .clipboard
-                .as_mut()
-                .and_then(|cb| cb.get_text().ok())
-                .unwrap_or_default();
-            if !text.is_empty() {
-                let mut bytes = Vec::with_capacity(text.len() + 12);
-                bytes.extend_from_slice(b"\x1b[200~");
-                bytes.extend_from_slice(text.as_bytes());
-                bytes.extend_from_slice(b"\x1b[201~");
-                if let Some(shell) = self.focused_shell_mut() {
-                    shell.write(&bytes);
-                }
-            }
             return;
         }
         let bytes = crate::shell::key_to_bytes(key, apply_shift);
@@ -1800,6 +1830,8 @@ impl Editor {
             return;
         }
         if let Some(shell) = self.focused_shell_mut() {
+            shell.reset_scrollback();
+            shell.selection = None;
             shell.write(&bytes);
         }
     }
@@ -2046,6 +2078,17 @@ impl Editor {
         let tab_width = self.config.tab_width;
 
         // Shell-pane mouse routing — check before default editor hits.
+        // Active drag stays locked to its origin pane even if the pointer
+        // drifts out of the pane rect (common during text selection).
+        if let Some(which) = self.shell_mouse_drag {
+            if matches!(
+                ev.kind,
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+            ) {
+                self.handle_shell_mouse(ev, which);
+                return;
+            }
+        }
         if let Some(which) = self.shell_pane_at_point(ev.column, ev.row, layout) {
             self.handle_shell_mouse(ev, which);
             return;
@@ -2054,11 +2097,13 @@ impl Editor {
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if point_in(ev.column, ev.row, tab_area) {
+                    self.focus = crate::shell::PaneFocus::Editor;
                     if let Some(idx) = self.tab_at_column(ev.column, tab_area) {
                         self.switch_to(idx);
                         self.tab_drag = Some(idx);
                     }
                 } else if layout.gutter.width > 0 && point_in(ev.column, ev.row, layout.gutter) {
+                    self.focus = crate::shell::PaneFocus::Editor;
                     // Click in the gutter. Chevron sits in the second-to-last
                     // column (there's a trailing space for breathing room).
                     let gutter = layout.gutter;
@@ -2229,34 +2274,109 @@ impl Editor {
             return;
         }
 
-        // Click on body: focus pane + forward mouse.
+        // Click on body: focus pane.
         if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
             && point_in(ev.column, ev.row, body_rect)
         {
             self.focus = which;
         }
 
-        if point_in(ev.column, ev.row, body_rect) {
-            let mouse_on = self
-                .focused_shell()
-                .map(|s| s.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
-                .unwrap_or(false);
-            if mouse_on {
-                if let Some(bytes) =
-                    crate::shell::mouse_to_bytes(ev, (body_rect.x, body_rect.y))
-                {
-                    if let Some(shell) = self.focused_shell_mut() {
+        let in_body = point_in(ev.column, ev.row, body_rect);
+        let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
+        let mouse_on = self
+            .shell_for_pane(which)
+            .map(|s| s.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
+            .unwrap_or(false);
+        // TUIs that opt into mouse reporting (vim, htop, etc.) get the raw
+        // events — unless the user holds Shift, which forces local handling
+        // (standard terminal-emulator convention for copy/paste).
+        let forward_to_tui = mouse_on && !shift;
+
+        if forward_to_tui {
+            if in_body {
+                if let Some(bytes) = crate::shell::mouse_to_bytes(ev, (body_rect.x, body_rect.y)) {
+                    if let Some(shell) = self.shell_for_pane_mut(which) {
                         shell.write(&bytes);
                     }
                 }
             }
+            return;
+        }
+
+        // Local scroll + selection. Coordinates are viewport cells (row, col)
+        // within the body rect.
+        let (vp_row, vp_col) = viewport_coord_clamped(ev.column, ev.row, body_rect);
+
+        match ev.kind {
+            MouseEventKind::ScrollUp if in_body => {
+                if let Some(shell) = self.shell_for_pane_mut(which) {
+                    shell.selection = None;
+                    shell.scroll_by(3);
+                }
+            }
+            MouseEventKind::ScrollDown if in_body => {
+                if let Some(shell) = self.shell_for_pane_mut(which) {
+                    shell.selection = None;
+                    shell.scroll_by(-3);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_body => {
+                if let Some(shell) = self.shell_for_pane_mut(which) {
+                    shell.selection = Some(crate::shell::Selection {
+                        start: (vp_row, vp_col),
+                        end: (vp_row, vp_col),
+                    });
+                }
+                self.shell_mouse_drag = Some(which);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(shell) = self.shell_for_pane_mut(which) {
+                    if let Some(sel) = shell.selection.as_mut() {
+                        sel.end = (vp_row, vp_col);
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.shell_mouse_drag = None;
+                let text = self
+                    .shell_for_pane(which)
+                    .and_then(|s| s.selected_text());
+                // If the selection is a single cell (no drag), treat it as a
+                // click and clear the selection so it doesn't linger.
+                let single_point = self
+                    .shell_for_pane(which)
+                    .and_then(|s| s.selection)
+                    .map(|s| s.start == s.end)
+                    .unwrap_or(true);
+                if single_point {
+                    if let Some(shell) = self.shell_for_pane_mut(which) {
+                        shell.selection = None;
+                    }
+                } else if let Some(text) = text {
+                    if let Some(cb) = self.clipboard.as_mut() {
+                        let _ = cb.set_text(text);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
-    fn focused_shell(&self) -> Option<&crate::shell::Shell> {
-        match self.focus {
+    fn shell_for_pane(&self, which: crate::shell::PaneFocus) -> Option<&crate::shell::Shell> {
+        match which {
             crate::shell::PaneFocus::Bottom => self.bottom_pane.active_shell(),
             crate::shell::PaneFocus::Right => self.right_pane.active_shell(),
+            _ => None,
+        }
+    }
+
+    fn shell_for_pane_mut(
+        &mut self,
+        which: crate::shell::PaneFocus,
+    ) -> Option<&mut crate::shell::Shell> {
+        match which {
+            crate::shell::PaneFocus::Bottom => self.bottom_pane.active_shell_mut(),
+            crate::shell::PaneFocus::Right => self.right_pane.active_shell_mut(),
             _ => None,
         }
     }
@@ -2524,11 +2644,26 @@ impl Editor {
     }
 
     pub fn handle_paste(&mut self, text: String) {
-        self.needs_cursor_adjust = true;
-        if !matches!(self.mode, Mode::Normal) {
+        if text.is_empty() {
             return;
         }
-        if text.is_empty() {
+        if matches!(
+            self.focus,
+            crate::shell::PaneFocus::Bottom | crate::shell::PaneFocus::Right
+        ) {
+            let mut bytes = Vec::with_capacity(text.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            if let Some(shell) = self.focused_shell_mut() {
+                shell.reset_scrollback();
+                shell.selection = None;
+                shell.write(&bytes);
+            }
+            return;
+        }
+        self.needs_cursor_adjust = true;
+        if !matches!(self.mode, Mode::Normal) {
             return;
         }
         self.insert_paste_text(&text);
@@ -2789,9 +2924,8 @@ impl Editor {
             };
             spans.push(Span::styled(name, name_style));
             if buf.dirty {
-                spans.push(Span::raw(" "));
                 spans.push(Span::styled(
-                    "•",
+                    " •",
                     Style::default().fg(Color::LightYellow),
                 ));
             }
@@ -2938,10 +3072,11 @@ impl Editor {
         let Some(shell) = pane.active_shell() else {
             return;
         };
-        if shell.parser.screen().hide_cursor() {
+        let screen = shell.parser.screen();
+        if screen.hide_cursor() || screen.scrollback() > 0 {
             return;
         }
-        let (crow, ccol) = shell.parser.screen().cursor_position();
+        let (crow, ccol) = screen.cursor_position();
         if crow < body.height && ccol < body.width {
             frame.set_cursor_position((body.x + ccol, body.y + crow));
         }
@@ -3023,6 +3158,7 @@ impl Editor {
             return;
         };
         let screen = shell.parser.screen();
+        let selection = shell.selection;
         let buf = frame.buffer_mut();
         for row in 0..area.height {
             for col in 0..area.width {
@@ -3032,7 +3168,12 @@ impl Editor {
                     } else {
                         " "
                     };
-                    let style = vt_cell_style(cell);
+                    let mut style = vt_cell_style(cell);
+                    if let Some(sel) = selection {
+                        if sel.contains(row, col) {
+                            style = style.add_modifier(Modifier::REVERSED);
+                        }
+                    }
                     if let Some(tcell) = buf.cell_mut((area.x + col, area.y + row)) {
                         tcell.set_symbol(symbol);
                         tcell.set_style(style);
@@ -3041,6 +3182,24 @@ impl Editor {
             }
         }
     }
+}
+
+fn viewport_coord_clamped(col: u16, row: u16, body: Rect) -> (u16, u16) {
+    let vp_row = if row < body.y {
+        0
+    } else if row >= body.y + body.height {
+        body.height.saturating_sub(1)
+    } else {
+        row - body.y
+    };
+    let vp_col = if col < body.x {
+        0
+    } else if col >= body.x + body.width {
+        body.width.saturating_sub(1)
+    } else {
+        col - body.x
+    };
+    (vp_row, vp_col)
 }
 
 enum ShellTabHit {

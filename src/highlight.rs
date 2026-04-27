@@ -138,7 +138,7 @@ fn style_for(stack: &ScopeStack) -> (Option<Color>, Modifier) {
             return (Some(Color::LightYellow), Modifier::empty());
         }
         if starts_with_any(&name, &["entity.name.function"]) {
-            return (Some(Color::Green), Modifier::empty());
+            return (Some(Color::LightGreen), Modifier::empty());
         }
         if starts_with_any(
             &name,

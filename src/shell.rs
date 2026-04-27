@@ -30,10 +30,46 @@ pub struct Shell {
     pub parser: vt100::Parser,
     pub size: (u16, u16),
     pub alive: bool,
+    pub selection: Option<Selection>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
     reader_alive: Arc<AtomicBool>,
+}
+
+/// Viewport-relative selection (row, col are offsets inside the pane body,
+/// including any scrollback offset currently applied to the vt100 screen).
+#[derive(Clone, Copy, Debug)]
+pub struct Selection {
+    pub start: (u16, u16),
+    pub end: (u16, u16),
+}
+
+impl Selection {
+    pub fn normalized(self) -> ((u16, u16), (u16, u16)) {
+        if (self.start.0, self.start.1) <= (self.end.0, self.end.1) {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        }
+    }
+
+    pub fn contains(self, row: u16, col: u16) -> bool {
+        let (s, e) = self.normalized();
+        if row < s.0 || row > e.0 {
+            return false;
+        }
+        if s.0 == e.0 {
+            return col >= s.1 && col <= e.1;
+        }
+        if row == s.0 {
+            return col >= s.1;
+        }
+        if row == e.0 {
+            return col <= e.1;
+        }
+        true
+    }
 }
 
 impl Shell {
@@ -66,6 +102,57 @@ impl Shell {
 
     pub fn pid(&self) -> Option<u32> {
         self.child.process_id()
+    }
+
+    /// Shift the viewport into scrollback. Positive delta scrolls back
+    /// (older content); negative scrolls toward live output. Clamped by
+    /// vt100 internally.
+    pub fn scroll_by(&mut self, delta: i32) {
+        let current = self.parser.screen().scrollback() as i32;
+        let next = (current + delta).max(0) as usize;
+        self.parser.screen_mut().set_scrollback(next);
+    }
+
+    pub fn reset_scrollback(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    /// Collect the text under the current selection, trimming trailing
+    /// whitespace from each row. Returns None if no selection or empty.
+    pub fn selected_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        let (start, end) = sel.normalized();
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        if rows == 0 || cols == 0 {
+            return None;
+        }
+        let mut out = String::new();
+        for r in start.0..=end.0 {
+            if r >= rows {
+                break;
+            }
+            let c_start = if r == start.0 { start.1 } else { 0 };
+            let c_end = if r == end.0 { end.1 } else { cols.saturating_sub(1) };
+            let mut line = String::new();
+            for c in c_start..=c_end {
+                if c >= cols {
+                    break;
+                }
+                if let Some(cell) = screen.cell(r, c) {
+                    if cell.has_contents() {
+                        line.push_str(cell.contents());
+                    } else {
+                        line.push(' ');
+                    }
+                }
+            }
+            if r != start.0 {
+                out.push('\n');
+            }
+            out.push_str(line.trim_end());
+        }
+        if out.is_empty() { None } else { Some(out) }
     }
 }
 
@@ -174,6 +261,7 @@ pub fn spawn_shell(
         parser,
         size: (rows.max(1), cols.max(1)),
         alive: true,
+        selection: None,
         master: pair.master,
         writer,
         child,
@@ -201,8 +289,24 @@ pub fn key_to_bytes(key: KeyEvent, apply_shift: fn(char) -> char) -> Vec<u8> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
+    // Alt is delivered two different ways depending on the key. For "simple"
+    // keys (Char, Enter, Tab, Backspace, Esc) the convention is ESC+key. For
+    // keys whose CSI form already carries a modifier byte (arrows, F-keys,
+    // etc.), the modifier is encoded *inside* the sequence — adding an
+    // ESC prefix on top would deliver a stray Escape to the program (e.g.
+    // Claude Code interprets it as cancel).
+    let alt_prefix = alt
+        && matches!(
+            key.code,
+            KeyCode::Char(_)
+                | KeyCode::Enter
+                | KeyCode::Tab
+                | KeyCode::Backspace
+                | KeyCode::Esc
+        );
+
     let mut out: Vec<u8> = Vec::new();
-    if alt {
+    if alt_prefix {
         out.push(0x1b);
     }
 
@@ -230,6 +334,12 @@ pub fn key_to_bytes(key: KeyEvent, apply_shift: fn(char) -> char) -> Vec<u8> {
             out
         }
         KeyCode::Enter => {
+            // Shift+Enter → ESC+CR, the convention Claude Code and many
+            // REPLs read as "insert newline, don't submit". Alt+Enter
+            // already gets the ESC prefix from the preamble above.
+            if shift && !alt {
+                out.push(0x1b);
+            }
             out.push(b'\r');
             out
         }
@@ -249,10 +359,25 @@ pub fn key_to_bytes(key: KeyEvent, apply_shift: fn(char) -> char) -> Vec<u8> {
             out.push(0x1b);
             out
         }
-        KeyCode::Up => arrow(&mut out, b'A', shift, alt, ctrl),
-        KeyCode::Down => arrow(&mut out, b'B', shift, alt, ctrl),
-        KeyCode::Right => arrow(&mut out, b'C', shift, alt, ctrl),
-        KeyCode::Left => arrow(&mut out, b'D', shift, alt, ctrl),
+        // Arrow keys: only Ctrl is preserved when forwarded to the PTY.
+        // Default bash/zsh readline only binds plain arrows and Ctrl+Left/
+        // Right (word motion); other modifier-encoded forms like \x1b[1;2C
+        // (Shift+Right) or \x1b[1;3A (Alt+Up) get partially consumed by zle
+        // and leak ";2C"/";3A" into the buffer. Plain Alt+Left/Right is
+        // remapped to readline's ESC+b / ESC+f word-motion bytes; other
+        // shift/alt combos collapse to the unmodified arrow.
+        KeyCode::Up => arrow(&mut out, b'A', false, false, ctrl),
+        KeyCode::Down => arrow(&mut out, b'B', false, false, ctrl),
+        KeyCode::Right if alt && !ctrl => {
+            out.extend_from_slice(b"\x1bf");
+            out
+        }
+        KeyCode::Left if alt && !ctrl => {
+            out.extend_from_slice(b"\x1bb");
+            out
+        }
+        KeyCode::Right => arrow(&mut out, b'C', false, false, ctrl),
+        KeyCode::Left => arrow(&mut out, b'D', false, false, ctrl),
         KeyCode::Home => {
             out.extend_from_slice(b"\x1b[H");
             out
