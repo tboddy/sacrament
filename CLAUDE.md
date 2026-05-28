@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`sacrament` is a single-binary terminal text editor written in Rust, built on `ratatui` + `crossterm`. It uses `syntect` for syntax highlighting (no themes — ANSI 16-color mapping only, so the terminal palette drives colors). The window is a three-pane workspace: editor (top-left), a bottom shell pane, and a right-side shell pane. Each shell pane holds its own tabs of PTY-backed shells (`portable-pty` + `vt100`).
+`sacrament` is a single-binary terminal text editor written in Rust, built on `ratatui` + `crossterm`. It uses `syntect` for syntax highlighting (no themes — ANSI 16-color mapping only, so the terminal palette drives colors) and `pulldown-cmark` for an optional markdown read-mode renderer. The window is a three-pane workspace: editor (top-left), a bottom shell pane, and a right-side shell pane. Each shell pane holds its own tabs of PTY-backed shells (`portable-pty` + `vt100`).
 
 ## Commands
 
@@ -44,9 +44,22 @@ In `handle_key_normal` / `handle_key_prompt` the `ctrl` flag is `CONTROL || SUPE
 
 - **Undo/redo** stores full `Snapshot`s (text + cursor + dirty + folds). Consecutive character inserts coalesce into one step via `last_edit: Option<EditKind>`. `MAX_UNDO = 500`.
 - **File watching** uses `notify` with one watcher shared across buffers. `reload_if_changed` compares mtime and skips reloads for the buffer's own saves by tracking `known_mtime`.
-- **Tab rendering** is a single horizontal row across the top of the editor column, rendered by `render_tab_bar` as one `Paragraph` with a horizontal `scroll((0, tabs_scroll))` offset (measured in columns, not tab indices). Active tab is white text, inactive tabs are gray. Dirty marker is a `•` in light yellow after the name. Active tab auto-scrolls into view (`ensure_active_tab_visible`); mouse-wheel over the row scrolls `tabs_scroll` horizontally without changing the active buffer. Click-hit testing goes through `buffer_tab_at_column` / `buffer_tab_drag_target` which walk the same width arithmetic as the renderer (`buffer_tab_width` = name + `" •"` if dirty + trailing space).
+- **Tab rendering** is a single horizontal row across the top of the editor column, rendered by `render_tab_bar` as one `Paragraph` with a horizontal `scroll((0, tabs_scroll))` offset (measured in columns, not tab indices). Active tab is white text, inactive tabs are gray. Dirty marker is a `•` in light yellow after the name. Active tab auto-scrolls into view (`ensure_active_tab_visible`) only on the frame the active buffer changes — tracked via `tabs_scroll_anchor: Option<usize>` — so manual mouse-wheel scrolling on the tab strip isn't reverted on subsequent frames. `clamp_tabs_scroll_for_buffers` runs every frame to keep `tabs_scroll` within bounds when the buffer list shrinks. Mouse-wheel over the row scrolls `tabs_scroll` horizontally without changing the active buffer. Click-hit testing goes through `buffer_tab_at_column` / `buffer_tab_drag_target` which walk the same width arithmetic as the renderer (`buffer_tab_width` = name + `" •"` if dirty + trailing space).
 - **Tab characters** are expanded to spaces at render time via `char_display_width(c, vis_col, tab_width)`, which snaps to the next multiple of `tab_width`. Cursor math (`char_idx_to_vis_col`, `vis_col_to_char_idx`) uses the same function so click/arrow positions stay aligned.
 - **Layout**: the window splits horizontally into a **left block** (`Fill(6)`) | 1-col gap | **right shell pane** (`Fill(4)`). The left block splits vertically as: 1-row tab bar | 1-row gap | editor body (`Min(1)`) | 1-row gap | 26-row bottom shell pane. The editor body's inner layout is gutter + text area. An optional 1-row status strip sits at the bottom of the editor column (not the window) and appears only when there's a prompt or a transient status. No permanent status bar. Each shell pane splits vertically as: 1-row tab strip | 1-row gap | body.
+
+### Markdown read mode (src/markdown.rs + Buffer::view_mode)
+
+Every `Buffer` carries a `view_mode: ViewMode` (`Edit` or `Read`). `Alt+M` (and `Ctrl+Shift+M` as a fallback for terminals that don't surface `Alt`) toggles it on markdown buffers — detected by extension (`md` / `markdown` / `mdx`); non-markdown buffers get a "not a markdown file" status and stay in edit mode. Toggling resets scroll + cursor to the top (the source-line ↔ rendered-line mapping isn't preserved) and clears the selection anchor.
+
+In read mode:
+- `render_body` short-circuits to `render_read_body`, which calls `markdown::render(&text.join("\n"), width)` to get a `Vec<Line<'static>>` and renders it as a single `Paragraph` with `scroll((scroll_row, 0))`. Read-mode scroll is plain row scroll (no segment/visual-column tracking) — wheel events and arrow keys bump `scroll_row` directly, clamped against `lines.len().saturating_sub(height)`.
+- `gutter_width` returns 0 (no line numbers).
+- `place_cursor` returns early so no cursor is drawn.
+- Mouse clicks in the text area only move focus — no cursor placement, no selection drag.
+- `handle_key_read` (called from `handle_key_normal` after the read-mode early return) accepts only navigation, copy/save/find prompts, tab switching, and quit. Everything else is swallowed so the buffer can't be edited.
+
+`markdown.rs` walks `pulldown_cmark::Parser` events with `ENABLE_STRIKETHROUGH | ENABLE_TASKLISTS | ENABLE_TABLES`. It maintains a style stack (so nested emphasis composes), open list contexts (indent + ordered counter), a blockquote depth, and an optional table accumulator that emits a column-aligned table on `TagEnd::Table`. Inline spans are wrapped to the body width via a width-aware `flush` that breaks on whitespace using `unicode-width`. Like the editor, only the 16 ANSI colors are used.
 
 ### Highlight cache (src/highlight.rs + Buffer fields)
 

@@ -23,6 +23,7 @@ Then run `sacrament <file>[:line]`.
 - **Integrated shells**: a bottom pane and a right-side pane, each with its own shell tabs. `Ctrl+1/2/3` moves focus between editor / bottom / right. Tab labels track the shell's cwd as you `cd` around.
 - **Syntax highlighting** via `syntect` (TextMate grammars), rendered in your terminal's ANSI 16-color palette. Swap your terminal theme, the editor follows.
 - **Code folding** (indent-based) with a clickable gutter chevron.
+- **Markdown read mode** — `Alt+M` toggles a `.md` / `.markdown` / `.mdx` buffer between source editing and a rendered, read-only view (headings, lists, code blocks, tables, links, emphasis).
 - **Search** (`Ctrl+F`), **goto-line** (`Ctrl+G`), and `sacrament file.rs:42` CLI syntax.
 - **Undo/redo** with coalesced character inserts.
 - **Mouse**: click to move, drag to select, double-click to select a word, scroll to navigate. Mouse in shell panes passes through to TUIs that opt into mouse reporting.
@@ -51,6 +52,7 @@ Where shown, `Ctrl` and `Cmd` are interchangeable (macOS-friendly).
 | Indent / outdent | `Ctrl+]` / `Ctrl+[` (selection-aware) |
 | Fold / unfold at cursor | `Cmd+Option+[` / `Cmd+Option+]` |
 | Fold / unfold all | `Cmd+Option+Shift+[` / `Cmd+Option+Shift+]` |
+| Toggle markdown read mode | `Alt+M` (or `Ctrl+Shift+M`) on `.md` buffers |
 | Focus editor / bottom shell / right shell | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` |
 | New shell tab in focused pane | `Ctrl+Shift+T` |
 | Close shell tab in focused pane | `Ctrl+Shift+W` |
