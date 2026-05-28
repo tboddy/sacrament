@@ -2,6 +2,7 @@ mod client;
 mod config;
 mod editor;
 mod highlight;
+mod markdown;
 mod protocol;
 mod server;
 mod session;

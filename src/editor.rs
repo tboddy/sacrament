@@ -77,6 +77,12 @@ enum CommentResult {
     NoStyle(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    Edit,
+    Read,
+}
+
 impl PromptKind {
     fn label(&self) -> &'static str {
         match self {
@@ -117,6 +123,7 @@ struct Buffer {
     foldable_dirty: bool,
     wrap: bool,
     last_wrap_width: usize,
+    view_mode: ViewMode,
 }
 
 impl Buffer {
@@ -147,7 +154,20 @@ impl Buffer {
             foldable_dirty: true,
             wrap: true,
             last_wrap_width: 0,
+            view_mode: ViewMode::Edit,
         }
+    }
+
+    fn is_markdown(&self) -> bool {
+        self.path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                let e = e.to_ascii_lowercase();
+                e == "md" || e == "markdown" || e == "mdx"
+            })
+            .unwrap_or(false)
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
@@ -1212,6 +1232,7 @@ pub struct Editor {
     watched_paths: HashSet<PathBuf>,
     last_click: Option<LastClick>,
     tabs_scroll: usize,
+    tabs_scroll_anchor: Option<usize>,
     tab_drag: Option<usize>,
     needs_cursor_adjust: bool,
     pub bottom_pane: crate::shell::ShellPane,
@@ -1266,6 +1287,7 @@ impl Editor {
             watched_paths: HashSet::new(),
             last_click: None,
             tabs_scroll: 0,
+            tabs_scroll_anchor: None,
             tab_drag: None,
             needs_cursor_adjust: true,
             bottom_pane: crate::shell::ShellPane::new(),
@@ -1882,6 +1904,79 @@ impl Editor {
         }
     }
 
+    fn toggle_view_mode(&mut self) {
+        let b = self.active_mut();
+        b.view_mode = match b.view_mode {
+            ViewMode::Edit => ViewMode::Read,
+            ViewMode::Read => ViewMode::Edit,
+        };
+        // Reset scroll + cursor on toggle. We don't preserve the source-
+        // position-to-rendered-line mapping; user starts from the top.
+        b.scroll_row = 0;
+        b.scroll_seg = 0;
+        b.scroll_col = 0;
+        b.cursor_row = 0;
+        b.cursor_col = 0;
+        b.selection_anchor = None;
+        let label = match b.view_mode {
+            ViewMode::Edit => "edit",
+            ViewMode::Read => "read",
+        };
+        self.set_status(format!("markdown: {label}"));
+    }
+
+    fn handle_key_read(&mut self, key: KeyEvent, ctrl: bool, shift: bool) {
+        // Read-mode dispatch: only navigation, copy, tab/quit/save commands
+        // and the toggle binding (handled upstream) are honored. Editing
+        // operations are swallowed.
+        match (ctrl, key.code) {
+            (true, KeyCode::Char('q')) => {
+                let any_dirty = self.buffers.iter().any(|b| b.dirty);
+                if any_dirty && !self.quit_pending {
+                    self.quit_pending = true;
+                    self.set_status("unsaved changes — Ctrl-Q again to quit");
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            (true, KeyCode::Char('w')) => self.close_active(),
+            (true, KeyCode::Tab) => self.next_buffer(),
+            (_, KeyCode::BackTab) => self.prev_buffer(),
+            (true, KeyCode::Char('s')) if shift => self.open_prompt(PromptKind::SaveAs),
+            (true, KeyCode::Char('s')) => {
+                if self.active().path.is_none() {
+                    self.open_prompt(PromptKind::SaveAs);
+                } else if let Err(e) = self.active_mut().save() {
+                    self.set_status(format!("save failed: {e}"));
+                }
+            }
+            (true, KeyCode::Char('f')) => self.open_prompt(PromptKind::Search),
+            (_, KeyCode::Esc) => {}
+            (_, KeyCode::Up) => self.active_mut().scroll_row = self.active().scroll_row.saturating_sub(1),
+            (_, KeyCode::Down) => self.active_mut().scroll_row = self.active().scroll_row.saturating_add(1),
+            (_, KeyCode::PageUp) => {
+                let h = self.last_body_height();
+                self.active_mut().scroll_row = self.active().scroll_row.saturating_sub(h);
+            }
+            (_, KeyCode::PageDown) => {
+                let h = self.last_body_height();
+                self.active_mut().scroll_row = self.active().scroll_row.saturating_add(h);
+            }
+            (_, KeyCode::Home) => self.active_mut().scroll_row = 0,
+            // Cmd/Ctrl-1..9 to switch buffer is handled in try_handle_global_key.
+            _ => {}
+        }
+    }
+
+    fn last_body_height(&self) -> usize {
+        self.layout
+            .as_ref()
+            .map(|l| l.text_area.height as usize)
+            .unwrap_or(20)
+            .saturating_sub(1)
+            .max(1)
+    }
+
     fn handle_key_normal(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
             || key.modifiers.contains(KeyModifiers::SUPER);
@@ -1893,6 +1988,24 @@ impl Editor {
         }
         if !(ctrl && matches!(key.code, KeyCode::Char('w'))) {
             self.close_pending = false;
+        }
+
+        // Markdown render-mode toggle: Alt+M, or Cmd/Ctrl+Shift+M as a
+        // fallback for setups where Option doesn't act as Alt (Alacritty
+        // without `option_as_alt`).
+        let is_m = matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M'));
+        if is_m && !self.active().is_markdown() && (alt || (ctrl && shift)) {
+            self.set_status("not a markdown file");
+            return;
+        }
+        if is_m && ((alt && !ctrl) || (ctrl && shift)) {
+            self.toggle_view_mode();
+            return;
+        }
+
+        if self.active().view_mode == ViewMode::Read {
+            self.handle_key_read(key, ctrl, shift);
+            return;
         }
 
         if alt {
@@ -2120,23 +2233,27 @@ impl Editor {
                     }
                 } else if point_in(ev.column, ev.row, text_area) {
                     self.focus = crate::shell::PaneFocus::Editor;
-                    let (row, col) = self.screen_to_doc(ev.column, ev.row, text_area, tab_width);
-                    let now = Instant::now();
-                    let is_double = self.last_click.is_some_and(|lc| {
-                        lc.row == row
-                            && lc.col == col
-                            && now.duration_since(lc.at) < DOUBLE_CLICK_WINDOW
-                    });
-                    self.last_click = Some(LastClick { row, col, at: now });
-                    let selected_word = is_double && self.active_mut().select_word_at(row, col);
-                    if !selected_word {
-                        let b = self.active_mut();
-                        b.cursor_row = row;
-                        b.cursor_col = col;
-                        b.selection_anchor = None;
-                        b.reset_coalesce();
+                    if self.active().view_mode == ViewMode::Read {
+                        // Read mode: just focus, no cursor placement.
+                    } else {
+                        let (row, col) = self.screen_to_doc(ev.column, ev.row, text_area, tab_width);
+                        let now = Instant::now();
+                        let is_double = self.last_click.is_some_and(|lc| {
+                            lc.row == row
+                                && lc.col == col
+                                && now.duration_since(lc.at) < DOUBLE_CLICK_WINDOW
+                        });
+                        self.last_click = Some(LastClick { row, col, at: now });
+                        let selected_word = is_double && self.active_mut().select_word_at(row, col);
+                        if !selected_word {
+                            let b = self.active_mut();
+                            b.cursor_row = row;
+                            b.cursor_col = col;
+                            b.selection_anchor = None;
+                            b.reset_coalesce();
+                        }
+                        self.needs_cursor_adjust = true;
                     }
-                    self.needs_cursor_adjust = true;
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -2176,12 +2293,22 @@ impl Editor {
                 self.tabs_scroll = (self.tabs_scroll + 2).min(max);
             }
             MouseEventKind::ScrollUp => {
-                let tw = self.config.tab_width;
-                self.active_mut().scroll_viewport_up(tw);
+                if self.active().view_mode == ViewMode::Read {
+                    let b = self.active_mut();
+                    b.scroll_row = b.scroll_row.saturating_sub(3);
+                } else {
+                    let tw = self.config.tab_width;
+                    self.active_mut().scroll_viewport_up(tw);
+                }
             }
             MouseEventKind::ScrollDown => {
-                let tw = self.config.tab_width;
-                self.active_mut().scroll_viewport_down(tw);
+                if self.active().view_mode == ViewMode::Read {
+                    let b = self.active_mut();
+                    b.scroll_row = b.scroll_row.saturating_add(3);
+                } else {
+                    let tw = self.config.tab_width;
+                    self.active_mut().scroll_viewport_down(tw);
+                }
             }
             _ => {}
         }
@@ -2740,6 +2867,7 @@ impl Editor {
         let bottom_pane_area = left_chunks[4];
 
         self.ensure_active_tab_visible(tab_area.width);
+        self.clamp_tabs_scroll_for_buffers(tab_area.width);
 
         // Editor-local status strip sits at the bottom of the editor column
         // (not the bottom of the window).
@@ -2879,7 +3007,7 @@ impl Editor {
     }
 
     fn gutter_width(&self) -> u16 {
-        if !self.config.line_numbers {
+        if !self.config.line_numbers || self.active().view_mode == ViewMode::Read {
             return 0;
         }
         let len = self.active().text.len().max(1);
@@ -2892,16 +3020,27 @@ impl Editor {
         if w == 0 || self.buffers.is_empty() {
             return;
         }
+        // Only auto-snap when the active buffer changes; otherwise user
+        // scrolling on the tab strip would be reverted every frame.
+        if self.tabs_scroll_anchor == Some(self.active) {
+            return;
+        }
         let (active_start, active_end) = buffer_tab_extent(&self.buffers, self.active);
-        // Scroll left to keep the active tab start in view.
         if active_start < self.tabs_scroll {
             self.tabs_scroll = active_start;
-        }
-        // Scroll right so the active tab's end is in view.
-        else if active_end > self.tabs_scroll + w {
+        } else if active_end > self.tabs_scroll + w {
             self.tabs_scroll = active_end.saturating_sub(w);
         }
-        // Clamp to overflow.
+        let total = buffer_tabs_total_width(&self.buffers);
+        let max_scroll = total.saturating_sub(w);
+        if self.tabs_scroll > max_scroll {
+            self.tabs_scroll = max_scroll;
+        }
+        self.tabs_scroll_anchor = Some(self.active);
+    }
+
+    fn clamp_tabs_scroll_for_buffers(&mut self, width: u16) {
+        let w = width as usize;
         let total = buffer_tabs_total_width(&self.buffers);
         let max_scroll = total.saturating_sub(w);
         if self.tabs_scroll > max_scroll {
@@ -2942,6 +3081,11 @@ impl Editor {
         let tab_width = self.config.tab_width;
         let height = text_area.height as usize;
         let width = text_area.width as usize;
+
+        if self.active().view_mode == ViewMode::Read {
+            self.render_read_body(frame, text_area, height, width);
+            return;
+        }
 
         // Update the wrap width for this frame so segment helpers agree.
         let idx = self.active;
@@ -2990,6 +3134,19 @@ impl Editor {
         frame.render_widget(Paragraph::new(lines), text_area);
     }
 
+    fn render_read_body(&mut self, frame: &mut Frame, area: Rect, height: usize, width: usize) {
+        let source = self.active().text.join("\n");
+        let lines = crate::markdown::render(&source, width);
+        // Clamp scroll so the user can't drag past end-of-content.
+        let max_scroll = lines.len().saturating_sub(height);
+        let idx = self.active;
+        if self.buffers[idx].scroll_row > max_scroll {
+            self.buffers[idx].scroll_row = max_scroll;
+        }
+        let scroll = self.buffers[idx].scroll_row.min(u16::MAX as usize) as u16;
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
+    }
+
     fn render_status_line(&self, frame: &mut Frame, area: Rect) {
         if self.status.is_empty() {
             return;
@@ -3006,6 +3163,9 @@ impl Editor {
         match &self.mode {
             Mode::Normal => {
                 let b = self.active();
+                if b.view_mode == ViewMode::Read {
+                    return;
+                }
                 if b.is_hidden(b.cursor_row) || b.cursor_row < b.scroll_row {
                     return;
                 }
