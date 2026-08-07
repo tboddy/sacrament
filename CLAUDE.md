@@ -983,6 +983,30 @@ Install both side by side with `scripts/install-gui.sh` (v2) and
 install reuses the workspace's own artifacts; without it every install is a cold
 build of iced and its whole tree.
 
+**`scripts/bundle-mac.sh` builds `Sacrament.app`** and installs it to
+`~/Applications` (no admin rights needed, and Spotlight and the Dock treat it the
+same as `/Applications`). The bundle exists for one reason: on macOS an app's
+icon comes from its `.app`, never from the window — winit doesn't support window
+icons on macOS at all — so `assets/icon.png` does nothing visible until
+`iconutil` has turned it into an `.icns` inside a bundle.
+
+Two details that are easy to get wrong and hard to diagnose:
+
+- **`-psn_…` must be tolerated in argv.** macOS passes a process-serial argument
+  to bundled apps on some launch paths, and `parse_args` rejected unknown flags
+  with `exit(2)` — so the Dock icon would launch *nothing* while the same binary
+  run from a shell worked perfectly. `the_finder_process_serial_argument_is_ignored`
+  pins it.
+- **The `@2x` iconset entries aren't optional.** Without them the Dock scales the
+  1x art and it looks soft on any modern display. The script also `touch`es the
+  installed bundle, because the Finder caches icons per bundle path and otherwise
+  a changed icon appears not to take until logout.
+
+The bundle carries its own copy of the binary, so it and the `$PATH` install are
+updated separately — but both reach the same running editor through the same
+socket, so `sacrament foo.rs` in a terminal opens a tab in the window launched
+from the Dock.
+
 **v2 is the daily driver as of the cutover.** `sacrament` is v2; v1 is installed
 as `sacrament1` and still builds. Nothing is deleted. The hook needs no override
 now that the script's default resolves to v2.

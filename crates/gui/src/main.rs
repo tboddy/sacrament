@@ -80,6 +80,11 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 args.review = true;
                 i += 1;
             }
+            // macOS hands a process-serial argument to bundled apps on some
+            // launch paths. Rejecting it as unknown would exit(2) before the
+            // window opened, so launching from the Dock would do nothing at all
+            // while running the same binary from a shell worked fine.
+            s if s.starts_with("-psn_") => i += 1,
             s if s.starts_with('-') && s.len() > 1 => {
                 return Err(format!("unexpected argument: {s}"));
             }
@@ -3229,6 +3234,16 @@ mod key_tests {
         let a = args(&["a.rs", "b.rs", "c.rs"]);
         assert_eq!(a.files.len(), 3);
         assert!(a.files.iter().all(|(_, line)| line.is_none()));
+    }
+
+    #[test]
+    fn the_finder_process_serial_argument_is_ignored() {
+        // Without this the app exits(2) before opening a window, so launching
+        // from the Dock silently does nothing while the same binary run from a
+        // shell works.
+        let a = args(&["-psn_0_774binary", "notes.md"]);
+        assert_eq!(a.files.len(), 1);
+        assert_eq!(a.files[0].0, std::path::PathBuf::from("notes.md"));
     }
 
     #[test]
