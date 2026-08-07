@@ -1710,6 +1710,10 @@ impl Editor {
                     scroll_col: b.scroll_col,
                     folds: b.folds.iter().map(|f| (f.start, f.end)).collect(),
                     syntax_override: b.syntax_override.clone(),
+                    // v2's field. v1 has read mode but has never restored it,
+                    // and this is frozen code — writing `false` keeps the shared
+                    // struct compiling without changing v1's behaviour.
+                    read_mode: false,
                 })
             })
             .collect();

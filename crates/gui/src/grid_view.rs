@@ -49,7 +49,8 @@ pub enum GridMouse {
     Release,
     /// Positive scrolls toward earlier content (wheel up), matching how both a
     /// buffer and a terminal scrollback are indexed.
-    Scroll { lines: f32 },
+    /// Whole rows to scroll, already converted from whatever the device sent.
+    Scroll { rows: i32 },
 }
 
 #[derive(Default)]
@@ -65,6 +66,13 @@ struct State {
     dragging: bool,
     /// For double-click detection.
     last_press: Option<(Instant, usize, usize)>,
+    /// Sub-row scroll carried between events.
+    ///
+    /// Without it, a trackpad never scrolls: it sends a few *pixels* at a time,
+    /// which is a fraction of a row, and truncating each event to a whole number
+    /// of rows rounds every one of them to zero. Only an unusually hard flick
+    /// moved anything, which reads as "scrolling takes effort and then jumps".
+    scroll_carry: f32,
 }
 
 pub struct GridView<'a, Message> {
@@ -103,6 +111,10 @@ impl<'a, Message> GridView<'a, Message> {
         self
     }
 }
+
+/// Rows moved per notch of a stepped mouse wheel. Pixel deltas from a trackpad
+/// are *not* scaled by this — they already carry a real distance.
+const ROWS_PER_NOTCH: f32 = 3.0;
 
 /// One coalesced run of cells sharing color and emphasis.
 struct Run {
@@ -242,17 +254,27 @@ where
                 if cursor.position_in(bounds).is_none() {
                     return;
                 }
-                // Lines and pixels both arrive depending on the device; normalize
-                // pixels to rows so one scroll notch means the same thing either
-                // way.
-                let lines = match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => *y,
+                // The two delta kinds mean genuinely different things and must
+                // not be scaled alike. A wheel notch is one `Lines` unit and
+                // should move several rows; a trackpad reports the distance the
+                // finger actually travelled, which is already a real measurement
+                // and only needs converting to rows. Multiplying that by the
+                // notch factor as well made trackpad scrolling fly.
+                let rows = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => *y * ROWS_PER_NOTCH,
                     mouse::ScrollDelta::Pixels { y, .. } => y / ch,
                 };
-                if lines != 0.0 {
-                    shell.publish(on_mouse(GridMouse::Scroll { lines }));
-                    shell.capture_event();
+                // Accumulate the fraction rather than discarding it, so small
+                // movements add up instead of rounding to nothing.
+                state.scroll_carry += rows;
+                let whole = state.scroll_carry.trunc();
+                state.scroll_carry -= whole;
+                if whole != 0.0 {
+                    shell.publish(on_mouse(GridMouse::Scroll { rows: whole as i32 }));
                 }
+                // Captured even when the carry hasn't reached a whole row yet:
+                // the event was for this pane either way.
+                shell.capture_event();
             }
             _ => {}
         }

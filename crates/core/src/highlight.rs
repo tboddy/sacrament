@@ -259,14 +259,12 @@ fn slot_for_scope(name: &str) -> Option<(Option<Slot>, Emphasis)> {
     }
 
     // Emphasis-only rules, which carry no color of their own.
+    //
+    // `markup.bold` renders italic rather than bold: the app uses no bold faces,
+    // and this is the editing view of the same `**text**` the read mode shows,
+    // so the two should agree.
     if name.starts_with("markup.bold") {
-        return Some((
-            None,
-            Emphasis {
-                bold: true,
-                ..Emphasis::NONE
-            },
-        ));
+        return Some((None, Emphasis::italic()));
     }
     if name.starts_with("markup.italic") {
         return Some((None, Emphasis::italic()));

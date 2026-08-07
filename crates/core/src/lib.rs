@@ -12,6 +12,7 @@ pub mod font;
 pub mod git;
 pub mod highlight;
 pub mod lint;
+pub mod markdown;
 pub mod paths;
 pub mod proc;
 pub mod protocol;

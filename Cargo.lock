@@ -2848,6 +2848,7 @@ name = "sacrament-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "pulldown-cmark",
  "serde",
  "syntect",
  "toml",

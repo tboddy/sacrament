@@ -263,7 +263,16 @@ impl crate::grid::GridSource for TerminalSource {
                 },
                 fg: palette.resolve(fg_src, false),
                 bg: palette.resolve(bg_src, true),
-                bold: flags.contains(Flags::BOLD),
+                // SGR 1 is dropped rather than drawn. The app uses no bold
+                // faces anywhere, and a shell is where that rule is most
+                // visible — prompts and TUI headers set it constantly, and a
+                // second weight reads as a different font mid-line.
+                //
+                // Only the *weight* goes: the colour the program asked for is
+                // still its own. Terminals that brighten bold text do so by
+                // remapping colours 0-7 to 8-15, which is a separate setting and
+                // isn't something this ever did.
+                bold: false,
                 italic: flags.contains(Flags::ITALIC),
                 underline: flags.contains(Flags::UNDERLINE),
             };

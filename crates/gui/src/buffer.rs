@@ -67,6 +67,15 @@ pub struct VisibleRow {
 /// ones the level shrinks, and blocks that folded a moment ago stop folding.
 const MAX_INDENT_STEP: usize = 8;
 
+/// Which way a buffer is being shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    #[default]
+    Edit,
+    /// Rendered markdown, read-only.
+    Read,
+}
+
 /// A collapsed region: `head` stays on screen, `head+1..=last` are hidden.
 ///
 /// Folds are metadata about *visibility*, never about content — `lines`,
@@ -141,6 +150,14 @@ pub struct Buffer {
     syntax_override: Option<String>,
     /// Collapsed regions, sorted by `head` and non-overlapping.
     folds: Vec<Fold>,
+    view_mode: ViewMode,
+    /// Rendered markdown, kept until the text or the width changes.
+    rendered: Option<crate::read::Rendered>,
+    /// Read mode's own scroll. Deliberately *not* `scroll_row`: that indexes
+    /// source lines, while this indexes rendered ones, and v1's habit of reusing
+    /// the field made its meaning depend on the mode.
+    read_scroll_row: usize,
+    read_scroll_seg: usize,
     /// Touched by an external tool and not looked at since. Set by a `--review`
     /// open, cleared the moment the tab is made active. Not persisted — v1
     /// doesn't either, and "unreviewed" is about this sitting, not the file.
@@ -174,6 +191,10 @@ impl Buffer {
             syntax_name: None,
             syntax_override: None,
             folds: Vec::new(),
+            view_mode: ViewMode::Edit,
+            rendered: None,
+            read_scroll_row: 0,
+            read_scroll_seg: 0,
             unreviewed: false,
             line_state_before: vec![None],
             highlights: vec![None],
@@ -212,6 +233,10 @@ impl Buffer {
             syntax_name: None,
             syntax_override: None,
             folds: Vec::new(),
+            view_mode: ViewMode::Edit,
+            rendered: None,
+            read_scroll_row: 0,
+            read_scroll_seg: 0,
             unreviewed: false,
             line_state_before: vec![None; n],
             highlights: vec![None; n],
@@ -1593,6 +1618,90 @@ impl Buffer {
         }
         self.rewrite_lines(first, last, new, &shift);
         true
+    }
+
+    pub fn view_mode(&self) -> ViewMode {
+        self.view_mode
+    }
+
+    /// Switch between source and rendered markdown.
+    ///
+    /// Refuses on anything that isn't markdown, and reports so — a key that
+    /// silently does nothing reads as broken. Resets the read scroll, since the
+    /// source line you were on has no defined position in the rendering.
+    pub fn toggle_read_mode(&mut self) -> bool {
+        let markdown = self
+            .path
+            .as_deref()
+            .map(sacrament_core::markdown::is_markdown_path)
+            .unwrap_or(false);
+        if !markdown {
+            return false;
+        }
+        self.view_mode = match self.view_mode {
+            ViewMode::Edit => ViewMode::Read,
+            ViewMode::Read => ViewMode::Edit,
+        };
+        self.read_scroll_row = 0;
+        self.read_scroll_seg = 0;
+        self.clear_selection();
+        true
+    }
+
+    /// Put the buffer into read mode, if it can be. Used by session restore,
+    /// which needs to *set* the mode rather than flip whatever it happens to be.
+    pub fn set_read_mode(&mut self) -> bool {
+        if self.view_mode == ViewMode::Read {
+            return true;
+        }
+        self.toggle_read_mode()
+    }
+
+    pub fn read_scroll(&self) -> (usize, usize) {
+        (self.read_scroll_row, self.read_scroll_seg)
+    }
+
+    /// Render if the text or the width has changed since last time.
+    pub fn ensure_rendered(&mut self, width: usize) {
+        let revision = self.head_revision();
+        let fresh = self
+            .rendered
+            .as_ref()
+            .is_some_and(|r| !r.is_stale(width, revision));
+        if fresh {
+            return;
+        }
+        self.rendered = Some(crate::read::Rendered::new(
+            crate::read::render(&self.to_text(), width),
+            width,
+            revision,
+        ));
+    }
+
+    pub fn rendered(&self) -> Option<&crate::read::Rendered> {
+        self.rendered.as_ref()
+    }
+
+    /// Scroll the rendered view, clamped so the last row can't leave the top.
+    pub fn scroll_read(&mut self, delta: isize, viewport_rows: usize, cols: usize) {
+        let Some(rendered) = &self.rendered else {
+            return;
+        };
+        let total = crate::read::total_rows(&rendered.lines, cols.max(1));
+        // Flattening to an absolute row index keeps this arithmetic instead of a
+        // walk, and the wrapped-row count is what the user is actually moving
+        // through.
+        let current = crate::read::row_index(
+            &rendered.lines,
+            self.read_scroll_row,
+            self.read_scroll_seg,
+            cols.max(1),
+        );
+        let max = total.saturating_sub(viewport_rows.max(1));
+        let target = current.saturating_add_signed(delta).min(max);
+        let (line, seg) = crate::read::row_at(&rendered.lines, target, cols.max(1));
+        self.read_scroll_row = line;
+        self.read_scroll_seg = seg;
     }
 
     /// The syntax in force, so the caller can find its comment marker.

@@ -108,6 +108,10 @@ pub struct SessionBuffer {
     pub folds: Vec<(usize, usize)>,
     #[serde(default)]
     pub syntax_override: Option<String>,
+    /// Showing rendered markdown rather than source. v2 only; v1 ignores it,
+    /// and `serde(default)` means a session written by either still loads.
+    #[serde(default)]
+    pub read_mode: bool,
 }
 
 pub fn load(app: &str) -> Option<Session> {
@@ -144,6 +148,33 @@ mod tests {
         // Written by a build predating geometry; must not fail to parse.
         let s: Session = toml::from_str("active = 0\n").unwrap();
         assert_eq!(s.geometry, Geometry::default());
+    }
+
+    #[test]
+    fn a_session_without_read_mode_still_loads() {
+        // Written by a build predating read mode, or by v1, which never sets it.
+        let s: SessionBuffer = toml::from_str("path = \"/tmp/a.md\"\n").unwrap();
+        assert!(!s.read_mode);
+    }
+
+    #[test]
+    fn read_mode_round_trips() {
+        let s = Session {
+            buffers: vec![SessionBuffer {
+                path: "/tmp/a.md".into(),
+                cursor_row: 0,
+                cursor_col: 0,
+                scroll_row: 0,
+                scroll_col: 0,
+                folds: vec![],
+                syntax_override: None,
+                read_mode: true,
+            }],
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&s).unwrap();
+        let back: Session = toml::from_str(&text).unwrap();
+        assert!(back.buffers[0].read_mode);
     }
 
     #[test]

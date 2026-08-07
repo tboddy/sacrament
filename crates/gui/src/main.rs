@@ -27,6 +27,7 @@ mod metrics;
 mod palette;
 mod font;
 mod pty;
+mod read;
 mod term;
 mod theme_guard;
 mod watch;
@@ -337,8 +338,6 @@ const TAB_BAR_HEIGHT: f32 = 26.0;
 /// "right only". A 1px rule per edge is the way to get a single side.
 const TAB_BORDER: f32 = 1.0;
 
-/// Rows per wheel notch. Three is the common default and matches v1.
-const SCROLL_ROWS: f32 = 3.0;
 
 /// Thickness of the divider between panes.
 ///
@@ -700,6 +699,10 @@ struct State {
     /// scrolling and cursor-following can clamp against the real viewport
     /// rather than a guess.
     editor_rows: usize,
+    /// Columns the editor grid last reported. Read mode wraps to the real pane
+    /// width regardless of `word_wrap`, so it needs this even when the editor's
+    /// own wrap width is zero.
+    editor_cols: usize,
     /// A hard failure worth showing the user. Distinct from the chatter that
     /// used to live in `status` ("shell attached", counters) — that was spike
     /// scaffolding and is gone.
@@ -849,6 +852,9 @@ impl State {
                     // After the text is in place: restoring a fold needs the
                     // line count to validate against.
                     b.set_fold_ranges(&sb.folds);
+                    if sb.read_mode {
+                        b.set_read_mode();
+                    }
                     buffers.push(Arc::new(Mutex::new(b)));
                 }
             }
@@ -883,6 +889,7 @@ impl State {
             font_warning,
             focus: Focus::Editor,
             editor_rows: 24,
+            editor_cols: 80,
             failure: None,
         };
         // `persist` keeps these in step later, but it hasn't run yet.
@@ -974,6 +981,21 @@ impl State {
             }
             b.ensure_cursor_visible(rows);
         }
+    }
+
+    /// Switch the active buffer between source and rendered markdown.
+    fn toggle_read_mode(&mut self) {
+        self.focus = Focus::Editor;
+        let ok = self
+            .buf()
+            .lock()
+            .map(|mut b| b.toggle_read_mode())
+            .unwrap_or(false);
+        self.failure = if ok {
+            None
+        } else {
+            Some("not a markdown file".to_string())
+        };
     }
 
     /// Comment or uncomment the selected lines.
@@ -1401,6 +1423,7 @@ impl State {
             }
             Message::EditorResized(rows, cols) => {
                 self.editor_rows = rows.max(1);
+                self.editor_cols = cols.max(1);
                 // The buffer needs the viewport width to derive wrap segments.
                 // `word_wrap = false` becomes width 0, which `text::wrap_line`
                 // treats as "one segment" — no second code path.
@@ -1712,6 +1735,11 @@ impl State {
                             }
                         }
                     }
+                    // Read mode takes navigation only. Gating here rather than
+                    // inside `edit_key` covers every editing path at once —
+                    // v1 gated its key handler and left `Event::Paste` free to
+                    // edit the source behind the rendering.
+                    Focus::Editor if self.reading() => self.read_key(&key),
                     Focus::Editor => self.edit_key(&key, mods, composed.as_deref()),
                 }
             }
@@ -1803,6 +1831,8 @@ impl State {
             "[" => self.reindent(false),
             // Toggle comment. `/` needs no shift, so there's no second spelling.
             "/" => self.toggle_comment(),
+            // `Cmd+Shift+M`, because plain `Cmd+M` is Minimize on macOS.
+            "m" | "M" if shift => self.toggle_read_mode(),
             "s" | "S" if shift => return Some(self.save_as_dialog()),
             "o" | "O" => return Some(open_dialog()),
             "s" | "S" => return Some(self.save()),
@@ -2243,6 +2273,12 @@ impl State {
             self.clear_selections_except(focus);
         }
         match (focus, gesture) {
+            // Read mode has nothing to select or put a caret in — but it does
+            // scroll, so this must not swallow the wheel.
+            (
+                Focus::Editor,
+                GridMouse::Press { .. } | GridMouse::Drag { .. } | GridMouse::Release,
+            ) if self.reading() => {}
             (Focus::Editor, GridMouse::Press { row, col, count }) => {
                 let rows = self.editor_rows;
                 if let Ok(mut b) = self.buf().lock() {
@@ -2284,17 +2320,24 @@ impl State {
                     b.clear_selection();
                 }
             }
-            (Focus::Editor, GridMouse::Scroll { lines }) => {
-                let rows = self.editor_rows;
+            (Focus::Editor, GridMouse::Scroll { rows: delta }) => {
+                let (rows, cols) = (self.editor_rows, self.editor_cols);
                 if let Ok(mut b) = self.buf().lock() {
-                    b.scroll_by(-(lines * SCROLL_ROWS) as isize, rows);
+                    // Negated: a positive wheel delta means "toward the top of
+                    // the document", which is a smaller row index.
+                    let delta = -delta as isize;
+                    if b.view_mode() == buffer::ViewMode::Read {
+                        b.scroll_read(delta, rows, cols);
+                    } else {
+                        b.scroll_by(delta, rows);
+                    }
                 }
             }
-            (Focus::Shell(id), GridMouse::Scroll { lines }) => {
+            (Focus::Shell(id), GridMouse::Scroll { rows: delta }) => {
                 if let Some(t) = self.pane(id).active().map(|s| s.terminal.clone())
                     && let Ok(mut t) = t.lock()
                 {
-                    t.scroll((lines * SCROLL_ROWS) as i32);
+                    t.scroll(delta);
                 }
             }
             (Focus::Shell(id), GridMouse::Press { row, col, count }) => {
@@ -2423,6 +2466,7 @@ impl State {
                 // Folding isn't ported yet; an empty list restores cleanly.
                 folds: b.fold_ranges(),
                 syntax_override: b.syntax_override().map(str::to_string),
+                read_mode: b.view_mode() == buffer::ViewMode::Read,
             });
         }
 
@@ -2524,6 +2568,34 @@ impl State {
             None => self.failure = Some("buffer lock poisoned".to_string()),
         }
         Task::none()
+    }
+
+    /// Is the active buffer showing rendered markdown?
+    fn reading(&self) -> bool {
+        self.buf()
+            .lock()
+            .map(|b| b.view_mode() == buffer::ViewMode::Read)
+            .unwrap_or(false)
+    }
+
+    /// Navigation only — read mode has nothing to type into.
+    fn read_key(&mut self, key: &iced::keyboard::Key) {
+        use iced::keyboard::Key;
+        use iced::keyboard::key::Named;
+        let rows = self.editor_rows;
+        let cols = self.editor_cols;
+        let delta = match key {
+            Key::Named(Named::ArrowDown) => 1,
+            Key::Named(Named::ArrowUp) => -1,
+            Key::Named(Named::PageDown) => rows as isize,
+            Key::Named(Named::PageUp) => -(rows as isize),
+            Key::Named(Named::Home) => isize::MIN / 2,
+            Key::Named(Named::End) => isize::MAX / 2,
+            _ => return,
+        };
+        if let Ok(mut b) = self.buf().lock() {
+            b.scroll_read(delta, rows, cols);
+        }
     }
 
     /// Editor keystrokes. Deliberately small: no undo, no selection, no
@@ -2838,21 +2910,44 @@ impl State {
                 // The same widget, different source. This is the whole point of
                 // the abstraction — the editor pane isn't a second renderer.
                 PaneKind::Editor => {
-                    let grid = GridView::new(
-                        BufferSource {
-                            buffer: self.buf().clone(),
-                            rows: self.editor_rows,
-                            highlighter: self.highlighter.clone(),
-                            focused: self.focus == Focus::Editor,
-                        },
-                        &self.palette,
-                        self.font,
-                        Message::EditorResized,
-                    )
+                    // Read mode has no gutter — no source line numbers to show
+                    // and nothing to fold — and swaps the source for the
+                    // rendered one. Same widget either way.
+                    let reading = self
+                        .buf()
+                        .lock()
+                        .map(|b| b.view_mode() == buffer::ViewMode::Read)
+                        .unwrap_or(false);
+                    // `GridView` owns its source, so the choice is made by
+                    // building the widget rather than by boxing twice.
+                    let grid = if reading {
+                        GridView::new(
+                            read::ReadSource {
+                                buffer: self.buf().clone(),
+                            },
+                            &self.palette,
+                            self.font,
+                            Message::EditorResized,
+                        )
+                    } else {
+                        GridView::new(
+                            BufferSource {
+                                buffer: self.buf().clone(),
+                                rows: self.editor_rows,
+                                highlighter: self.highlighter.clone(),
+                                focused: self.focus == Focus::Editor,
+                            },
+                            &self.palette,
+                            self.font,
+                            Message::EditorResized,
+                        )
+                    }
                     .on_mouse(|g| Message::Mouse(Focus::Editor, g));
                     // `line_numbers = false` drops the gutter entirely rather
                     // than drawing an empty one.
-                    let body: Element<'_, Message> = if self.config.line_numbers {
+                    let body: Element<'_, Message> = if reading {
+                        grid.into()
+                    } else if self.config.line_numbers {
                         row![
                             Gutter::new(self.buf().clone(), self.font, &self.palette)
                                 .on_fold(Message::ToggleFold),
