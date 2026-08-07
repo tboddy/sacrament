@@ -1097,7 +1097,8 @@ Fold state is part of the undo `Snapshot` and is also round-tripped through `ses
 
 Each pane is a `ShellPane` = `Vec<Shell>` + `active: usize` + `tabs_scroll`. A `Shell` owns a `portable_pty` master/writer/child plus a `vt100::Parser` (2000-row scrollback) that's the source of truth for what to render. `Editor` also owns a `PaneFocus` (Editor/Bottom/Right) and an `mpsc` channel (`shell_tx` / `shell_rx`) — each `spawn_shell` creates a reader thread that forwards PTY bytes as `ShellMsg::Bytes { id, data }` / `ShellMsg::Exited { id }`.
 
-- **Spawning**: `Editor::new` auto-spawns one shell per pane with the process cwd. `restore_session` replaces them with the persisted list (one shell per saved `ShellTabSession { cwd }`), falling back to current dir if the saved cwd no longer exists.
+- **Spawning**: `Editor::new` auto-spawns one shell per pane with the process cwd.
+  (v2 differs — see below.) `restore_session` replaces them with the persisted list (one shell per saved `ShellTabSession { cwd }`), falling back to current dir if the saved cwd no longer exists.
 - **Rendering**: `render_shell_body` reads cells directly from `vt100::Parser::screen()` and writes them into the ratatui buffer via `vt_cell_style` / `vt_color_to_ratatui`. Only the 16 ANSI colors are emitted — truecolor / indexed beyond 15 collapse to `Color::Reset`, matching the editor's no-RGB rule. Before rendering, `resize_pane_shells` calls `Shell::resize` to sync the PTY + parser to the current body rect.
 - **Input routing**: `handle_key` first runs `try_handle_global_key` (Ctrl+1/2/3 switch panes, Ctrl+Q quits). If focus is a shell pane, `try_handle_shell_reserved` handles Ctrl+Shift+T (new tab), Ctrl+Shift+W (close tab), Alt+1..9 (switch tab); otherwise keys go through `shell::key_to_bytes` and are written to the PTY. Cmd/Ctrl+V pastes the clipboard as a bracketed paste sequence (`\x1b[200~` … `\x1b[201~`). Mouse events in a pane body are forwarded as SGR mouse reports via `shell::mouse_to_bytes` *only* when the shell's vt100 parser reports a non-`None` `mouse_protocol_mode` — outside that, clicks just move focus.
 - **Cwd tracking**: two paths, both handled in `drain_shell_output`. OSC 7 (`\x1b]7;file://host/path\x07`) is parsed by `extract_osc7_cwd` on every chunk of PTY output; as a fallback (and to catch shells without OSC 7), `poll_shell_cwds` calls `query_process_cwd` (macOS `proc_pidinfo PROC_PIDVNODEPATHINFO` / Linux `/proc/$pid/cwd`) and updates the shell's `cwd` + `label` when it changes. The label is the cwd's basename via `derive_label`.
@@ -1235,6 +1236,14 @@ Pane ratios are tracked in `State::geometry` as `PaneResized` events arrive, bec
 `pane_grid::State` exposes no getter for a split's ratio — the event is the only place
 it can be observed. `split_vertical`/`split_horizontal` are captured from `split()`'s
 return value so a `ResizeEvent` (which carries only a `Split` id) can be attributed.
+
+**A new shell starts at `$HOME`**, not in the editor's own working directory.
+That would be wherever the app happened to be launched from — the last project,
+or `/` when started from the Finder — so the starting directory would depend on
+trivia the user can't see. `paths::home_dir` is the one place that decides;
+`pty::run` still falls back to the process cwd if it somehow isn't a directory.
+Restored shells are unaffected: they go through `Shell::in_dir` with their saved
+directory.
 
 **Shell directories persist, not shells.** A PTY isn't serializable, so restore
 re-spawns a shell in the saved cwd. That's why `pty::Spawn` bundles the key with a

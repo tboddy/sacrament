@@ -596,8 +596,14 @@ struct Shell {
 }
 
 impl Shell {
+    /// A brand-new shell, started at home.
+    ///
+    /// `None` would mean "wherever the editor was launched from", which is the
+    /// last project or `/` depending on how it was started — unpredictable from
+    /// the user's side. Restored shells go through `in_dir` with their saved
+    /// directory and are unaffected.
     fn new(key: ShellKey) -> Self {
-        Self::in_dir(key, None)
+        Self::in_dir(key, sacrament_core::paths::home_dir())
     }
 
     fn in_dir(key: ShellKey, start_cwd: Option<std::path::PathBuf>) -> Self {
