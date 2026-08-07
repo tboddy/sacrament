@@ -116,7 +116,7 @@ fn main() -> iced::Result {
     let args = match parse_args(&argv) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("sacrament2: {e}");
+            eprintln!("sacrament: {e}");
             std::process::exit(2);
         }
     };
@@ -180,7 +180,7 @@ fn bind_socket() -> Option<UnixListener> {
         // Losing IPC costs the single-instance behavior, not the editor, so this
         // is a warning rather than a failure to start.
         Err(e) => {
-            eprintln!("sacrament2: not listening on {}: {e}", sock.display());
+            eprintln!("sacrament: not listening on {}: {e}", sock.display());
             None
         }
     }
@@ -242,7 +242,7 @@ fn hand_off(args: &Args) -> HandOff {
             // instead, rather than half here and half there.
             Ok(false) => return HandOff::BeServer,
             Err(e) => {
-                eprintln!("sacrament2: {e}");
+                eprintln!("sacrament: {e}");
                 return HandOff::BeServer;
             }
         }

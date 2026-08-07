@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild and reinstall the GUI editor (`sacrament2`) into ~/.cargo/bin.
+# Rebuild and reinstall the GUI editor (`sacrament`) into ~/.cargo/bin.
 #
 # Reuses the workspace's own target directory rather than letting cargo build in
 # a scratch one. Without that, every install is a cold build of iced and its
@@ -13,10 +13,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 crate=crates/gui
-bin=sacrament2
+bin=sacrament
 if [ "${1:-}" = "--tui" ]; then
   crate=crates/tui
-  bin=sacrament
+  bin=sacrament1
 fi
 
 # A running instance keeps its own copy of the old binary, so the replacement

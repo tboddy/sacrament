@@ -8,8 +8,8 @@ A Cargo workspace holding two frontends over one shared core:
 
 ```
 crates/core/   sacrament-core — model + logic. NO UI framework dependency.
-crates/tui/    sacrament-tui  — v1, binary `sacrament`. Shipping; frozen.
-crates/gui/    sacrament-gui  — v2, binary `sacrament2`. The iced rebuild.
+crates/tui/    sacrament-tui  — v1, binary `sacrament1`. Fallback; frozen.
+crates/gui/    sacrament-gui  — v2, binary `sacrament`. The iced rebuild.
 ```
 
 **Why a workspace and not a branch:** sacrament is a daily driver, so v1 has to
@@ -975,20 +975,25 @@ Workspace root has no package, so `-p` (or `cargo run --bin`) is required.
 - `cargo run -p sacrament-tui` — launch v1 with restored session (or empty untitled buffer)
 - `cargo run -p sacrament-gui` — launch v2
 - `cargo clippy --workspace --all-targets` — lint everything
-- `sacrament --review <file>` — open a file as an unreviewed background tab in a *running* instance (silent no-op if none is running, and never boots a server); this is what the Claude Code hook calls. v2 speaks the same flag; point the hook at it with `SACRAMENT_BIN=sacrament2`, which `scripts/claude-open-hook.sh` already honors
+- `sacrament --review <file>` — open a file as an unreviewed background tab in a *running* instance (silent no-op if none is running, and never boots a server); this is what the Claude Code hook calls, and since the rename it reaches v2 by default
 
 Install both side by side with `scripts/install-gui.sh` (v2) and
 `scripts/install-gui.sh --tui` (v1) — different binary names (`sacrament`,
-`sacrament2`), so they coexist. The script passes `--target-dir target` so an
+`sacrament1`), so they coexist. The script passes `--target-dir target` so an
 install reuses the workspace's own artifacts; without it every install is a cold
 build of iced and its whole tree.
 
-**v2 is the daily driver as of the cutover**, with v1 kept installed as a
-fallback and nothing deleted. The Claude Code hook targets it too —
-`.claude/settings.json` sets `SACRAMENT_BIN=sacrament2`, which
-`scripts/claude-open-hook.sh` already honored. Typing `sacrament` still launches
-v1; renaming the binaries is the last step and waits until v2 has survived real
-use.
+**v2 is the daily driver as of the cutover.** `sacrament` is v2; v1 is installed
+as `sacrament1` and still builds. Nothing is deleted. The hook needs no override
+now that the script's default resolves to v2.
+
+**The app ids did not change with the binaries** (`APP_TUI = "sacrament"`,
+`APP_GUI = "sacrament2"`). They name the socket and the session file, not the
+executable, and swapping them would be destructive rather than tidy: `APP_GUI`
+becoming `"sacrament"` would point v2 at `sacrament-session.toml` — v1's file —
+so v2 would restore v1's tabs and shells over its own, and both would then
+contend for one socket. `/tmp/sacrament2-$USER.sock` belonging to a binary called
+`sacrament` is the cost of not doing that.
 
 16 tests, all in the config/theme/font layer (`cargo test --workspace`). `core`
 and the gui's `font.rs` are where tests are cheap — no UI to stand up. Still
@@ -1217,8 +1222,8 @@ Two consequences worth knowing:
   directory. The cwd falls back to the shell's `start_cwd`, then the process cwd.
   `Event::Started` then persists again, replacing the fallback with the real one.
 - **Two instances would stomp each other's session**, which is what the socket
-  (below) exists to prevent: `sacrament2 foo.rs` joins the running window rather
-  than starting a rival writer. A bare `sacrament2` launched alongside one still
+  (below) exists to prevent: `sacrament foo.rs` joins the running window rather
+  than starting a rival writer. A bare `sacrament` launched alongside one still
   opens a second window, and that one *will* overwrite the session on its own
   changes.
 
@@ -1243,7 +1248,7 @@ can't grab. Every field is `#[serde(default)]`, so a session written by an older
 still loads.
 
 Restore only happens when **no paths were given on the command line** — an explicit
-`sacrament2 foo.rs` means "open this", not "and also everything from last time". Same
+`sacrament foo.rs` means "open this", not "and also everything from last time". Same
 rule as v1.
 
 Verified end-to-end by hand-writing a session file and launching: shell cwds via

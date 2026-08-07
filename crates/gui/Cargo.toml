@@ -3,10 +3,9 @@ name = "sacrament-gui"
 version = "0.1.0"
 edition = "2024"
 
-# v2 — the iced rebuild. Renamed to `sacrament` at the cutover, when the tui
-# crate is deleted.
+# v2 — the iced rebuild, and now the binary you get by typing `sacrament`.
 [[bin]]
-name = "sacrament2"
+name = "sacrament"
 path = "src/main.rs"
 
 [dependencies]

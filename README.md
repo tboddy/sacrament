@@ -11,19 +11,20 @@ Requires Rust (stable, 2024 edition or newer).
 ```sh
 git clone https://github.com/tboddy/sacrament
 cd sacrament
-scripts/install-gui.sh          # sacrament2, the GUI editor
-scripts/install-gui.sh --tui    # sacrament, the terminal editor
+scripts/install-gui.sh          # sacrament, the GUI editor
+scripts/install-gui.sh --tui    # sacrament1, the terminal editor (fallback)
 ```
 
 Then run `sacrament <file>[:line]`.
 
-> **2.0 in progress.** The repo is a Cargo workspace: `crates/tui` is the
-> shipping terminal editor described below, `crates/core` is the shared
-> framework-independent core, and `crates/gui` is an in-progress rewrite as a
-> native GUI app (via [iced](https://iced.rs)) that keeps the terminal-ish feel
-> without running in a terminal. The two install side by side as `sacrament` and
-> `sacrament2` and keep separate sockets and sessions, so nothing below changes
-> until the cutover.
+> **2.0 is now the default.** The repo is a Cargo workspace: `crates/gui` is a
+> rewrite as a native GUI app (via [iced](https://iced.rs)) that keeps the
+> terminal-ish feel without running in a terminal, and it installs as
+> `sacrament`. `crates/tui` is the original terminal editor described below,
+> still built and installed as `sacrament1`; `crates/core` is the shared,
+> framework-independent core. The two keep separate sockets and sessions, so
+> both can run at once. Everything below describes the terminal editor —
+> the GUI drops git and lint, and its keybindings are `Cmd`-based.
 
 ## Features
 

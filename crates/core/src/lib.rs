@@ -23,5 +23,13 @@ pub mod theme;
 /// App ids for per-user runtime paths. v1 and v2 run side by side during the
 /// rewrite, so they must not share a socket or a session file — see
 /// [`paths`] for what is namespaced and what is deliberately shared.
+/// Identity for the socket and session file, **not** the binary name.
+///
+/// These deliberately did not change when the binaries were renamed at the
+/// cutover, and swapping them would be destructive rather than tidy: `APP_GUI`
+/// becoming `"sacrament"` would point v2 at `sacrament-session.toml`, which is
+/// v1's file — v2 would restore v1's tabs and shells over its own — and both
+/// would then contend for the same socket. The names are internal identity that
+/// happens to look like the old binary names.
 pub const APP_TUI: &str = "sacrament";
 pub const APP_GUI: &str = "sacrament2";

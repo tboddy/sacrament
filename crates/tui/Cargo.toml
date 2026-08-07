@@ -6,7 +6,7 @@ edition = "2024"
 # v1 — the shipping terminal editor. Frozen in behavior while v2 is built;
 # deleted once v2 takes over the `sacrament` binary name.
 [[bin]]
-name = "sacrament"
+name = "sacrament1"
 path = "src/main.rs"
 
 [dependencies]
