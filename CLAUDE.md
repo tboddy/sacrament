@@ -283,8 +283,18 @@ not the code.
 
 **Mouse gestures** come out of the grid as one `GridMouse` enum
 (`Press{row,col,count}` / `Drag` / `Release` / `Scroll`) rather than four
-callbacks, since the app has to correlate them as a gesture anyway. Three details
+callbacks, since the app has to correlate them as a gesture anyway. Four details
 that matter:
+
+- **Scrolling converts to rows in the widget, and carries the fraction.** The two
+  `ScrollDelta` kinds mean different things: a wheel notch is one `Lines` unit
+  and should move `ROWS_PER_NOTCH` rows, while `Pixels` is the distance a finger
+  actually travelled and only needs dividing by the row height. Scaling both by
+  the notch factor made trackpad scrolling fly. Worse, truncating each event to
+  whole rows meant a trackpad never scrolled at all — a few pixels is a fraction
+  of a row, which rounds to zero every time, so only a hard flick moved anything.
+  `State::scroll_carry` keeps the remainder between events, and `GridMouse::Scroll`
+  carries whole `rows` so the app never sees device units.
 
 - **Drag coordinates aren't required to be inside the widget.** `Press` uses
   `cursor.position_in`, but `Drag` uses `cursor.position()` and clamps into the
@@ -559,6 +569,7 @@ none of which worked while the app was intercepting them globally.
 | `Cmd+G` / `Cmd+Shift+G` | Find next / previous — repeats the last query with no prompt open |
 | `Ctrl+G` | Goto line (prompt) |
 | `Option+←` / `→` | Word left / right (`Shift` extends) |
+| `Cmd+Shift+M` | Toggle markdown read mode |
 | `Cmd+Shift+R` | Reset metrics counters (only visible under `SACRAMENT_METRICS`) |
 | `Ctrl+1` / `2` / `3` | Focus editor / bottom shell / right shell |
 
@@ -713,6 +724,68 @@ and every match column after such a character would be wrong, since `find`
 returns positions into the *original* line. Smart case is the Sublime rule: an
 all-lowercase query is case-insensitive, any uppercase makes the whole query
 exact.
+
+#### Markdown read mode (`core::markdown` + `gui::read`)
+
+`Cmd+Shift+M` on a `.md`/`.markdown`/`.mdx` buffer swaps the grid's source for a
+rendered one. Same widget, different `GridSource` — the editor pane isn't a
+second renderer. The gutter disappears with it: there are no source line numbers
+to show and nothing to fold.
+
+**The renderer does not wrap, and that is the whole point of the port.** v1
+wrapped inline text inside `markdown.rs` and handed finished lines to a
+`Paragraph` that did no wrapping of its own, so wrapping only happened where the
+renderer remembered it — anything emitted whole ran off the edge and was clipped.
+That's why word wrap looks broken in v1's read mode.
+
+Here a block becomes **one logical `markdown::Line`**, however long, carrying the
+`indent` its continuations should hang under. `gui::read::visible_rows` wraps it
+with `text::wrap_line` — the same function the editor uses on source code. Wrap
+is a property of the layout, so it can't be missed for a particular construct,
+and a resize re-wraps without re-parsing.
+
+`render` still takes a width, because some blocks are genuinely width-shaped: a
+rule spans the pane, a fenced block is padded into a slab, table columns scale to
+fit. `Buffer::ensure_rendered` caches the result against `(width, revision)`, so
+scrolling costs nothing and only a resize or an edit re-renders.
+
+The mode itself persists: `SessionBuffer::read_mode` is `#[serde(default)]`, so a
+session written by v1 — or by a build predating it — still loads. v1 writes
+`false` unconditionally; it has read mode but has never restored it, and it's
+frozen.
+
+**Read scroll is its own state** (`read_scroll_row` / `read_scroll_seg`), not
+`scroll_row`. v1 reused the editor's field, which silently changed its meaning by
+mode — in read mode it indexes *rendered* rows, which usually outnumber the
+source lines — so anything feeding it back into a source-line calculation was
+wrong by construction. That's the root of v1's mouse-drag hole.
+
+Read mode still **scrolls**, so the arm that swallows editor gestures while
+reading is restricted to press/drag/release. Matching `_` there ate the wheel.
+
+**Read-only is enforced at the routing layer**, not inside `edit_key`: the
+`Focus::Editor if self.reading()` arm takes navigation and drops the rest, mouse
+gestures are swallowed, and paste is gated too. v1 gated its key handler and left
+`Event::Paste` free to edit the source behind the rendering — its own notes call
+that out, and doing it one level up covers every editing path at once.
+
+Colors are `Slot`s, so `[theme]` drives them. Strikethrough renders as muted text:
+`Emphasis` has no strikethrough and a cell grid has nowhere to draw one.
+
+**Nothing the app styles for itself is bold.** Heading level is carried entirely
+by colour, which separates them far better than weight does in a 16-colour
+scheme. `**strong**` renders *italic* — with bold gone, it's the only attribute
+left that isn't already spoken for, since underline belongs to emphasis and
+links; a brighter colour isn't an option either, because in a typical theme
+`bright_white` is the same value as `foreground` (both `#ebdbb2` in Gruvbox) and
+strong text would vanish into the body. `markup.bold` in the *highlighter* is
+italic for the same reason, so the editing and reading views of the same
+`**text**` agree.
+
+`markdown::Style` has no `bold` constructor at all, so this is a property of the
+type rather than a rule to remember, and `nothing_the_renderer_emits_is_bold`
+pins it from the outside. Bold arriving from a *shell* is untouched — that's
+another program's output, not our styling.
 
 #### Code folding
 
@@ -904,9 +977,18 @@ Workspace root has no package, so `-p` (or `cargo run --bin`) is required.
 - `cargo clippy --workspace --all-targets` — lint everything
 - `sacrament --review <file>` — open a file as an unreviewed background tab in a *running* instance (silent no-op if none is running, and never boots a server); this is what the Claude Code hook calls. v2 speaks the same flag; point the hook at it with `SACRAMENT_BIN=sacrament2`, which `scripts/claude-open-hook.sh` already honors
 
-Install both side by side with `cargo install --path crates/tui` and
-`cargo install --path crates/gui` — different binary names (`sacrament`,
-`sacrament2`), so they coexist.
+Install both side by side with `scripts/install-gui.sh` (v2) and
+`scripts/install-gui.sh --tui` (v1) — different binary names (`sacrament`,
+`sacrament2`), so they coexist. The script passes `--target-dir target` so an
+install reuses the workspace's own artifacts; without it every install is a cold
+build of iced and its whole tree.
+
+**v2 is the daily driver as of the cutover**, with v1 kept installed as a
+fallback and nothing deleted. The Claude Code hook targets it too —
+`.claude/settings.json` sets `SACRAMENT_BIN=sacrament2`, which
+`scripts/claude-open-hook.sh` already honored. Typing `sacrament` still launches
+v1; renaming the binaries is the last step and waits until v2 has survived real
+use.
 
 16 tests, all in the config/theme/font layer (`cargo test --workspace`). `core`
 and the gui's `font.rs` are where tests are cheap — no UI to stand up. Still

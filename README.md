@@ -11,7 +11,8 @@ Requires Rust (stable, 2024 edition or newer).
 ```sh
 git clone https://github.com/tboddy/sacrament
 cd sacrament
-cargo install --path crates/tui
+scripts/install-gui.sh          # sacrament2, the GUI editor
+scripts/install-gui.sh --tui    # sacrament, the terminal editor
 ```
 
 Then run `sacrament <file>[:line]`.
