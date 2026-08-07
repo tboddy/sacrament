@@ -267,11 +267,12 @@ impl Buffer {
             self.set_syntax_override(&name, hl);
             return;
         }
-        let syntax = self.path.as_deref().and_then(|p| hl.syntax_for_path(p));
-        match syntax {
-            Some(s) => {
-                self.syntax_name = Some(s.name.clone());
-                self.line_state_before[0] = Some(hl.initial_state(s));
+        // `seed_for_path` covers syntect's languages and the built-in ones
+        // alike, so this doesn't have to know which is which.
+        match self.path.as_deref().and_then(|p| hl.seed_for_path(p)) {
+            Some((name, state)) => {
+                self.syntax_name = Some(name);
+                self.line_state_before[0] = Some(state);
             }
             None => {
                 self.syntax_name = None;

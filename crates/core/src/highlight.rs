@@ -88,13 +88,31 @@ pub struct HlSpan {
     pub byte_end: usize,
 }
 
+/// A language syntect's bundled set doesn't ship.
+///
+/// Sublime's default packages have no TOML — and no INI, cfg or conf either —
+/// so `Cargo.toml` and the app's own `config.toml` came out unhighlighted. The
+/// alternatives were vendoring a third-party `.sublime-syntax` and enabling
+/// syntect's YAML loader (a dependency and a startup parse for one language), or
+/// this: a small line-wise highlighter for a format that is line-wise anyway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Builtin {
+    Toml,
+}
+
 /// Parser state *before* a given line. Highlighting is line-by-line and each
 /// line's parse depends on the previous, which is what the per-buffer
 /// `line_state_before` cache exists to avoid re-deriving.
 #[derive(Clone)]
-pub struct LineState {
-    pub parse: ParseState,
-    pub scopes: ScopeStack,
+pub enum LineState {
+    /// syntect's incremental parse.
+    Syntect {
+        parse: ParseState,
+        scopes: ScopeStack,
+    },
+    /// A built-in language. `in_block_string` is the only state TOML carries
+    /// across lines — a `"""` or `'''` block.
+    Builtin { kind: Builtin, in_block_string: bool },
 }
 
 pub struct Highlighter {
@@ -138,19 +156,58 @@ impl Highlighter {
     }
 
     pub fn initial_state(&self, syntax: &SyntaxReference) -> LineState {
-        LineState {
+        LineState::Syntect {
             parse: ParseState::new(syntax),
             scopes: ScopeStack::new(),
         }
     }
 
+    /// The syntax name and starting state for a path, syntect's or ours.
+    ///
+    /// One call so callers don't have to know that some languages come from
+    /// syntect and some don't — the built-ins would otherwise have to be checked
+    /// at every site that seeds a buffer.
+    pub fn seed_for_path(&self, path: &Path) -> Option<(String, LineState)> {
+        if let Some(syntax) = self.syntax_for_path(path) {
+            return Some((syntax.name.clone(), self.initial_state(syntax)));
+        }
+        let kind = match path.extension().and_then(|e| e.to_str())? {
+            "toml" => Builtin::Toml,
+            _ => return None,
+        };
+        // The name matters beyond display: `line_comment_for` keys off it, so
+        // Cmd+/ works in a built-in language too.
+        Some((
+            "TOML".to_string(),
+            LineState::Builtin {
+                kind,
+                in_block_string: false,
+            },
+        ))
+    }
+
     pub fn highlight_line(&self, line: &str, state: &mut LineState) -> Vec<HlSpan> {
+        let (parse, scopes) = match state {
+            LineState::Syntect { parse, scopes } => (parse, scopes),
+            LineState::Builtin {
+                kind: Builtin::Toml,
+                in_block_string,
+            } => return toml_syntax::highlight(line, in_block_string),
+        };
+        self.highlight_syntect(line, parse, scopes)
+    }
+
+    fn highlight_syntect(
+        &self,
+        line: &str,
+        state_parse: &mut ParseState,
+        state_scopes: &mut ScopeStack,
+    ) -> Vec<HlSpan> {
         let mut with_nl = String::with_capacity(line.len() + 1);
         with_nl.push_str(line);
         with_nl.push('\n');
 
-        let ops = state
-            .parse
+        let ops = state_parse
             .parse_line(&with_nl, &self.syntax_set)
             .unwrap_or_default();
 
@@ -163,7 +220,7 @@ impl Highlighter {
         for (byte_idx, op) in &ops {
             let clamped = (*byte_idx).min(actual_len);
             if clamped > last_byte {
-                let (color, emphasis) = style_for(&state.scopes);
+                let (color, emphasis) = style_for(state_scopes);
                 spans.push(HlSpan {
                     color,
                     emphasis,
@@ -172,11 +229,11 @@ impl Highlighter {
                 });
                 last_byte = clamped;
             }
-            state.scopes.apply(op).ok();
+            state_scopes.apply(op).ok();
         }
 
         if last_byte < actual_len {
-            let (color, emphasis) = style_for(&state.scopes);
+            let (color, emphasis) = style_for(state_scopes);
             spans.push(HlSpan {
                 color,
                 emphasis,
@@ -354,5 +411,336 @@ mod tests {
         assert_eq!(line_comment_for("Rust"), Some("//"));
         assert_eq!(line_comment_for("Python"), Some("#"));
         assert_eq!(line_comment_for("Nonexistent Lang"), None);
+    }
+}
+
+
+/// A small line-wise highlighter for TOML.
+///
+/// syntect's bundled set has no TOML, and TOML is line-oriented enough that a
+/// grammar is more machinery than it needs: the only state crossing a line
+/// boundary is whether a block string is open. Colours match what `style_for`
+/// gives the equivalent scopes elsewhere, so a `.toml` file sits beside a `.rs`
+/// one without looking like a different program rendered it.
+mod toml_syntax {
+    use super::{Emphasis, HlSpan, Slot};
+
+    const COMMENT: Slot = Slot::BRIGHT_BLACK;
+    const STRING: Slot = Slot::GREEN;
+    /// Numbers, booleans and datetimes: all `constant.*` elsewhere.
+    const CONSTANT: Slot = Slot::BRIGHT_MAGENTA;
+    /// Table headers, which are the file's structure.
+    const HEADER: Slot = Slot::BRIGHT_YELLOW;
+    /// Keys, matching the `variable.other.member` family.
+    const KEY: Slot = Slot::BRIGHT_BLUE;
+    const OP: Slot = Slot::CYAN;
+
+    fn push(out: &mut Vec<HlSpan>, color: Slot, start: usize, end: usize) {
+        if end > start {
+            out.push(HlSpan {
+                color: Some(color),
+                emphasis: Emphasis::NONE,
+                byte_start: start,
+                byte_end: end,
+            });
+        }
+    }
+
+    pub fn highlight(line: &str, in_block_string: &mut bool) -> Vec<HlSpan> {
+        let mut out = Vec::new();
+        let b = line.as_bytes();
+        let mut i = 0;
+
+        // Continuing a block string opened on an earlier line.
+        if *in_block_string {
+            match block_end(line, 0) {
+                Some(end) => {
+                    push(&mut out, STRING, 0, end);
+                    *in_block_string = false;
+                    i = end;
+                }
+                None => {
+                    push(&mut out, STRING, 0, line.len());
+                    return out;
+                }
+            }
+        }
+
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+        if i >= b.len() {
+            return out;
+        }
+
+        if b[i] == b'#' {
+            push(&mut out, COMMENT, i, line.len());
+            return out;
+        }
+
+        if b[i] == b'[' {
+            // Scan to the closing bracket rather than the last one on the line,
+            // so a `]` inside a trailing comment doesn't swallow it.
+            let mut j = i;
+            while j < b.len() && b[j] != b']' {
+                j += 1;
+            }
+            if j < b.len() {
+                j += 1;
+                if j < b.len() && b[j] == b']' {
+                    j += 1;
+                }
+            }
+            push(&mut out, HEADER, i, j);
+            i = j;
+        } else if let Some(eq) = key_end(line, i) {
+            let mut key_stop = eq;
+            while key_stop > i && (b[key_stop - 1] == b' ' || b[key_stop - 1] == b'\t') {
+                key_stop -= 1;
+            }
+            push(&mut out, KEY, i, key_stop);
+            push(&mut out, OP, eq, eq + 1);
+            i = eq + 1;
+        }
+
+        values(line, i, in_block_string, &mut out);
+        out
+    }
+
+    /// Byte index of the `=` separating key from value, if this line has one.
+    ///
+    /// Quote-aware, because a key may be quoted and contain anything — a key of
+    /// `"a=b"` is legal and its first `=` isn't the separator.
+    fn key_end(line: &str, from: usize) -> Option<usize> {
+        let b = line.as_bytes();
+        let mut quote: Option<u8> = None;
+        for (i, &c) in b.iter().enumerate().skip(from) {
+            match quote {
+                Some(q) => {
+                    if c == q {
+                        quote = None;
+                    }
+                }
+                None => match c {
+                    b'"' | b'\'' => quote = Some(c),
+                    b'=' => return Some(i),
+                    b'#' => return None,
+                    _ => {}
+                },
+            }
+        }
+        None
+    }
+
+    /// Colour whatever follows the `=`: strings, constants and a trailing
+    /// comment. Array and inline-table punctuation is left alone, which lets
+    /// their contents be coloured without special-casing either.
+    fn values(line: &str, mut i: usize, in_block_string: &mut bool, out: &mut Vec<HlSpan>) {
+        let b = line.as_bytes();
+        while i < b.len() {
+            match b[i] {
+                b' ' | b'\t' | b',' | b'[' | b']' | b'{' | b'}' => i += 1,
+                b'#' => {
+                    push(out, COMMENT, i, line.len());
+                    return;
+                }
+                b'"' | b'\'' => {
+                    let quote = b[i];
+                    // A tripled quote opens a block that may not close here.
+                    if b[i..].starts_with(&[quote, quote, quote]) {
+                        match block_end(line, i + 3) {
+                            Some(end) => {
+                                push(out, STRING, i, end);
+                                i = end;
+                            }
+                            None => {
+                                push(out, STRING, i, line.len());
+                                *in_block_string = true;
+                                return;
+                            }
+                        }
+                    } else {
+                        let end = string_end(line, i, quote);
+                        push(out, STRING, i, end);
+                        i = end;
+                    }
+                }
+                c if c.is_ascii_digit() || c == b'+' || c == b'-' => {
+                    let start = i;
+                    // Datetimes are as much a constant as numbers and share
+                    // their characters, so one scan covers both.
+                    while i < b.len()
+                        && (b[i].is_ascii_alphanumeric()
+                            || matches!(b[i], b'+' | b'-' | b'.' | b':' | b'_'))
+                    {
+                        i += 1;
+                    }
+                    push(out, CONSTANT, start, i);
+                }
+                c if c.is_ascii_alphabetic() => {
+                    let start = i;
+                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                        i += 1;
+                    }
+                    if matches!(&line[start..i], "true" | "false" | "inf" | "nan") {
+                        push(out, CONSTANT, start, i);
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+    }
+
+    /// End of a quoted string, just past its closer.
+    fn string_end(line: &str, start: usize, quote: u8) -> usize {
+        let b = line.as_bytes();
+        let mut i = start + 1;
+        while i < b.len() {
+            // Only basic strings take escapes; a literal string doesn't, so a
+            // trailing backslash inside one mustn't swallow the closer.
+            if quote == b'"' && b[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b[i] == quote {
+                return i + 1;
+            }
+            i += 1;
+        }
+        line.len()
+    }
+
+    /// End of a block string that closes on this line, just past its delimiter.
+    fn block_end(line: &str, from: usize) -> Option<usize> {
+        let b = line.as_bytes();
+        let mut i = from;
+        while i + 3 <= b.len() {
+            if &b[i..i + 3] == b"\"\"\"" || &b[i..i + 3] == b"'''" {
+                return Some(i + 3);
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod toml_tests {
+    use super::*;
+
+    fn spans(line: &str, open: &mut bool) -> Vec<(Option<Slot>, String)> {
+        toml_syntax::highlight(line, open)
+            .into_iter()
+            .map(|s| (s.color, line[s.byte_start..s.byte_end].to_string()))
+            .collect()
+    }
+
+    fn one(line: &str) -> Vec<(Option<Slot>, String)> {
+        spans(line, &mut false)
+    }
+
+    #[test]
+    fn toml_is_recognised_even_though_syntect_has_no_grammar_for_it() {
+        let hl = Highlighter::new();
+        assert!(
+            hl.syntax_for_path(Path::new("a.toml")).is_none(),
+            "if syntect ever ships TOML, prefer its grammar over ours"
+        );
+        let (name, state) = hl.seed_for_path(Path::new("Cargo.toml")).expect("seeded");
+        assert_eq!(name, "TOML");
+        assert!(matches!(state, LineState::Builtin { .. }));
+        // The name is what Cmd+/ keys off, so comment toggling works too.
+        assert_eq!(line_comment_for(&name), Some("#"));
+    }
+
+    #[test]
+    fn a_table_header_is_coloured_whole() {
+        assert_eq!(one("[dependencies]"), vec![(Some(Slot::BRIGHT_YELLOW), "[dependencies]".into())]);
+        assert_eq!(one("[[bin]]"), vec![(Some(Slot::BRIGHT_YELLOW), "[[bin]]".into())]);
+    }
+
+    #[test]
+    fn a_header_stops_at_its_bracket_not_at_one_in_a_comment() {
+        let got = one("[bin]  # array[0]");
+        assert_eq!(got[0], (Some(Slot::BRIGHT_YELLOW), "[bin]".into()));
+        assert_eq!(got[1], (Some(Slot::BRIGHT_BLACK), "# array[0]".into()));
+    }
+
+    #[test]
+    fn a_key_value_pair_splits_into_key_operator_and_value() {
+        let got = one(r#"name = "sacrament""#);
+        assert_eq!(got[0], (Some(Slot::BRIGHT_BLUE), "name".into()));
+        assert_eq!(got[1], (Some(Slot::CYAN), "=".into()));
+        assert_eq!(got[2], (Some(Slot::GREEN), "\"sacrament\"".into()));
+    }
+
+    #[test]
+    fn an_equals_inside_a_quoted_key_is_not_the_separator() {
+        let got = one(r#""a=b" = 1"#);
+        assert_eq!(got[0], (Some(Slot::BRIGHT_BLUE), "\"a=b\"".into()));
+        assert_eq!(got[1], (Some(Slot::CYAN), "=".into()));
+        assert_eq!(got[2], (Some(Slot::BRIGHT_MAGENTA), "1".into()));
+    }
+
+    #[test]
+    fn constants_cover_numbers_booleans_and_datetimes() {
+        for (src, want) in [
+            ("a = 42", "42"),
+            ("a = -1.5e3", "-1.5e3"),
+            ("a = true", "true"),
+            ("a = 1979-05-27T07:32:00Z", "1979-05-27T07:32:00Z"),
+        ] {
+            let got = one(src);
+            assert_eq!(
+                got.last().unwrap(),
+                &(Some(Slot::BRIGHT_MAGENTA), want.to_string()),
+                "for {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn array_and_inline_table_contents_are_coloured() {
+        let got = one(r#"features = ["a", "b"]"#);
+        let strings: Vec<&String> = got
+            .iter()
+            .filter(|(c, _)| *c == Some(Slot::GREEN))
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(strings, vec!["\"a\"", "\"b\""]);
+
+        let got = one(r#"dep = { version = "1", optional = true }"#);
+        assert!(got.iter().any(|(c, t)| *c == Some(Slot::GREEN) && t == "\"1\""));
+        assert!(got.iter().any(|(c, t)| *c == Some(Slot::BRIGHT_MAGENTA) && t == "true"));
+    }
+
+    #[test]
+    fn a_comment_after_a_value_is_still_a_comment() {
+        let got = one("edition = 2021 # the newer one");
+        assert_eq!(got.last().unwrap(), &(Some(Slot::BRIGHT_BLACK), "# the newer one".into()));
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_end_a_string() {
+        let got = one(r#"a = "say \"hi\" now""#);
+        assert_eq!(got[2], (Some(Slot::GREEN), r#""say \"hi\" now""#.into()));
+    }
+
+    #[test]
+    fn a_block_string_carries_across_lines() {
+        // The one piece of state TOML has, and the reason `LineState` keeps a
+        // flag for built-ins at all.
+        let mut open = false;
+        let first = spans(r#"text = """start"#, &mut open);
+        assert!(open, "block left open");
+        assert_eq!(first[2].0, Some(Slot::GREEN));
+
+        let middle = spans("still inside # not a comment", &mut open);
+        assert!(open, "still open");
+        assert_eq!(middle, vec![(Some(Slot::GREEN), "still inside # not a comment".into())]);
+
+        let last = spans(r#"end""" "#, &mut open);
+        assert!(!open, "closed");
+        assert_eq!(last[0], (Some(Slot::GREEN), "end\"\"\"".into()));
     }
 }

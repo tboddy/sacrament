@@ -1083,6 +1083,22 @@ These are the only one-shot `std::process::Command` uses (everything else is PTY
 
 `ensure_highlights(up_to)` runs once per frame, walking forward from the nearest live `line_state_before` to fill gaps. On edits, `invalidate_highlights_from(row)` zeroes from `row` onward (the state *before* the edited row stays valid). Every mutation path that changes line count (insert/delete line, join on backspace, `insert_text`, `delete_range`) must `insert`/`drain` the cache vecs alongside `text` — this includes `change_bars` (the git overlay), which follows the identical `insert`/`remove`/`drain` discipline. `restore` (undo) and `load` rebuild all of them to length `n`.
 
+**TOML is highlighted by hand** (`core::highlight::toml_syntax`). syntect's
+bundled set ships no TOML — nor INI, cfg or conf — so `Cargo.toml` and the app's
+own `config.toml` came out plain. The alternatives were vendoring a third-party
+`.sublime-syntax` and turning on syntect's YAML loader, which is a dependency and
+a startup parse for one language. TOML is line-oriented enough that a grammar is
+more machinery than it needs: the only state crossing a line is whether a block
+string is open, which `LineState::Builtin` carries.
+
+`LineState` is therefore an enum — `Syntect` or `Builtin` — and
+`Highlighter::seed_for_path` returns whichever applies, so callers seeding a
+buffer don't have to know which languages come from where. Colours are picked to
+match what `style_for` gives the equivalent scopes, so a `.toml` file sits beside
+a `.rs` one without looking like a different program rendered it. A test asserts
+syntect still *lacks* TOML, so if it ever gains one, that fails and we prefer the
+real grammar.
+
 **Color theme**: `style_for` in `highlight.rs` maps TextMate scopes to `ratatui::style::Color`. Only the 16 named ANSI colors are used, never `Color::Rgb` or `Color::Indexed` — this is intentional so the user's terminal palette *is* the theme. When tweaking colors, edit `style_for` directly; there is no other theme layer.
 
 ### Code folding

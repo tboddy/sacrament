@@ -574,7 +574,7 @@ impl State {
 
         for (row_idx, row) in table.rows.iter().enumerate() {
             let mut spans: Vec<Span> = Vec::new();
-            for col in 0..n_cols {
+            for (col, target) in col_widths.iter().enumerate() {
                 if col > 0 {
                     spans.push(Span {
                         text: " │ ".to_string(),
@@ -588,9 +588,9 @@ impl State {
                 if let Some(cell) = cell {
                     spans.extend(cell.iter().cloned());
                 }
-                if cell_w < col_widths[col] {
+                if cell_w < *target {
                     spans.push(Span {
-                        text: " ".repeat(col_widths[col] - cell_w),
+                        text: " ".repeat(target - cell_w),
                         style: Style::default(),
                     });
                 }
