@@ -15,8 +15,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
 
-use crate::config::Config;
-use crate::highlight::{HlSpan, Highlighter, LineState};
+use sacrament_core::config::Config;
+use sacrament_core::git::ChangeKind;
+use sacrament_core::lint::{Diagnostic, Severity};
+
+use sacrament_core::highlight::{HlSpan, Highlighter, LineState};
+
+use crate::hlstyle::{emphasis_to_modifier, slot_to_color};
 
 const MAX_UNDO: usize = 500;
 const DISK_CHECK_INTERVAL: Duration = Duration::from_millis(1500);
@@ -81,6 +86,8 @@ enum CommentResult {
 pub enum ViewMode {
     Edit,
     Read,
+    // Read-only unified-diff render vs git HEAD. See [[Editor::toggle_diff_view]].
+    Diff,
 }
 
 impl PromptKind {
@@ -124,6 +131,20 @@ struct Buffer {
     wrap: bool,
     last_wrap_width: usize,
     view_mode: ViewMode,
+    // Touched by Claude (or another tool) and not yet looked at. Cleared when
+    // the user makes this buffer active. See [[Editor::try_load_remote]].
+    unreviewed: bool,
+    // Per-line change status vs git, in lockstep with `text` (like `highlights`).
+    change_bars: Vec<Option<ChangeKind>>,
+    // Lint results: a positional snapshot, cleared on any line-count edit.
+    diagnostics: Vec<Diagnostic>,
+    // Stashed unified-diff text while view_mode == Diff, so the renderer doesn't
+    // re-run git every frame. None outside diff mode.
+    diff_view: Option<String>,
+    // Whether the file lives in a git repo. Gates the gutter change-bar column
+    // (no point reserving it for files git knows nothing about). Set by
+    // recompute_change_bars.
+    in_git_repo: bool,
 }
 
 impl Buffer {
@@ -155,6 +176,11 @@ impl Buffer {
             wrap: true,
             last_wrap_width: 0,
             view_mode: ViewMode::Edit,
+            unreviewed: false,
+            change_bars: vec![None],
+            diagnostics: Vec::new(),
+            diff_view: None,
+            in_git_repo: false,
         }
     }
 
@@ -203,6 +229,9 @@ impl Buffer {
         self.folds = Vec::new();
         self.foldable_at = vec![None; n];
         self.foldable_dirty = true;
+        self.change_bars = vec![None; n];
+        self.diagnostics.clear();
+        self.diff_view = None;
         Ok(())
     }
 
@@ -276,6 +305,9 @@ impl Buffer {
             false
         });
         self.foldable_dirty = true;
+        // Lint diagnostics are positional snapshots; any line-count change
+        // invalidates them. Re-run lint (Alt+L) to refresh.
+        self.diagnostics.clear();
     }
 
     fn is_hidden(&self, row: usize) -> bool {
@@ -286,6 +318,15 @@ impl Buffer {
 
     fn collapsed_fold_at(&self, row: usize) -> Option<Fold> {
         self.folds.iter().find(|f| f.start == row).copied()
+    }
+
+    // Most severe lint diagnostic on a row, for the gutter glyph.
+    fn diagnostic_severity_at(&self, row: usize) -> Option<Severity> {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.row == row)
+            .map(|d| d.severity)
+            .max()
     }
 
     fn next_visible_row(&self, from: usize) -> Option<usize> {
@@ -615,7 +656,7 @@ impl Buffer {
         let Some(syntax_name) = self.syntax_name.clone() else {
             return CommentResult::NoSyntax;
         };
-        let Some(prefix) = crate::highlight::line_comment_for(&syntax_name) else {
+        let Some(prefix) = sacrament_core::highlight::line_comment_for(&syntax_name) else {
             return CommentResult::NoStyle(syntax_name);
         };
 
@@ -829,6 +870,7 @@ impl Buffer {
         self.text.insert(insert_at, tail);
         self.highlights.insert(insert_at, None);
         self.line_state_before.insert(insert_at, None);
+        self.change_bars.insert(insert_at, None);
         self.adjust_folds_for_edit(insert_at, 0, 1);
         self.cursor_row += 1;
         self.cursor_col = 0;
@@ -858,6 +900,7 @@ impl Buffer {
             let line = self.text.remove(row);
             self.highlights.remove(row);
             self.line_state_before.remove(row);
+            self.change_bars.remove(row);
             self.adjust_folds_for_edit(row, 1, 0);
             self.cursor_row -= 1;
             self.cursor_col = self.current_line_len();
@@ -888,6 +931,7 @@ impl Buffer {
             let next = self.text.remove(self.cursor_row + 1);
             self.highlights.remove(self.cursor_row + 1);
             self.line_state_before.remove(self.cursor_row + 1);
+            self.change_bars.remove(self.cursor_row + 1);
             self.adjust_folds_for_edit(self.cursor_row + 1, 1, 0);
             self.text[self.cursor_row].push_str(&next);
             self.dirty = true;
@@ -917,6 +961,7 @@ impl Buffer {
             self.text.drain((sr + 1)..=er);
             self.highlights.drain((sr + 1)..=er);
             self.line_state_before.drain((sr + 1)..=er);
+            self.change_bars.drain((sr + 1)..=er);
             self.adjust_folds_for_edit(sr + 1, er - sr, 0);
         }
         self.cursor_row = sr;
@@ -955,6 +1000,7 @@ impl Buffer {
                 self.text.insert(insert_at + i, l);
                 self.highlights.insert(insert_at + i, None);
                 self.line_state_before.insert(insert_at + i, None);
+                self.change_bars.insert(insert_at + i, None);
             }
             self.adjust_folds_for_edit(insert_at, 0, added);
             self.cursor_row += parts.len() - 1;
@@ -1014,6 +1060,8 @@ impl Buffer {
             .collect();
         self.foldable_at = vec![None; n];
         self.foldable_dirty = true;
+        self.change_bars = vec![None; n];
+        self.diagnostics.clear();
     }
 
     fn undo(&mut self) -> bool {
@@ -1242,6 +1290,9 @@ pub struct Editor {
     pub shell_rx: mpsc::Receiver<crate::shell::ShellMsg>,
     next_shell_id: u64,
     shell_mouse_drag: Option<crate::shell::PaneFocus>,
+    // On-demand lint results, delivered from a worker thread (see run_lint).
+    lint_tx: mpsc::Sender<sacrament_core::lint::LintMsg>,
+    lint_rx: mpsc::Receiver<sacrament_core::lint::LintMsg>,
 }
 
 impl Editor {
@@ -1268,6 +1319,7 @@ impl Editor {
         })
         .ok();
         let (shell_tx, shell_rx) = mpsc::channel::<crate::shell::ShellMsg>();
+        let (lint_tx, lint_rx) = mpsc::channel::<sacrament_core::lint::LintMsg>();
         let mut ed = Self {
             buffers: vec![Buffer::empty()],
             active: 0,
@@ -1297,6 +1349,8 @@ impl Editor {
             shell_rx,
             next_shell_id: 0,
             shell_mouse_drag: None,
+            lint_tx,
+            lint_rx,
         };
         ed.buffers[0].wrap = ed.config.word_wrap;
         // Auto-spawn one shell in each pane with the process cwd.
@@ -1416,11 +1470,198 @@ impl Editor {
         }
         self.watch(path);
         self.report_syntax_status(idx, syntax, path);
+        self.recompute_change_bars(idx);
         self.needs_cursor_adjust = true;
         Ok(())
     }
 
-    pub fn try_load_remote(&mut self, path: &Path, syntax: Option<&str>) -> Result<()> {
+    fn buffer_index_for_path(&self, path: &Path) -> Option<usize> {
+        self.buffers.iter().position(|b| {
+            b.path
+                .as_deref()
+                .map(|p| paths_equal(p, path))
+                .unwrap_or(false)
+        })
+    }
+
+    // Refresh a buffer's git change-bars from disk (a cheap single-file diff).
+    fn recompute_change_bars(&mut self, idx: usize) {
+        let Some(path) = self.buffers.get(idx).and_then(|b| b.path.clone()) else {
+            return;
+        };
+        let n = self.buffers[idx].text.len();
+        let info = sacrament_core::git::changed_lines(&path);
+        self.buffers[idx].in_git_repo = info.in_repo;
+        let mut bars = vec![None; n];
+        match info.change {
+            sacrament_core::git::FileChange::Hunks(hunks) => {
+                for (row, kind) in hunks {
+                    if row < n {
+                        bars[row] = Some(kind);
+                    }
+                }
+            }
+            sacrament_core::git::FileChange::AllAdded => {
+                for slot in bars.iter_mut() {
+                    *slot = Some(ChangeKind::Added);
+                }
+            }
+            sacrament_core::git::FileChange::None => {}
+        }
+        self.buffers[idx].change_bars = bars;
+    }
+
+    // Lint the active file on demand. Resolves a command by language name or
+    // extension and runs it on a worker thread; results arrive via lint_rx.
+    fn run_lint(&mut self) {
+        let Some(path) = self.active().path.clone() else {
+            self.set_status("no file to lint");
+            return;
+        };
+        let lang = self.active().syntax_name.clone();
+        let cmd = lang
+            .as_deref()
+            .and_then(|k| self.config.lint.linters.get(k))
+            .or_else(|| {
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(|e| self.config.lint.linters.get(e))
+            })
+            .map(|spec| spec.command.clone());
+        let Some(cmd) = cmd else {
+            let what = lang.unwrap_or_else(|| "this file".to_string());
+            self.set_status(format!("no linter configured for {what}"));
+            return;
+        };
+        self.set_status("linting…");
+        let tx = self.lint_tx.clone();
+        std::thread::spawn(move || {
+            let diagnostics = sacrament_core::lint::run(&cmd, &path);
+            let _ = tx.send(sacrament_core::lint::LintMsg { path, diagnostics });
+        });
+    }
+
+    pub fn drain_lint_results(&mut self) {
+        while let Ok(msg) = self.lint_rx.try_recv() {
+            let total = msg.diagnostics.len();
+            let errors = msg
+                .diagnostics
+                .iter()
+                .filter(|d| d.severity == Severity::Error)
+                .count();
+            let warnings = total - errors;
+            for idx in 0..self.buffers.len() {
+                let same = self.buffers[idx]
+                    .path
+                    .as_deref()
+                    .map(|p| paths_equal(p, &msg.path))
+                    .unwrap_or(false);
+                if same {
+                    self.buffers[idx].diagnostics = msg.diagnostics.clone();
+                }
+            }
+            if total == 0 {
+                self.set_status("lint: clean");
+            } else {
+                self.set_status(format!("lint: {errors} error(s), {warnings} warning(s)"));
+            }
+        }
+    }
+
+    fn diagnostic_message_at(&self, row: usize) -> Option<String> {
+        self.active()
+            .diagnostics
+            .iter()
+            .find(|d| d.row == row)
+            .map(|d| d.message.clone())
+    }
+
+    // The most-severe diagnostic on the active cursor row, for the status strip.
+    fn active_cursor_diagnostic(&self) -> Option<(Severity, String)> {
+        let b = self.active();
+        if b.view_mode != ViewMode::Edit {
+            return None;
+        }
+        b.diagnostics
+            .iter()
+            .filter(|d| d.row == b.cursor_row)
+            .max_by_key(|d| d.severity)
+            .map(|d| (d.severity, d.message.clone()))
+    }
+
+    fn jump_diagnostic(&mut self, forward: bool) {
+        let cur = self.active().cursor_row;
+        let mut rows: Vec<usize> = self.active().diagnostics.iter().map(|d| d.row).collect();
+        if rows.is_empty() {
+            self.set_status("no diagnostics");
+            return;
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        let target = if forward {
+            rows.iter()
+                .copied()
+                .find(|&r| r > cur)
+                .or_else(|| rows.first().copied())
+        } else {
+            rows.iter()
+                .copied()
+                .rev()
+                .find(|&r| r < cur)
+                .or_else(|| rows.last().copied())
+        };
+        if let Some(r) = target {
+            self.active_mut().goto_line(r + 1);
+            // Land on the diagnostic's column when known.
+            let col = self
+                .active()
+                .diagnostics
+                .iter()
+                .find(|d| d.row == r)
+                .map(|d| d.col);
+            if let Some(col) = col {
+                let b = self.active_mut();
+                let line_len = b.current_line_len();
+                b.cursor_col = col.min(line_len);
+            }
+            self.needs_cursor_adjust = true;
+            if let Some(m) = self.diagnostic_message_at(r) {
+                self.set_status(m);
+            }
+        }
+    }
+
+    pub fn try_load_remote(&mut self, path: &Path, syntax: Option<&str>, review: bool) -> Result<()> {
+        // Review opens (from a Claude Code hook) surface the file as a
+        // background, unreviewed tab — no focus steal, so the user keeps
+        // working and the touched files pile up to be reviewed on their schedule.
+        if review {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            // Already open? Just flag it; the fs watcher reloads new content.
+            if let Some(idx) = self.buffer_index_for_path(path) {
+                self.buffers[idx].unreviewed = true;
+                self.set_status(format!("Claude touched {name} — unreviewed"));
+                return Ok(());
+            }
+            let mut b = Buffer::empty();
+            b.wrap = self.config.word_wrap;
+            b.load(path)?;
+            b.unreviewed = true;
+            b.syntax_override = syntax.map(|s| s.to_string());
+            if let Some(hl) = self.highlighter.as_ref() {
+                b.seed_syntax(hl);
+            }
+            self.buffers.push(b);
+            let idx = self.buffers.len() - 1;
+            self.watch(path);
+            self.recompute_change_bars(idx);
+            self.set_status(format!("Claude touched {name} — unreviewed"));
+            return Ok(());
+        }
+
         if self.active().is_fresh_and_clean() {
             self.active_mut().load(path)?;
         } else {
@@ -1437,6 +1678,7 @@ impl Editor {
         }
         self.watch(path);
         self.report_syntax_status(idx, syntax, path);
+        self.recompute_change_bars(idx);
         self.needs_cursor_adjust = true;
         Ok(())
     }
@@ -1455,12 +1697,12 @@ impl Editor {
         }
     }
 
-    pub fn capture_session(&self) -> crate::session::Session {
+    pub fn capture_session(&self) -> sacrament_core::session::Session {
         let buffers: Vec<_> = self
             .buffers
             .iter()
             .filter_map(|b| {
-                b.path.as_ref().map(|p| crate::session::SessionBuffer {
+                b.path.as_ref().map(|p| sacrament_core::session::SessionBuffer {
                     path: p.clone(),
                     cursor_row: b.cursor_row,
                     cursor_col: b.cursor_col,
@@ -1490,26 +1732,29 @@ impl Editor {
             .bottom_pane
             .shells
             .iter()
-            .map(|s| crate::session::ShellTabSession { cwd: s.cwd.clone() })
+            .map(|s| sacrament_core::session::ShellTabSession { cwd: s.cwd.clone() })
             .collect();
         let right_shells = self
             .right_pane
             .shells
             .iter()
-            .map(|s| crate::session::ShellTabSession { cwd: s.cwd.clone() })
+            .map(|s| sacrament_core::session::ShellTabSession { cwd: s.cwd.clone() })
             .collect();
 
-        crate::session::Session {
+        sacrament_core::session::Session {
             active,
             buffers,
             bottom_shells,
             bottom_active: self.bottom_pane.active,
             right_shells,
             right_active: self.right_pane.active,
+            // v1 has no window geometry to persist, and writes its own session
+            // file (`APP_TUI`), so the default is never read back by v2.
+            ..Default::default()
         }
     }
 
-    pub fn restore_session(&mut self, session: crate::session::Session) {
+    pub fn restore_session(&mut self, session: sacrament_core::session::Session) {
         let mut loaded: Vec<Buffer> = Vec::new();
         for sb in &session.buffers {
             if !sb.path.exists() {
@@ -1561,6 +1806,9 @@ impl Editor {
                 self.watch(&p);
             }
             self.set_status(format!("restored {count} buffers"));
+            for idx in 0..self.buffers.len() {
+                self.recompute_change_bars(idx);
+            }
         }
         self.needs_cursor_adjust = true;
 
@@ -1677,6 +1925,21 @@ impl Editor {
                         .unwrap_or(false);
                     if same {
                         self.buffers[idx].seed_syntax(hl);
+                    }
+                }
+            }
+            for idx in 0..self.buffers.len() {
+                let same = self.buffers[idx]
+                    .path
+                    .as_deref()
+                    .map(|p| paths_equal(p, path))
+                    .unwrap_or(false);
+                if same {
+                    self.recompute_change_bars(idx);
+                    // If this buffer is open in the diff view, refresh it so the
+                    // diff tracks the file (e.g. an agent re-editing it).
+                    if self.buffers[idx].view_mode == ViewMode::Diff {
+                        self.buffers[idx].diff_view = sacrament_core::git::diff_text(path);
                     }
                 }
             }
@@ -1906,10 +2169,13 @@ impl Editor {
 
     fn toggle_view_mode(&mut self) {
         let b = self.active_mut();
-        b.view_mode = match b.view_mode {
-            ViewMode::Edit => ViewMode::Read,
-            ViewMode::Read => ViewMode::Edit,
+        // Alt+M flips Edit<->Read (also exits a diff view back to Read).
+        b.view_mode = if b.view_mode == ViewMode::Read {
+            ViewMode::Edit
+        } else {
+            ViewMode::Read
         };
+        b.diff_view = None;
         // Reset scroll + cursor on toggle. We don't preserve the source-
         // position-to-rendered-line mapping; user starts from the top.
         b.scroll_row = 0;
@@ -1918,11 +2184,48 @@ impl Editor {
         b.cursor_row = 0;
         b.cursor_col = 0;
         b.selection_anchor = None;
-        let label = match b.view_mode {
-            ViewMode::Edit => "edit",
-            ViewMode::Read => "read",
+        let label = if b.view_mode == ViewMode::Read {
+            "read"
+        } else {
+            "edit"
         };
         self.set_status(format!("markdown: {label}"));
+    }
+
+    fn toggle_diff_view(&mut self) {
+        if self.active().view_mode == ViewMode::Diff {
+            let b = self.active_mut();
+            b.view_mode = ViewMode::Edit;
+            b.diff_view = None;
+            b.scroll_row = 0;
+            b.scroll_seg = 0;
+            b.scroll_col = 0;
+            b.cursor_row = 0;
+            b.cursor_col = 0;
+            b.selection_anchor = None;
+            self.set_status("diff: off");
+            return;
+        }
+        let Some(path) = self.active().path.clone() else {
+            self.set_status("no file to diff");
+            return;
+        };
+        match sacrament_core::git::diff_text(&path) {
+            Some(text) if !text.trim().is_empty() => {
+                let b = self.active_mut();
+                b.diff_view = Some(text);
+                b.view_mode = ViewMode::Diff;
+                b.scroll_row = 0;
+                b.scroll_seg = 0;
+                b.scroll_col = 0;
+                b.cursor_row = 0;
+                b.cursor_col = 0;
+                b.selection_anchor = None;
+                self.set_status("diff vs HEAD — Alt+D to exit");
+            }
+            Some(_) => self.set_status("no changes vs git"),
+            None => self.set_status("not in a git repo"),
+        }
     }
 
     fn handle_key_read(&mut self, key: KeyEvent, ctrl: bool, shift: bool) {
@@ -2003,7 +2306,16 @@ impl Editor {
             return;
         }
 
-        if self.active().view_mode == ViewMode::Read {
+        // Diff/review view toggle: Alt+D, or Cmd/Ctrl+Shift+D as a fallback for
+        // setups where Option doesn't act as Alt.
+        let is_d = matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'));
+        if is_d && ((alt && !ctrl) || (ctrl && shift)) {
+            self.toggle_diff_view();
+            return;
+        }
+
+        // Read and diff are read-only render modes: navigation only.
+        if self.active().view_mode != ViewMode::Edit {
             self.handle_key_read(key, ctrl, shift);
             return;
         }
@@ -2028,6 +2340,18 @@ impl Editor {
                         }
                         'f' => {
                             self.active_mut().move_word_right(shift);
+                            return;
+                        }
+                        'l' => {
+                            self.run_lint();
+                            return;
+                        }
+                        '[' if !ctrl => {
+                            self.jump_diagnostic(false);
+                            return;
+                        }
+                        ']' if !ctrl => {
+                            self.jump_diagnostic(true);
                             return;
                         }
                         _ => {}
@@ -2069,6 +2393,7 @@ impl Editor {
                         Ok(()) => {
                             let name = self.active().display_name();
                             self.set_status(format!("saved {name}"));
+                            self.recompute_change_bars(self.active);
                         }
                         Err(e) => self.set_status(format!("save failed: {e}")),
                     }
@@ -2105,6 +2430,7 @@ impl Editor {
             (true, KeyCode::Char('v')) => self.paste(),
             (true, KeyCode::Char('f')) => self.open_prompt(PromptKind::Search),
             (true, KeyCode::Char('g')) => self.open_prompt(PromptKind::Goto),
+            (true, KeyCode::Char('l')) if shift => self.run_lint(),
             (true, KeyCode::Char('[')) if alt && shift => self.fold_all(),
             (true, KeyCode::Char(']')) if alt && shift => self.unfold_all(),
             (true, KeyCode::Char('[')) if alt => self.fold_at_cursor(),
@@ -2217,10 +2543,13 @@ impl Editor {
                     }
                 } else if layout.gutter.width > 0 && point_in(ev.column, ev.row, layout.gutter) {
                     self.focus = crate::shell::PaneFocus::Editor;
-                    // Click in the gutter. Chevron sits in the second-to-last
-                    // column (there's a trailing space for breathing room).
+                    // Click in the gutter. The chevron sits at `digits + 1`
+                    // from the left edge (after the right-aligned number and a
+                    // space); the optional lint/change-bar columns come after it,
+                    // so its position depends only on the line count, not them.
                     let gutter = layout.gutter;
-                    let chevron_x = gutter.x + gutter.width - 2;
+                    let digits = digits_in(self.active().text.len().max(1));
+                    let chevron_x = gutter.x + digits as u16 + 1;
                     if ev.column == chevron_x {
                         let screen_row = ev.row.saturating_sub(gutter.y) as usize;
                         let b = self.active();
@@ -2233,8 +2562,8 @@ impl Editor {
                     }
                 } else if point_in(ev.column, ev.row, text_area) {
                     self.focus = crate::shell::PaneFocus::Editor;
-                    if self.active().view_mode == ViewMode::Read {
-                        // Read mode: just focus, no cursor placement.
+                    if self.active().view_mode != ViewMode::Edit {
+                        // Read/diff modes: just focus, no cursor placement.
                     } else {
                         let (row, col) = self.screen_to_doc(ev.column, ev.row, text_area, tab_width);
                         let now = Instant::now();
@@ -2293,7 +2622,7 @@ impl Editor {
                 self.tabs_scroll = (self.tabs_scroll + 2).min(max);
             }
             MouseEventKind::ScrollUp => {
-                if self.active().view_mode == ViewMode::Read {
+                if self.active().view_mode != ViewMode::Edit {
                     let b = self.active_mut();
                     b.scroll_row = b.scroll_row.saturating_sub(3);
                 } else {
@@ -2302,7 +2631,7 @@ impl Editor {
                 }
             }
             MouseEventKind::ScrollDown => {
-                if self.active().view_mode == ViewMode::Read {
+                if self.active().view_mode != ViewMode::Edit {
                     let b = self.active_mut();
                     b.scroll_row = b.scroll_row.saturating_add(3);
                 } else {
@@ -2541,21 +2870,31 @@ impl Editor {
         buffer_tab_drag_target(&self.buffers, x_off)
     }
 
+    // Viewing a tab counts as reviewing it: clear the unreviewed mark.
+    fn mark_active_reviewed(&mut self) {
+        if let Some(b) = self.buffers.get_mut(self.active) {
+            b.unreviewed = false;
+        }
+    }
+
     fn switch_to(&mut self, idx: usize) {
         if idx < self.buffers.len() {
             self.active = idx;
+            self.mark_active_reviewed();
         }
     }
 
     fn next_buffer(&mut self) {
         if self.buffers.len() > 1 {
             self.active = (self.active + 1) % self.buffers.len();
+            self.mark_active_reviewed();
         }
     }
 
     fn prev_buffer(&mut self) {
         if self.buffers.len() > 1 {
             self.active = (self.active + self.buffers.len() - 1) % self.buffers.len();
+            self.mark_active_reviewed();
         }
     }
 
@@ -2836,7 +3175,9 @@ impl Editor {
         self.active_mut().ensure_foldable(tw);
 
         let area = frame.area();
-        let show_bottom = matches!(self.mode, Mode::Prompt(_)) || !self.status.is_empty();
+        let show_bottom = matches!(self.mode, Mode::Prompt(_))
+            || !self.status.is_empty()
+            || self.active_cursor_diagnostic().is_some();
 
         // Outer horizontal split: left block | 1-col gap | right shell pane.
         let outer_chunks = Layout::default()
@@ -2961,9 +3302,43 @@ impl Editor {
         });
     }
 
+    // Which gutter overlay columns apply to a buffer, in render order after the
+    // chevron: (lint glyph, change-bar). Each is omitted when it could never
+    // carry content for this buffer, so a plain file outside git with no linter
+    // keeps the lean `digits + 3` gutter.
+    fn gutter_overlays(&self, buf: &Buffer) -> (bool, bool) {
+        let lint = self.linter_configured_for(buf) || !buf.diagnostics.is_empty();
+        (lint, buf.in_git_repo)
+    }
+
+    fn linter_configured_for(&self, buf: &Buffer) -> bool {
+        let linters = &self.config.lint.linters;
+        if linters.is_empty() {
+            return false;
+        }
+        let by_name = buf
+            .syntax_name
+            .as_deref()
+            .map(|k| linters.contains_key(k))
+            .unwrap_or(false);
+        let by_ext = buf
+            .path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .map(|e| linters.contains_key(e))
+            .unwrap_or(false);
+        by_name || by_ext
+    }
+
     fn render_gutter(&self, frame: &mut Frame, area: Rect) {
         let b = self.active();
-        let digits = (area.width as usize).saturating_sub(3);
+        // Layout: [number][space][chevron] then optional [lint] / [change-bar]
+        // columns, then a trailing space. `digits` comes from the line count
+        // (not area.width) so it's independent of which overlays are present —
+        // keep this in sync with gutter_width() and the gutter-click hit-test.
+        let digits = digits_in(b.text.len().max(1));
+        let (show_lint, show_change) = self.gutter_overlays(b);
         let height = area.height as usize;
         let tab_width = self.config.tab_width;
         let rows = build_screen_rows(b, height, tab_width);
@@ -2985,13 +3360,34 @@ impl Editor {
             } else {
                 ' '
             };
-            let label = format!("{:>width$} {} ", sr.doc_row + 1, chevron, width = digits);
-            let style = if sr.doc_row == b.cursor_row {
+            let base_style = if sr.doc_row == b.cursor_row {
                 Style::default()
             } else {
                 Style::default().add_modifier(Modifier::DIM)
             };
-            lines.push(Line::from(Span::styled(label, style)));
+            let mut spans = vec![Span::styled(
+                format!("{:>width$} {}", sr.doc_row + 1, chevron, width = digits),
+                base_style,
+            )];
+            if show_lint {
+                // Most severe diagnostic on this row.
+                let (ch, style) = match b.diagnostic_severity_at(sr.doc_row) {
+                    Some(Severity::Error) => ('●', Style::default().fg(Color::Red)),
+                    Some(Severity::Warning) => ('●', Style::default().fg(Color::Yellow)),
+                    None => (' ', Style::default()),
+                };
+                spans.push(Span::styled(ch.to_string(), style));
+            }
+            if show_change {
+                let (ch, style) = match b.change_bars.get(sr.doc_row).copied().flatten() {
+                    Some(ChangeKind::Added) => ('▎', Style::default().fg(Color::Green)),
+                    Some(ChangeKind::Modified) => ('▎', Style::default().fg(Color::Cyan)),
+                    None => (' ', Style::default()),
+                };
+                spans.push(Span::styled(ch.to_string(), style));
+            }
+            spans.push(Span::raw(" "));
+            lines.push(Line::from(spans));
         }
         frame.render_widget(Paragraph::new(lines), area);
     }
@@ -3007,12 +3403,17 @@ impl Editor {
     }
 
     fn gutter_width(&self) -> u16 {
-        if !self.config.line_numbers || self.active().view_mode == ViewMode::Read {
+        // No line numbers / gutter in the read-only render modes (markdown,
+        // diff) — they draw their own content edge to edge.
+        if !self.config.line_numbers || self.active().view_mode != ViewMode::Edit {
             return 0;
         }
-        let len = self.active().text.len().max(1);
-        let digits = digits_in(len);
-        (digits + 3) as u16
+        let b = self.active();
+        let digits = digits_in(b.text.len().max(1));
+        let (lint, change) = self.gutter_overlays(b);
+        // [number][space][chevron] + overlay columns + [trailing space].
+        let overlays = lint as usize + change as usize;
+        (digits + 3 + overlays) as u16
     }
 
     fn ensure_active_tab_visible(&mut self, width: u16) {
@@ -3068,6 +3469,9 @@ impl Editor {
                     Style::default().fg(Color::LightYellow),
                 ));
             }
+            if buf.unreviewed {
+                spans.push(Span::styled(" ◇", Style::default().fg(Color::LightCyan)));
+            }
             spans.push(Span::raw(" "));
         }
         let scroll = self.tabs_scroll.min(u16::MAX as usize) as u16;
@@ -3082,9 +3486,16 @@ impl Editor {
         let height = text_area.height as usize;
         let width = text_area.width as usize;
 
-        if self.active().view_mode == ViewMode::Read {
-            self.render_read_body(frame, text_area, height, width);
-            return;
+        match self.active().view_mode {
+            ViewMode::Read => {
+                self.render_read_body(frame, text_area, height, width);
+                return;
+            }
+            ViewMode::Diff => {
+                self.render_diff_body(frame, text_area, height);
+                return;
+            }
+            ViewMode::Edit => {}
         }
 
         // Update the wrap width for this frame so segment helpers agree.
@@ -3147,11 +3558,52 @@ impl Editor {
         frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
     }
 
+    fn render_diff_body(&mut self, frame: &mut Frame, area: Rect, height: usize) {
+        let idx = self.active;
+        let text = self.buffers[idx].diff_view.clone().unwrap_or_default();
+        let lines: Vec<Line> = text
+            .lines()
+            .map(|raw| {
+                // File headers bold; +added green; -removed red; @@ hunks cyan.
+                let style = if raw.starts_with("+++") || raw.starts_with("---") {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else if raw.starts_with('+') {
+                    Style::default().fg(Color::Green)
+                } else if raw.starts_with('-') {
+                    Style::default().fg(Color::Red)
+                } else if raw.starts_with("@@") {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().add_modifier(Modifier::DIM)
+                };
+                Line::from(Span::styled(raw.to_string(), style))
+            })
+            .collect();
+        let max_scroll = lines.len().saturating_sub(height);
+        if self.buffers[idx].scroll_row > max_scroll {
+            self.buffers[idx].scroll_row = max_scroll;
+        }
+        let scroll = self.buffers[idx].scroll_row.min(u16::MAX as usize) as u16;
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
+    }
+
     fn render_status_line(&self, frame: &mut Frame, area: Rect) {
-        if self.status.is_empty() {
+        if !self.status.is_empty() {
+            frame.render_widget(Paragraph::new(self.status.clone()), area);
             return;
         }
-        frame.render_widget(Paragraph::new(self.status.clone()), area);
+        // No transient status: surface the diagnostic on the cursor's line.
+        if let Some((sev, msg)) = self.active_cursor_diagnostic() {
+            let color = if sev == Severity::Error {
+                Color::Red
+            } else {
+                Color::Yellow
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(color)))),
+                area,
+            );
+        }
     }
 
     fn render_prompt(&self, frame: &mut Frame, area: Rect, state: &PromptState) {
@@ -3163,7 +3615,7 @@ impl Editor {
         match &self.mode {
             Mode::Normal => {
                 let b = self.active();
-                if b.view_mode == ViewMode::Read {
+                if b.view_mode != ViewMode::Edit {
                     return;
                 }
                 if b.is_hidden(b.cursor_row) || b.cursor_row < b.scroll_row {
@@ -3368,9 +3820,13 @@ enum ShellTabHit {
 }
 
 fn buffer_tab_width(buf: &Buffer) -> usize {
-    // <name>(+ " •" if dirty) + " " — same layout as render_tab_bar.
+    // <name>(+ " •" if dirty)(+ " ◇" if unreviewed) + " " — same layout as
+    // render_tab_bar. Hit-testing walks this width, so keep them in lockstep.
     let mut w = buf.display_name().chars().count();
     if buf.dirty {
+        w += 2;
+    }
+    if buf.unreviewed {
         w += 2;
     }
     w += 1;
@@ -3921,10 +4377,10 @@ fn make_span(text: String, hl: Option<&HlSpan>, selected: bool) -> Span<'static>
     if selected {
         style = style.fg(Color::White).bg(Color::DarkGray);
     } else if let Some(h) = hl {
-        if let Some(c) = h.color {
-            style = style.fg(c);
+        if let Some(slot) = h.color {
+            style = style.fg(slot_to_color(slot));
         }
-        style = style.add_modifier(h.modifier);
+        style = style.add_modifier(emphasis_to_modifier(h.emphasis));
     }
     Span::styled(text, style)
 }

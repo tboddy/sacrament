@@ -19,10 +19,12 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::config::Config;
+use sacrament_core::config::Config;
+use sacrament_core::paths::socket_path;
+use sacrament_core::protocol::{Request, Response};
+use sacrament_core::{APP_TUI, session};
+
 use crate::editor::Editor;
-use crate::protocol::{Request, Response, socket_path};
-use crate::session;
 
 pub struct InitialOpen {
     pub path: PathBuf,
@@ -35,6 +37,7 @@ pub enum RemoteCommand {
         path: PathBuf,
         line: Option<usize>,
         syntax: Option<String>,
+        review: bool,
         reply: Sender<Response>,
     },
 }
@@ -47,7 +50,7 @@ impl Drop for SocketGuard {
 }
 
 pub fn run(initial: Option<InitialOpen>, config: Config) -> Result<()> {
-    let sock_path = socket_path();
+    let sock_path = socket_path(APP_TUI);
     if sock_path.exists() {
         let _ = fs::remove_file(&sock_path);
     }
@@ -65,14 +68,14 @@ pub fn run(initial: Option<InitialOpen>, config: Config) -> Result<()> {
         } else if let Some(n) = open.line {
             editor.goto_line(n);
         }
-    } else if let Some(sess) = session::load() {
+    } else if let Some(sess) = session::load(APP_TUI) {
         editor.restore_session(sess);
     }
 
     let result = run_ui(&mut editor, rx);
 
     let snapshot = editor.capture_session();
-    let _ = session::save(&snapshot);
+    let _ = session::save(APP_TUI, &snapshot);
 
     result
 }
@@ -97,12 +100,18 @@ fn handle_client(mut stream: UnixStream, tx: Sender<RemoteCommand>) -> Result<()
     }
 
     let response = match Request::parse(&line) {
-        Some(Request::Open { path, line, syntax }) => {
+        Some(Request::Open {
+            path,
+            line,
+            syntax,
+            review,
+        }) => {
             let (reply_tx, reply_rx) = mpsc::channel();
             tx.send(RemoteCommand::Open {
                 path,
                 line,
                 syntax,
+                review,
                 reply: reply_tx,
             })
             .ok();
@@ -165,6 +174,8 @@ fn event_loop(
         // Drain PTY output from background reader threads; vt100 parsers
         // update and OSC 7 cwd updates are applied in apply_shell_output.
         editor.drain_shell_output();
+        // Drain on-demand lint results from worker threads (see run_lint).
+        editor.drain_lint_results();
 
         if event::poll(Duration::from_millis(20))? {
             loop {
@@ -252,12 +263,17 @@ fn apply_remote(editor: &mut Editor, cmd: RemoteCommand) {
             path,
             line,
             syntax,
+            review,
             reply,
         } => {
-            let response = match editor.try_load_remote(&path, syntax.as_deref()) {
+            let response = match editor.try_load_remote(&path, syntax.as_deref(), review) {
                 Ok(()) => {
-                    if let Some(n) = line {
-                        editor.goto_line(n);
+                    // Review opens land in a background tab; don't move the
+                    // cursor or steal focus by jumping to a line.
+                    if !review {
+                        if let Some(n) = line {
+                            editor.goto_line(n);
+                        }
                     }
                     Response::Ok
                 }

@@ -1,0 +1,3231 @@
+//! sacrament 2.0 spike — validates the iced rebuild before committing to it.
+//!
+//! What this is testing, in order of risk:
+//!
+//! 1. Can a custom iced widget draw a styled monospace cell grid fast enough,
+//!    inside `pane_grid`'s layout? (`grid_view`)
+//! 2. Does `alacritty_terminal` slot in cleanly as the VT layer, replacing v1's
+//!    `vt100`? (`term`)
+//! 3. Can PTY output be push-driven through iced's subscription model instead of
+//!    v1's 20ms poll loop? (`pty`)
+//! 4. What does it cost in frame time and memory?
+//!
+//! Run it, type in the shell, then flood output (`yes | head -200000`, `htop`)
+//! and watch the metrics line at the bottom. `Ctrl+R` resets the counters.
+//!
+//! Not in scope: editor surface, tabs, multiple panes, selection, scrollback
+//! input, mouse forwarding, OSC handling. Those are cheap once the grid is
+//! proven; they're the reason the grid is proven first.
+
+mod buffer;
+mod grid;
+mod ipc;
+mod macos;
+mod grid_view;
+mod gutter;
+mod metrics;
+mod palette;
+mod font;
+mod pty;
+mod term;
+mod theme_guard;
+mod watch;
+
+use std::os::unix::net::UnixListener;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use iced::widget::{column, container, mouse_area, pane_grid, row, rule, text, text_input};
+use iced::{Element, Font, Length, Subscription, Task};
+
+use buffer::{Buffer, BufferSource};
+use grid_view::{GridMouse, GridView};
+use gutter::Gutter;
+use metrics::Metrics;
+use font::FontSpec;
+use palette::Palette;
+use pty::{PaneId, ShellKey, Spawn};
+use term::{Terminal, TerminalSource};
+
+/// What the command line asked for.
+struct Args {
+    /// Paths with their optional `:line` suffix already split off.
+    files: Vec<(std::path::PathBuf, Option<usize>)>,
+    syntax: Option<String>,
+    /// Opened on behalf of a tool rather than a person — see `--review` below.
+    review: bool,
+}
+
+fn parse_args(argv: &[String]) -> Result<Args, String> {
+    let mut args = Args {
+        files: Vec::new(),
+        syntax: None,
+        review: false,
+    };
+    let mut i = 0;
+    while i < argv.len() {
+        let a = &argv[i];
+        match a.as_str() {
+            "-s" | "--syntax" => {
+                let v = argv.get(i + 1).ok_or_else(|| format!("{a} requires a value"))?;
+                args.syntax = Some(v.clone());
+                i += 2;
+            }
+            s if s.starts_with("--syntax=") => {
+                args.syntax = Some(s["--syntax=".len()..].to_string());
+                i += 1;
+            }
+            "--review" => {
+                args.review = true;
+                i += 1;
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                return Err(format!("unexpected argument: {s}"));
+            }
+            s => {
+                args.files.push(split_line_suffix(s));
+                i += 1;
+            }
+        }
+    }
+    Ok(args)
+}
+
+/// Split a trailing `:N` into a line number, as `sacrament2 src/main.rs:42`.
+///
+/// A file whose name genuinely ends in `:digits` wins over the suffix reading —
+/// checked by asking the filesystem, since there's no other way to tell them
+/// apart.
+fn split_line_suffix(arg: &str) -> (std::path::PathBuf, Option<usize>) {
+    if let Some((head, tail)) = arg.rsplit_once(':')
+        && !tail.is_empty()
+        && tail.chars().all(|c| c.is_ascii_digit())
+        && let Ok(n) = tail.parse::<usize>()
+    {
+        if !std::path::Path::new(head).exists() && std::path::Path::new(arg).exists() {
+            return (std::path::PathBuf::from(arg), None);
+        }
+        return (std::path::PathBuf::from(head), Some(n));
+    }
+    (std::path::PathBuf::from(arg), None)
+}
+
+fn main() -> iced::Result {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let args = match parse_args(&argv) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("sacrament2: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Single instance per user, per app id. If a server is already listening,
+    // hand the files over and exit — that's what makes opening a file from any
+    // terminal join the live window instead of starting a second editor.
+    match hand_off(&args) {
+        HandOff::Done => return Ok(()),
+        HandOff::BeServer => {}
+    }
+
+    // No server, so this process becomes one. Bound before the window opens: a
+    // failure here shouldn't be discovered after the UI is up.
+    if let Some(listener) = bind_socket() {
+        ipc::attach(listener);
+    }
+    // Started before the window so the first `sync_watches` has somewhere to go.
+    watch::start();
+
+    // Window size comes from the session, so the app reopens where it was left.
+    // Read before `State::new` because the builder needs it up front.
+    let geometry = sacrament_core::session::load(sacrament_core::APP_GUI)
+        .map(|s| s.geometry.sanitized())
+        .unwrap_or_default();
+
+    iced::application(State::new, State::update, State::view)
+        .title(State::title)
+        .subscription(State::subscription)
+        .theme(State::theme)
+        .window_size((geometry.window_width, geometry.window_height))
+        // Intercept the close so the session can be written before exiting.
+        .exit_on_close_request(false)
+        .default_font(Font::MONOSPACE)
+        .antialiasing(true)
+        .run()
+}
+
+/// Bind the listening socket, clearing a stale one first.
+///
+/// A leftover socket file is the normal case, not an error: on macOS `Cmd+Q`
+/// terminates the process without unwinding, so nothing gets the chance to
+/// unlink it. `bind` fails with `EADDRINUSE` on an existing path whether or not
+/// anyone is listening, so the two have to be told apart by trying to connect.
+///
+/// `None` means don't serve. That's expected when another instance already owns
+/// the socket — a bare `sacrament2` opens a second window rather than refusing to
+/// start, and the first instance keeps the socket.
+fn bind_socket() -> Option<UnixListener> {
+    use std::os::unix::net::UnixStream;
+
+    let sock = sacrament_core::paths::socket_path(sacrament_core::APP_GUI);
+    if sock.exists() {
+        if UnixStream::connect(&sock).is_ok() {
+            return None;
+        }
+        let _ = std::fs::remove_file(&sock);
+    }
+    match UnixListener::bind(&sock) {
+        Ok(listener) => Some(listener),
+        // Losing IPC costs the single-instance behavior, not the editor, so this
+        // is a warning rather than a failure to start.
+        Err(e) => {
+            eprintln!("sacrament2: not listening on {}: {e}", sock.display());
+            None
+        }
+    }
+}
+
+enum HandOff {
+    /// A running instance took the request; this process is finished.
+    Done,
+    /// Nothing was listening — become the server.
+    BeServer,
+}
+
+/// Try to give the requested files to an already-running instance.
+fn hand_off(args: &Args) -> HandOff {
+    // `--review` is a tool's open (the Claude Code hook), and only means anything
+    // against an editor someone is already looking at. It never creates files and
+    // never boots a server — a hook firing in a repo with no editor open should
+    // do nothing at all, not launch one.
+    if args.review {
+        for (path, line) in &args.files {
+            let _ = sacrament_core::client::try_send_open(
+                sacrament_core::APP_GUI,
+                path,
+                *line,
+                args.syntax.as_deref(),
+                true,
+            );
+        }
+        return HandOff::Done;
+    }
+
+    if args.files.is_empty() {
+        // A bare `sacrament2` with a server running would otherwise be a no-op
+        // that looks like a crash. Becoming a second window is the honest
+        // outcome; the running instance already has the session.
+        return HandOff::BeServer;
+    }
+
+    // Create before sending: the server resolves the path with `canonicalize`,
+    // which fails on a file that doesn't exist yet, so `sacrament2 new.rs` has to
+    // create it either way — here or after becoming the server.
+    for (path, _) in &args.files {
+        if !path.exists() {
+            let _ = std::fs::File::create(path);
+        }
+    }
+
+    let mut handed = false;
+    for (path, line) in &args.files {
+        match sacrament_core::client::try_send_open(
+            sacrament_core::APP_GUI,
+            path,
+            *line,
+            args.syntax.as_deref(),
+            false,
+        ) {
+            Ok(true) => handed = true,
+            // No server listening. Stop trying and open everything locally
+            // instead, rather than half here and half there.
+            Ok(false) => return HandOff::BeServer,
+            Err(e) => {
+                eprintln!("sacrament2: {e}");
+                return HandOff::BeServer;
+            }
+        }
+    }
+    if handed { HandOff::Done } else { HandOff::BeServer }
+}
+
+#[derive(Debug, Clone)]
+enum Message {
+    Pty(ShellKey, pty::Event),
+    /// The shell grid measured its bounds and wants this many rows/cols.
+    GridResized(ShellKey, usize, usize),
+    /// Same, for the editor pane. Separate because only the shell's size has to
+    /// be pushed down to a PTY.
+    EditorResized(usize, usize),
+    /// A pane_grid splitter was dragged.
+    PaneDragged(pane_grid::DragEvent),
+    PaneResized(pane_grid::ResizeEvent),
+    /// Key, physical key, modifiers, and the composed text iced resolved for us.
+    Key(
+        iced::keyboard::Key,
+        iced::keyboard::key::Physical,
+        iced::keyboard::Modifiers,
+        Option<String>,
+    ),
+    /// A mouse gesture inside a pane's grid.
+    Mouse(Focus, GridMouse),
+    /// Clipboard read completed; insert it.
+    Pasted(Option<String>),
+    /// The pointer entered a tab.
+    TabHovered(Option<(TabGroup, usize)>),
+    /// The pointer left a *specific* tab. Which one matters — see the handler.
+    TabExited(TabGroup, usize),
+    /// A tab was pressed: it becomes active, and a reorder drag begins.
+    TabPressed(TabGroup, usize),
+    /// Pointer moved within a tab strip, in strip-relative x. Supplies the drag's
+    /// direction of travel.
+    TabPointerMoved(TabGroup, f32),
+    /// Middle-click on a tab.
+    TabClosed(TabGroup, usize),
+    /// The left button came up anywhere. Ends a tab drag, and settles geometry.
+    LeftReleased,
+    /// The prompt's text changed.
+    PromptInput(String),
+    /// Another invocation asked this instance to open something.
+    Remote(ipc::Command),
+    /// A watched file changed on disk.
+    FileChanged(std::path::PathBuf),
+    /// The save panel closed. `None` means it was cancelled.
+    SaveAsPicked(Option<std::path::PathBuf>, AfterSave),
+    /// The open panel closed.
+    OpenPicked(Vec<std::path::PathBuf>),
+    /// New empty buffer tab.
+    NewBuffer,
+    /// A gutter chevron was clicked.
+    ToggleFold(usize),
+    /// Answer to "save before closing this tab?".
+    CloseTabAnswer(usize, Answer),
+    /// Answer to "save before quitting?".
+    QuitAnswer(Answer),
+    /// Answer to a save that collided with a change on disk.
+    ConflictAnswer(Conflict),
+    WindowResized(iced::Size),
+    CloseRequested,
+    SpawnShell(PaneId),
+    /// A pane was clicked somewhere that isn't a cell — its padding. Focus moves,
+    /// the cursor doesn't. Without this, the padding band would be dead to
+    /// clicks, which looks like the pane ignoring you.
+    FocusPane(Focus),
+}
+
+/// One pane's identity. Only `Shell` exists in the spike; `Editor` is the point
+/// of the enum — it's where the same `GridView` gets a different data source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneKind {
+    Editor,
+    Shell(PaneId),
+}
+
+/// Inset between a pane's edge and its content. Terminal text jammed against a
+/// window border is uncomfortable to read — the same reason terminal emulators
+/// ship a padding setting. Not configurable yet; one number doesn't justify a new
+/// config section, but it's a small change if it wants tuning.
+const PANE_PADDING: u16 = 10;
+
+/// Height of the buffer tab strip, in pixels.
+const TAB_BAR_HEIGHT: f32 = 26.0;
+
+/// Thickness of the tab strip's underline and the separators between tabs.
+///
+/// Drawn as `rule` widgets rather than a `Border`, because `iced::Border` applies
+/// to all four sides at once — there's no way to ask it for "bottom only" or
+/// "right only". A 1px rule per edge is the way to get a single side.
+const TAB_BORDER: f32 = 1.0;
+
+/// Rows per wheel notch. Three is the common default and matches v1.
+const SCROLL_ROWS: f32 = 3.0;
+
+/// Thickness of the divider between panes.
+///
+/// Implemented as `pane_grid`'s `spacing`, not as a border on each pane: a border
+/// would outline every pane, and `pane_grid::Style` only draws its split line on
+/// hover or drag, with no always-visible option. The gap `spacing` leaves shows
+/// whatever is behind the grid, so painting *that* the divider color yields one
+/// permanent line between panes and nothing around them.
+///
+/// Independent of the drag target — `on_resize`'s leeway is what you grab, so a
+/// 1px divider is still easy to hit.
+const PANE_DIVIDER: f32 = 1.0;
+
+/// What the one-line prompt at the bottom is currently asking for.
+///
+/// Find, goto-line and save-as all need a single line of text, so they share one
+/// prompt rather than growing three lookalike inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptKind {
+    Find,
+    GotoLine,
+}
+
+impl PromptKind {
+    fn label(self) -> &'static str {
+        match self {
+            PromptKind::Find => "find:",
+            PromptKind::GotoLine => "line:",
+        }
+    }
+}
+
+/// The prompt's state while it's open.
+#[derive(Debug, Clone)]
+struct Prompt {
+    kind: PromptKind,
+    input: String,
+    /// Caret position when the prompt opened. Find searches from here every time
+    /// the query changes, so editing the query re-searches the same span instead
+    /// of walking forward through the file one keystroke at a time.
+    origin: buffer::Pos,
+    /// Outcome of the last action — "no match", an IO error — shown after the
+    /// input. Not a transient status: it stays until the next action changes it.
+    note: Option<String>,
+}
+
+/// What to do once a save-as completes. Dialogs are async, so an action that
+/// depends on one has to travel with it rather than following the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterSave {
+    Nothing,
+    CloseTab(usize),
+    Quit,
+}
+
+/// A three-way answer from a native confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    Save,
+    Discard,
+    Cancel,
+}
+
+/// What to do about a file that changed underneath an edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Conflict {
+    Overwrite,
+    Reload,
+    Cancel,
+}
+
+/// What one tab displays. The markers carry their own colors, so they can't be
+/// folded into the name.
+struct TabLabel {
+    name: String,
+    dirty: bool,
+    unreviewed: bool,
+}
+
+/// Marker colors, matching v1: bright yellow for unsaved, bright cyan for a file
+/// an external tool touched. Theme slots, not literals — `[theme]` decides the
+/// actual shade.
+const DIRTY_SLOT: usize = 11;
+const UNREVIEWED_SLOT: usize = 14;
+
+/// A tab being dragged to a new position within its own strip.
+///
+/// The reorder happens **live**, as the pointer crosses each tab, so the strip
+/// shows the result instead of describing it.
+///
+/// Moving live is what makes oscillation possible, and it is not hypothetical.
+/// Drag a narrow tab past a wide one: the swap puts the narrow tab where the
+/// wide one began, which leaves the pointer still inside the *wide* tab. The
+/// very next pointer movement fires `on_enter` for it and swaps back, and the
+/// pair flip-flops for as long as the mouse moves.
+///
+/// The fix is direction, not geometry: a tab only moves *forward* into a tab
+/// ahead of it while the pointer is travelling right, and *backward* into one
+/// behind it while travelling left. The rebound above asks to move backward
+/// during a rightward drag, so it's refused. Undoing a move then requires
+/// actually reversing direction, which is exactly the hysteresis a midpoint
+/// rule would give — without needing to know where any midpoint is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TabDrag {
+    group: TabGroup,
+    /// Where the drag started, so a release can tell whether anything changed.
+    origin: usize,
+    /// Where the dragged tab sits *now* — it moves as the pointer does.
+    at: usize,
+    /// Pointer x within the strip, from the previous move.
+    last_x: Option<f32>,
+    /// Sign of the last horizontal movement: positive is rightward.
+    dir: f32,
+}
+
+/// The prompt input, so opening the prompt can move keyboard focus into it.
+static PROMPT_ID: std::sync::LazyLock<iced::widget::Id> =
+    std::sync::LazyLock::new(iced::widget::Id::unique);
+
+/// The native save panel.
+///
+/// Async, and driven through `Task::perform`, because a blocking dialog on the
+/// UI thread deadlocks against the event loop that has to keep drawing it.
+/// Overwrite confirmation comes from the panel itself — which is the main reason
+/// this replaced a hand-rolled prompt, since "the file exists, are you sure" is
+/// exactly the part that had to be reinvented before.
+fn save_as_dialog_for(current: Option<std::path::PathBuf>, then: AfterSave) -> Task<Message> {
+    Task::perform(
+        async move {
+            let mut dialog = rfd::AsyncFileDialog::new();
+            if let Some(path) = &current {
+                if let Some(dir) = path.parent() {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(name) = path.file_name() {
+                    dialog = dialog.set_file_name(name.to_string_lossy().into_owned());
+                }
+            }
+            dialog.save_file().await.map(|h| h.path().to_path_buf())
+        },
+        move |picked| Message::SaveAsPicked(picked, then),
+    )
+}
+
+/// The native open panel. Multi-select, since tabs are cheap.
+fn open_dialog() -> Task<Message> {
+    Task::perform(
+        async {
+            rfd::AsyncFileDialog::new()
+                .pick_files()
+                .await
+                .map(|files| files.iter().map(|f| f.path().to_path_buf()).collect())
+                .unwrap_or_default()
+        },
+        Message::OpenPicked,
+    )
+}
+
+/// A Save / Don't Save / Cancel confirmation.
+fn confirm_unsaved(title: &str, body: String) -> impl std::future::Future<Output = Answer> {
+    let dialog = rfd::AsyncMessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title(title)
+        .set_description(body)
+        .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+            "Save".into(),
+            "Don't Save".into(),
+            "Cancel".into(),
+        ));
+    async move {
+        match dialog.show().await {
+            rfd::MessageDialogResult::Custom(label) if label == "Save" => Answer::Save,
+            rfd::MessageDialogResult::Custom(label) if label == "Don't Save" => Answer::Discard,
+            // Everything else — Cancel, or the dialog dismissed some other way —
+            // is the safe reading: do nothing.
+            _ => Answer::Cancel,
+        }
+    }
+}
+
+/// Move one element of a `Vec` to another index, returning whether it happened.
+///
+/// Remove-then-insert, deliberately, rather than a swap: dragging a tab three
+/// places left should slide the three it passes one step right, not exchange the
+/// endpoints. Because `to` indexes the list *before* the removal, no adjustment
+/// is needed in either direction — removing an earlier element shifts the target
+/// left by exactly the one position the insert then accounts for.
+fn move_item<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
+    if from == to || from >= items.len() || to >= items.len() {
+        return false;
+    }
+    let item = items.remove(from);
+    items.insert(to, item);
+    true
+}
+
+/// Is this the app's non-`Cmd` chord?
+///
+/// Two bindings sit outside the Cmd scheme, both because the macOS convention for
+/// their key is already spoken for: pane focus (`Cmd+1..9` is "select tab N") and
+/// goto-line (`Cmd+G` is "find next"). Ctrl is where editors put both.
+///
+/// Off macOS `Modifiers::command()` *is* `Ctrl`, so plain `Ctrl+G` would be
+/// ambiguous with the Cmd table; `Ctrl+Alt` is the fallback there.
+fn is_app_ctrl(mods: iced::keyboard::Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        mods.control() && !mods.alt()
+    } else {
+        mods.control() && mods.alt()
+    }
+}
+
+/// Which tab strip a hover belongs to. Hover has to be tracked in app state
+/// because the tabs aren't `button`s — see `tab_strip`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabGroup {
+    Editor,
+    Shell(PaneId),
+}
+
+/// Which pane receives keystrokes. There is exactly one, always — v1 has the
+/// same rule (`PaneFocus`), and without it every key went to the PTY while the
+/// editor drew a caret it couldn't honor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Editor,
+    Shell(PaneId),
+}
+
+/// One shell: its own PTY, VT parser, and input handle.
+struct Shell {
+    key: ShellKey,
+    /// Directory to start in. Only set for restored shells; `None` means the
+    /// process cwd. Part of the subscription data, so it must not change after the
+    /// shell starts.
+    start_cwd: Option<std::path::PathBuf>,
+    terminal: Arc<Mutex<Terminal>>,
+    handle: Option<pty::Handle>,
+    /// Viewport rows, reported by that pane's grid.
+    rows: usize,
+    /// The shell's pid, once spawned. Needed to read its working directory.
+    pid: Option<u32>,
+    /// Tab label: the cwd's basename, following `cd`.
+    label: String,
+    /// Throttles the cwd syscall — output can arrive thousands of times a second
+    /// during a flood, and the directory changes at human speed.
+    last_cwd_check: Option<Instant>,
+    /// Whether a real, measured size has been applied yet.
+    ///
+    /// The first size must bypass the debounce. Debouncing exists to stop a
+    /// splitter drag from sending a `SIGWINCH` per frame; the initial layout isn't
+    /// a drag, and holding it back for 80ms means the PTY spawns the shell at the
+    /// placeholder size and then gets resized — exactly the startup corruption the
+    /// deferred spawn was added to prevent.
+    sized: bool,
+}
+
+impl Shell {
+    fn new(key: ShellKey) -> Self {
+        Self::in_dir(key, None)
+    }
+
+    fn in_dir(key: ShellKey, start_cwd: Option<std::path::PathBuf>) -> Self {
+        Self {
+            key,
+            label: start_cwd
+                .as_deref()
+                .map(sacrament_core::proc::dir_label)
+                .unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .map(|p| sacrament_core::proc::dir_label(&p))
+                        .unwrap_or_else(|_| "shell".to_string())
+                }),
+            start_cwd,
+            terminal: Arc::new(Mutex::new(Terminal::new(24, 80))),
+            handle: None,
+            rows: 24,
+            pid: None,
+            last_cwd_check: None,
+            sized: false,
+        }
+    }
+}
+
+/// A shell pane: several shells with one active, like v1's `ShellPane`.
+struct ShellPane {
+    shells: Vec<Shell>,
+    active: usize,
+}
+
+impl ShellPane {
+    /// The active shell, or `None` when the pane is empty. A pane *is* allowed to
+    /// be empty — closing the last tab leaves it blank until `+` is clicked, which
+    /// is v1's behavior and documented in its README.
+    fn active(&self) -> Option<&Shell> {
+        self.shells.get(self.active)
+    }
+
+
+    fn find_mut(&mut self, key: ShellKey) -> Option<&mut Shell> {
+        self.shells.iter_mut().find(|s| s.key == key)
+    }
+}
+
+struct State {
+    /// Shared with the widget, which reads it during `draw`. `Arc<Mutex<_>>`
+    /// because `draw` takes `&self` while `update` needs to mutate on every
+    /// output chunk. Contention is nil in practice — both run on the UI thread.
+    bottom: ShellPane,
+    right: ShellPane,
+    /// Never-reused counter behind `ShellKey::serial`. See its docs for why reuse
+    /// would be a bug rather than an optimization.
+    next_shell_serial: u64,
+    /// Open buffers, in tab order. `Arc<Mutex<_>>` per buffer because the gutter
+    /// widget and the grid's source both need the active one, and each locks
+    /// independently at draw time.
+    buffers: Vec<Arc<Mutex<Buffer>>>,
+    /// Index into `buffers`. Kept valid by `close_tab`, which is the only thing
+    /// that can invalidate it.
+    active: usize,
+    /// `None` when `syntax_highlighting = false`.
+    highlighter: Option<Arc<sacrament_core::highlight::Highlighter>>,
+    panes: pane_grid::State<PaneKind>,
+    metrics: Metrics,
+    /// Resolved once at startup from `[theme]` in config.toml.
+    palette: Palette,
+    /// Resolved once at startup from `[font]` in config.toml.
+    font: FontSpec,
+    /// Set when the configured font family couldn't be used. A misconfigured
+    /// font is a persistent condition, not a transient event, so it lives
+    /// separately from `status` — which every PTY event overwrites.
+    font_warning: Option<String>,
+    focus: Focus,
+    /// The whole loaded config, so options are read where they're used rather
+     /// than copied into a field each. v1 and v2 share `config.toml`.
+    config: sacrament_core::config::Config,
+    /// Live geometry, written to the session on close. Pane ratios are tracked here
+    /// because `pane_grid::State` doesn't expose them for reading.
+    geometry: sacrament_core::session::Geometry,
+    /// The two splits, captured when created so a `ResizeEvent` can be attributed
+    /// to the right one — `ResizeEvent` carries a `Split` id and nothing else.
+    split_vertical: Option<pane_grid::Split>,
+    split_horizontal: Option<pane_grid::Split>,
+    /// Which tab the pointer is over, for hover styling.
+    hovered_tab: Option<(TabGroup, usize)>,
+    /// An in-progress tab reorder.
+    tab_drag: Option<TabDrag>,
+    /// Window or pane sizes changed since the last session write. Flushed on
+    /// mouse-up rather than per event — a splitter drag emits one per frame.
+    geometry_dirty: bool,
+    /// The bottom prompt, when one is open.
+    prompt: Option<Prompt>,
+    /// Last find query, so `Cmd+G` can repeat it after the prompt has closed.
+    last_query: Option<String>,
+    /// Feedback from a promptless search — `Cmd+G` has no prompt to write a note
+    /// into, and a search that silently does nothing reads as a broken key.
+    search_note: Option<String>,
+    /// Editor viewport height in rows, reported by the grid. Needed so keyboard
+    /// scrolling and cursor-following can clamp against the real viewport
+    /// rather than a guess.
+    editor_rows: usize,
+    /// A hard failure worth showing the user. Distinct from the chatter that
+    /// used to live in `status` ("shell attached", counters) — that was spike
+    /// scaffolding and is gone.
+    failure: Option<String>,
+}
+
+impl State {
+    fn new() -> (Self, Task<Message>) {
+        // v1's arrangement: a left column of editor-over-shell, and a full-height
+        // shell down the right. Split the right off first so it spans both.
+        let (mut panes, editor) = pane_grid::State::new(PaneKind::Editor);
+        let split_vertical = panes
+            .split(
+                pane_grid::Axis::Vertical,
+                editor,
+                PaneKind::Shell(PaneId::Right),
+            )
+            .map(|(_, split)| split);
+        let split_horizontal = panes
+            .split(
+                pane_grid::Axis::Horizontal,
+                editor,
+                PaneKind::Shell(PaneId::Bottom),
+            )
+            .map(|(_, split)| split);
+
+        let saved = sacrament_core::session::load(sacrament_core::APP_GUI);
+
+        // Restore the shell panes. A PTY isn't serializable, so what persists is
+        // each shell's *directory* — restore re-spawns there. A pane with nothing
+        // saved gets one shell in the process cwd, which is also the first-run path.
+        let mut serial = 0u64;
+        let mut restore_pane = |id: PaneId, saved_shells: &[sacrament_core::session::ShellTabSession], active: usize| {
+            let mut shells: Vec<Shell> = saved_shells
+                .iter()
+                .map(|s| {
+                    let key = ShellKey { pane: id, serial };
+                    serial += 1;
+                    Shell::in_dir(key, Some(s.cwd.clone()))
+                })
+                .collect();
+            if shells.is_empty() {
+                let key = ShellKey { pane: id, serial };
+                serial += 1;
+                shells.push(Shell::new(key));
+            }
+            let active = active.min(shells.len() - 1);
+            ShellPane { shells, active }
+        };
+        let (bottom, right) = match &saved {
+            Some(sess) => (
+                restore_pane(PaneId::Bottom, &sess.bottom_shells, sess.bottom_active),
+                restore_pane(PaneId::Right, &sess.right_shells, sess.right_active),
+            ),
+            None => (
+                restore_pane(PaneId::Bottom, &[], 0),
+                restore_pane(PaneId::Right, &[], 0),
+            ),
+        };
+        let geometry = saved
+            .as_ref()
+            .map(|s| s.geometry.sanitized())
+            .unwrap_or_default();
+        // Restore the split positions the window was left at.
+        if let Some(split) = split_vertical {
+            panes.resize(split, geometry.vertical_split);
+        }
+        if let Some(split) = split_horizontal {
+            panes.resize(split, geometry.horizontal_split);
+        }
+        let config = sacrament_core::config::load();
+        let tab_width = config.tab_width.max(1);
+        let syntax_on = config.syntax_highlighting;
+        // Validate the requested family against what iced can actually load, so
+        // a typo degrades to the default monospace instead of drawing nothing
+        // (Shaping::Basic has no font fallback).
+        // One font-database load feeds both family validation and glyph coverage.
+        let fonts = font::SystemFonts::load();
+        let (font, font_warning) = font::resolve(&config.font, &fonts.families());
+        // Leaked once at startup so `FontSpec` stays `Copy` — same rationale as
+        // the family name. Without coverage, a character the font lacks draws as
+        // nothing, since `Shaping::Basic` does no fallback.
+        let coverage = fonts
+            .coverage(&font.font.family)
+            .map(|c| &*Box::leak(Box::new(c)));
+        let font = font.with_coverage(coverage);
+
+        // Open a file if one was given on the command line, else an empty
+        // buffer. Real argument parsing and the client/server open flow come
+        // with the socket work; this is enough to see a file on screen.
+        // `syntax_highlighting = false` skips building the highlighter at all,
+        // not just skipping its output: `Highlighter::new` loads syntect's whole
+        // default syntax set, which is the startup cost and memory the option
+        // exists to avoid.
+        let highlighter =
+            syntax_on.then(|| Arc::new(sacrament_core::highlight::Highlighter::new()));
+        let palette = Palette::from_theme(&config.theme);
+        // Every path on the command line opens as a tab. An empty buffer only
+        // when nothing was given, so `sacrament2 a.rs b.rs` does the obvious thing.
+        //
+        // Parsed with the same `parse_args` `main` used, rather than treating
+        // every argument as a path — otherwise `--syntax=Rust` becomes a request
+        // to open a file by that name.
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        let cli = parse_args(&argv).unwrap_or(Args {
+            files: Vec::new(),
+            syntax: None,
+            review: false,
+        });
+        let mut buffers: Vec<Arc<Mutex<Buffer>>> = cli
+            .files
+            .iter()
+            .filter_map(|(path, line)| {
+                let mut b = Buffer::load(path, highlighter.as_deref()).ok()?;
+                b.tab_width = tab_width;
+                if let Some(name) = &cli.syntax
+                    && let Some(hl) = highlighter.as_deref()
+                {
+                    b.set_syntax_override(name, hl);
+                }
+                if let Some(n) = line {
+                    b.goto_line(*n);
+                }
+                Some(Arc::new(Mutex::new(b)))
+            })
+            .collect();
+        // Only restore when nothing was named on the command line — an explicit
+        // `sacrament2 foo.rs` means "open this", not "and also everything from
+        // last time". Same rule as v1.
+        let mut active = 0;
+        if buffers.is_empty()
+            && let Some(saved) = &saved
+        {
+            for sb in &saved.buffers {
+                if let Ok(mut b) = Buffer::load(&sb.path, highlighter.as_deref()) {
+                    b.tab_width = tab_width;
+                    if let Some(name) = &sb.syntax_override
+                        && let Some(hl) = highlighter.as_deref()
+                    {
+                        b.set_syntax_override(name, hl);
+                    }
+                    // Clamp: the file may have shrunk since it was saved.
+                    b.cursor_row = sb.cursor_row.min(b.line_count().saturating_sub(1));
+                    b.cursor_col = sb.cursor_col;
+                    b.scroll_row = sb.scroll_row.min(b.line_count().saturating_sub(1));
+                    b.clamp_to_content();
+                    // After the text is in place: restoring a fold needs the
+                    // line count to validate against.
+                    b.set_fold_ranges(&sb.folds);
+                    buffers.push(Arc::new(Mutex::new(b)));
+                }
+            }
+            active = saved.active.min(buffers.len().saturating_sub(1));
+        }
+        if buffers.is_empty() {
+            let mut b = Buffer::empty();
+            b.tab_width = tab_width;
+            buffers.push(Arc::new(Mutex::new(b)));
+        }
+        let state = Self {
+            bottom,
+            right,
+            next_shell_serial: serial,
+            buffers,
+            active,
+            highlighter,
+            config,
+            panes,
+            geometry,
+            split_vertical,
+            split_horizontal,
+            hovered_tab: None,
+            tab_drag: None,
+            geometry_dirty: false,
+            prompt: None,
+            last_query: None,
+            search_note: None,
+            metrics: Metrics::new(),
+            palette,
+            font,
+            font_warning,
+            focus: Focus::Editor,
+            editor_rows: 24,
+            failure: None,
+        };
+        // `persist` keeps these in step later, but it hasn't run yet.
+        state.sync_watches();
+        (state, Task::none())
+    }
+
+    /// Window title carries the filename and the dirty marker. That's the save
+    /// feedback: there's no status bar, and a dirty dot that disappears on save
+    /// tells you more, continuously, than a message that flashes once.
+    fn title(&self) -> String {
+        let (name, dirty) = self
+            .buf()
+            .lock()
+            .map(|b| (b.display_name(), b.dirty))
+            .unwrap_or_else(|_| ("[no file]".to_string(), false));
+        if dirty {
+            format!("• {name} — sacrament")
+        } else {
+            format!("{name} — sacrament")
+        }
+    }
+
+    /// The active buffer. `active` is always in range — `close_tab` is the only
+    /// operation that can shrink `buffers`, and it clamps.
+    fn buf(&self) -> &Arc<Mutex<Buffer>> {
+        &self.buffers[self.active]
+    }
+
+    fn select_tab(&mut self, index: usize) {
+        if index < self.buffers.len() {
+            self.active = index;
+            self.focus = Focus::Editor;
+            self.mark_active_reviewed();
+            self.persist();
+        }
+    }
+
+    /// Ask the system where to save, then save there.
+    fn save_as_dialog(&self) -> Task<Message> {
+        let current = self
+            .buf()
+            .lock()
+            .ok()
+            .and_then(|b| b.path().map(|p| p.to_path_buf()));
+        save_as_dialog_for(current, AfterSave::Nothing)
+    }
+
+    /// Fold or unfold. `shift` widens it to the whole file.
+    fn fold_command(&mut self, unfold: bool, all: bool) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let rows = self.editor_rows;
+        if let Ok(mut b) = self.buf().lock() {
+            match (all, unfold) {
+                (true, true) => b.unfold_all(),
+                (true, false) => b.fold_all(),
+                // On a line that heads no block, walk outward to the block this
+                // line is *inside* — folding "here" should work from the body,
+                // not only from the header.
+                (false, _) => {
+                    let row = b.enclosing_fold_head(b.cursor_row);
+                    if unfold {
+                        if b.fold_mark(row) == Some(buffer::FoldMark::Closed) {
+                            b.toggle_fold(row);
+                        }
+                    } else if b.fold_mark(row) == Some(buffer::FoldMark::Open) {
+                        b.toggle_fold(row);
+                    }
+                }
+            }
+            b.ensure_cursor_visible(rows);
+        }
+    }
+
+    /// Indent or outdent the selected lines in the editor.
+    fn reindent(&mut self, deeper: bool) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let (tw, tabs) = (self.config.tab_width.max(1), self.config.indent_with_tabs);
+        let rows = self.editor_rows;
+        if let Ok(mut b) = self.buf().lock() {
+            if deeper {
+                b.indent_selection(tw, tabs);
+            } else {
+                b.outdent_selection(tw);
+            }
+            b.ensure_cursor_visible(rows);
+        }
+    }
+
+    /// Comment or uncomment the selected lines.
+    ///
+    /// The marker comes from the buffer's syntax, so a file the highlighter
+    /// doesn't recognise has none — that's reported rather than silently doing
+    /// nothing, since an unresponsive key reads as broken.
+    fn toggle_comment(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let rows = self.editor_rows;
+        let Ok(mut b) = self.buf().lock() else { return };
+        let Some(syntax) = b.syntax_name().map(str::to_string) else {
+            drop(b);
+            self.failure = Some("no syntax — nothing to comment with".to_string());
+            return;
+        };
+        let Some(prefix) = sacrament_core::highlight::line_comment_for(&syntax) else {
+            drop(b);
+            self.failure = Some(format!("no comment style for {syntax}"));
+            return;
+        };
+        b.toggle_comment(prefix);
+        b.ensure_cursor_visible(rows);
+        drop(b);
+        self.failure = None;
+    }
+
+    /// Looking at a tab counts as reviewing it.
+    ///
+    /// Called from the paths where the *user* chose a tab, not from every place
+    /// `active` moves: closing a tab or reordering one shifts the index without
+    /// anyone having read what's in it.
+    fn mark_active_reviewed(&mut self) {
+        if let Ok(mut b) = self.buf().lock() {
+            b.set_unreviewed(false);
+        }
+    }
+
+    fn cycle_tab(&mut self, forward: bool) {
+        let n = self.buffers.len();
+        if n < 2 {
+            return;
+        }
+        self.active = if forward {
+            (self.active + 1) % n
+        } else {
+            (self.active + n - 1) % n
+        };
+        self.focus = Focus::Editor;
+        self.mark_active_reviewed();
+        self.persist();
+    }
+
+    /// Close a tab. Closing the last one leaves an empty untitled buffer rather
+    /// than zero buffers, so `buf()` never has to handle an empty list.
+    /// Close a tab, asking about unsaved work first.
+    ///
+    /// Previously this just refused and left a message, which put the burden on
+    /// the user to notice it. The system dialog is the right shape for the
+    /// question: it's modal because the answer decides whether work survives.
+    fn close_tab(&mut self, index: usize) -> Task<Message> {
+        if index >= self.buffers.len() {
+            return Task::none();
+        }
+        let (dirty, name) = self.buffers[index]
+            .lock()
+            .map(|b| (b.dirty, b.display_name()))
+            .unwrap_or((false, "this file".to_string()));
+        if dirty {
+            return Task::perform(
+                confirm_unsaved(
+                    "Unsaved changes",
+                    format!("Save changes to {name} before closing?"),
+                ),
+                move |answer| Message::CloseTabAnswer(index, answer),
+            );
+        }
+        self.discard_tab(index);
+        Task::none()
+    }
+
+    /// Close a tab without asking. Every path that decides it's safe ends here.
+    ///
+    /// Closing the last one leaves an empty untitled buffer rather than zero
+    /// buffers, so `buf()` never has to handle an empty list.
+    fn discard_tab(&mut self, index: usize) {
+        if index >= self.buffers.len() {
+            return;
+        }
+        self.failure = None;
+        self.buffers.remove(index);
+        if self.buffers.is_empty() {
+            let mut b = Buffer::empty();
+            b.tab_width = self.config.tab_width.max(1);
+            self.buffers.push(Arc::new(Mutex::new(b)));
+        }
+        self.active = self.active.min(self.buffers.len() - 1);
+        self.persist();
+    }
+
+    /// Quit, asking about unsaved work first.
+    fn request_quit(&mut self) -> Task<Message> {
+        let dirty: Vec<String> = self
+            .buffers
+            .iter()
+            .filter_map(|b| b.lock().ok())
+            .filter(|b| b.dirty)
+            .map(|b| b.display_name())
+            .collect();
+        if dirty.is_empty() {
+            return self.quit_now();
+        }
+        let body = if dirty.len() == 1 {
+            format!("Save changes to {} before quitting?", dirty[0])
+        } else {
+            format!(
+                "Save changes to {} files before quitting?\n\n{}",
+                dirty.len(),
+                dirty.join(", ")
+            )
+        };
+        Task::perform(confirm_unsaved("Unsaved changes", body), Message::QuitAnswer)
+    }
+
+    /// Save the session and go.
+    fn quit_now(&mut self) -> Task<Message> {
+        self.save_session();
+        iced::exit()
+    }
+
+    /// Save every dirty buffer, then quit.
+    ///
+    /// Untitled buffers need a path, so each one opens a save panel whose
+    /// completion re-enters here — the loop runs through the message system
+    /// rather than blocking on a dialog.
+    fn save_all_then_quit(&mut self) -> Task<Message> {
+        for i in 0..self.buffers.len() {
+            let Ok(mut b) = self.buffers[i].lock() else {
+                continue;
+            };
+            if !b.dirty {
+                continue;
+            }
+            if b.path().is_none() {
+                drop(b);
+                self.active = i;
+                return save_as_dialog_for(None, AfterSave::Quit);
+            }
+            if let Err(e) = b.save() {
+                drop(b);
+                // Stop rather than quit: a failed save here means quitting would
+                // throw away exactly what the user asked to keep.
+                self.active = i;
+                self.failure = Some(e.to_string());
+                return Task::none();
+            }
+        }
+        self.quit_now()
+    }
+
+    fn pane_mut(&mut self, id: PaneId) -> &mut ShellPane {
+        match id {
+            PaneId::Bottom => &mut self.bottom,
+            PaneId::Right => &mut self.right,
+        }
+    }
+
+    fn pane(&self, id: PaneId) -> &ShellPane {
+        match id {
+            PaneId::Bottom => &self.bottom,
+            PaneId::Right => &self.right,
+        }
+    }
+
+    /// Locate a shell by key across both panes — how PTY events find their target,
+    /// since a key is unique app-wide.
+    fn shell_by_key(&mut self, key: ShellKey) -> Option<&mut Shell> {
+        self.pane_mut(key.pane).find_mut(key)
+    }
+
+    /// Every live shell key, in pane order. Drives the subscription list, so this
+    /// growing spawns a PTY and shrinking stops one.
+    fn spawns(&self) -> Vec<Spawn> {
+        PaneId::ALL
+            .iter()
+            .flat_map(|id| {
+                self.pane(*id).shells.iter().map(|s| Spawn {
+                    key: s.key,
+                    cwd: s.start_cwd.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Update a shell's tab label from its process cwd.
+    ///
+    /// Polling the process rather than parsing OSC 7: v1 shipped both and concluded
+    /// only this one was reliable (see `core::proc`).
+    ///
+    /// Deliberately **not** throttled. An earlier version skipped checks inside a
+    /// 150ms window, which lost the update entirely whenever a `cd` produced its
+    /// only output inside that window — nothing re-checked afterwards. The PTY
+    /// coalescer already bounds `Output` to roughly one message per frame, so the
+    /// syscall runs at frame rate at worst, which is nothing.
+    fn refresh_cwd(&mut self, key: ShellKey) {
+        let Some(shell) = self.shell_by_key(key) else {
+            return;
+        };
+        let Some(pid) = shell.pid else {
+            return;
+        };
+        let mut moved = false;
+        if let Some(cwd) = sacrament_core::proc::cwd_of(pid) {
+            let label = sacrament_core::proc::dir_label(&cwd);
+            if shell.label != label {
+                shell.label = label;
+                moved = true;
+            }
+        }
+        // Only on an actual `cd`. The poll itself runs every frame a shell
+        // produces output, so writing unconditionally here would be a file write
+        // per frame.
+        if moved {
+            self.persist();
+        }
+    }
+
+    fn spawn_shell(&mut self, id: PaneId) {
+        let key = ShellKey {
+            pane: id,
+            serial: self.next_shell_serial,
+        };
+        self.next_shell_serial += 1;
+        let pane = self.pane_mut(id);
+        pane.shells.push(Shell::new(key));
+        pane.active = pane.shells.len() - 1;
+        self.focus = Focus::Shell(id);
+        self.persist();
+    }
+
+    /// Close a shell tab. Dropping it removes its key from the subscription list,
+    /// which drops the stream and kills the child (see `pty::run`).
+    fn close_shell(&mut self, id: PaneId, index: usize) {
+        let pane = self.pane_mut(id);
+        if index >= pane.shells.len() {
+            return;
+        }
+        pane.shells.remove(index);
+        pane.active = pane.active.min(pane.shells.len().saturating_sub(1));
+        self.persist();
+    }
+
+    fn select_shell(&mut self, id: PaneId, index: usize) {
+        let pane = self.pane_mut(id);
+        if index < pane.shells.len() {
+            pane.active = index;
+        }
+        self.focus = Focus::Shell(id);
+        self.persist();
+    }
+
+    fn theme(&self) -> iced::Theme {
+        self.palette.iced_theme()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        // Push-driven: the PTY reader thread feeds an unbounded channel whose
+        // receiver *is* the stream. No polling tick, unlike v1's event loop.
+        // One subscription per shell. `run_with` hashes the id, so the two get
+        // independent PTYs instead of being deduplicated into one.
+        // One subscription per live shell. Because the list is rebuilt from state
+        // each frame, adding a key spawns a PTY and removing one stops it — no
+        // imperative spawn/kill calls anywhere.
+        let ptys: Vec<_> = self
+            .spawns()
+            .into_iter()
+            .map(|spawn| {
+                Subscription::run_with(spawn, pty::stream).map(|(key, ev)| Message::Pty(key, ev))
+            })
+            .collect();
+        // `listen_with` rather than `keyboard::listen()`, because the latter
+        // yields only events the widget tree *ignored* — and the prompt's
+        // `text_input` captures `Escape` (it unfocuses on it, calling
+        // `shell.capture_event()`). With `listen()` the prompt could therefore
+        // never be closed with `Escape`: the input would silently unfocus, every
+        // later key would arrive uncaptured, and `update` would swallow them all
+        // because a prompt was still open. It reads exactly like a frozen editor.
+        //
+        // Receiving captured events means `update` must not act on keys the
+        // `text_input` already handled — see the prompt arm there, which handles
+        // `Enter`/`Escape` and nothing else.
+        let keys = iced::event::listen_with(|event, _status, _window| match event {
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                text,
+                ..
+            }) => Some(Message::Key(
+                key,
+                physical_key,
+                modifiers,
+                text.map(|t| t.to_string()),
+            )),
+            // A tab drag has to end on *any* left release, not just one over a
+            // tab: releasing past the end of the strip, or outside the window,
+            // would otherwise leave the drag armed and reorder on the next click.
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )) => Some(Message::LeftReleased),
+            _ => None,
+        });
+        let resizes = iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size));
+        let closes = iced::window::close_requests().map(|_id| Message::CloseRequested);
+        // Requests from other invocations. The listener was started in `main`,
+        // before the window existed, so nothing queued in between is lost.
+        let remote = Subscription::run(ipc::stream).map(Message::Remote);
+        let files = Subscription::run(watch::stream).map(Message::FileChanged);
+
+        Subscription::batch(
+            ptys.into_iter()
+                .chain([keys, resizes, closes, remote, files]),
+        )
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        // Done here rather than in `main`: the menu doesn't exist until winit has
+        // finished launching the application, and this has to run on the main
+        // thread — which is where iced drives `update` from.
+        static QUIT_ROUTED: std::sync::Once = std::sync::Once::new();
+        QUIT_ROUTED.call_once(macos::route_quit_through_window_close);
+
+        match message {
+            Message::Pty(key, pty::Event::Attached(handle)) => {
+                let bottom_first = key
+                    == ShellKey {
+                        pane: PaneId::Bottom,
+                        serial: 0,
+                    };
+                let Some(shell) = self.shell_by_key(key) else {
+                    return Task::none();
+                };
+                // Only push a size the grid actually measured. Sending the
+                // terminal's placeholder here would let the PTY spawn its shell at
+                // 24x80, and the real size arriving later would trigger the
+                // redraw this whole path exists to avoid. If nothing is measured
+                // yet, `GridResized` pushes it the moment it is.
+                if shell.sized
+                    && let Ok(t) = shell.terminal.lock()
+                {
+                    let size = t.size();
+                    handle.resize(size.rows as u16, size.cols as u16);
+                }
+                // SACRAMENT_SPIKE_CMD runs a command on attach so throughput can
+                // be measured without typing. Only the bottom pane, or it would
+                // run twice.
+                if bottom_first
+                    && let Ok(cmd) = std::env::var("SACRAMENT_SPIKE_CMD")
+                {
+                    handle.write(format!("{cmd}\n").into_bytes());
+                }
+                shell.handle = Some(handle);
+                self.failure = None;
+            }
+            Message::Pty(key, pty::Event::Started { pid }) => {
+                if let Some(shell) = self.shell_by_key(key) {
+                    shell.pid = pid;
+                    shell.last_cwd_check = None;
+                }
+                self.refresh_cwd(key);
+                // The pid is what makes this shell's directory readable, so the
+                // session entry written at spawn time was a fallback until now.
+                self.persist();
+            }
+            Message::Pty(key, pty::Event::Output(bytes)) => {
+                let n = bytes.len();
+                let t0 = std::time::Instant::now();
+                if let Some(shell) = self.shell_by_key(key)
+                    && let Ok(mut term) = shell.terminal.lock()
+                {
+                    term.feed(&bytes);
+                }
+                self.metrics.record_feed(n, t0.elapsed());
+                // Output is exactly when a `cd` would have happened — the prompt
+                // gets redrawn — so this is event-driven rather than a timer, and
+                // costs nothing at idle. Throttled inside.
+                self.refresh_cwd(key);
+                if self.metrics.should_log() {
+                    eprintln!("[metrics] {}", self.metrics.render());
+                }
+            }
+            Message::Pty(key, pty::Event::Exited) => {
+                // The shell's process ended (`exit`, or it was killed). Remove the
+                // tab, matching v1: a dead shell isn't something to look at.
+                let pane = self.pane_mut(key.pane);
+                if let Some(i) = pane.shells.iter().position(|s| s.key == key) {
+                    pane.shells.remove(i);
+                    pane.active = pane.active.min(pane.shells.len().saturating_sub(1));
+                }
+            }
+            Message::Pty(_, pty::Event::Failed(e)) => {
+                self.failure = Some(format!("pty failed: {e}"));
+            }
+            Message::GridResized(key, rows, cols) => {
+                let Some(shell) = self.shell_by_key(key) else {
+                    return Task::none();
+                };
+                shell.rows = rows.max(1);
+                // Grid and shell are resized together, every frame — no
+                // throttling. Keeping them in lockstep is what makes a drag look
+                // right: any delay leaves the grid holding content wrapped for a
+                // width the shell no longer has, which renders as fragments of
+                // adjacent lines until the shell catches up.
+                let changed = shell
+                    .terminal
+                    .lock()
+                    .map(|mut t| t.resize(rows, cols))
+                    .unwrap_or(false);
+                shell.sized = true;
+                if changed && let Some(h) = &shell.handle {
+                    h.resize(rows as u16, cols as u16);
+                }
+            }
+            Message::EditorResized(rows, cols) => {
+                self.editor_rows = rows.max(1);
+                // The buffer needs the viewport width to derive wrap segments.
+                // `word_wrap = false` becomes width 0, which `text::wrap_line`
+                // treats as "one segment" — no second code path.
+                let width = if self.config.word_wrap { cols.max(1) } else { 0 };
+                if let Ok(mut b) = self.buf().lock()
+                    && b.wrap_width != width
+                {
+                    b.wrap_width = width;
+                    b.ensure_cursor_visible(self.editor_rows);
+                }
+            }
+            Message::FocusPane(focus) => self.focus = focus,
+            Message::SpawnShell(id) => self.spawn_shell(id),
+            Message::Mouse(focus, gesture) => return self.mouse(focus, gesture),
+            Message::Pasted(text) => {
+                if let Some(text) = text {
+                    match self.focus {
+                        Focus::Editor => {
+                            if let Ok(mut b) = self.buf().lock() {
+                                b.insert_str(&text);
+                                b.ensure_cursor_visible(self.editor_rows);
+                            }
+                        }
+                        Focus::Shell(id) => self.paste_to_shell(id, &text),
+                    }
+                }
+            }
+            Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
+                self.panes.resize(split, ratio);
+                // Record it: `pane_grid::State` has no getter for a split's ratio,
+                // so this event is the only place it can be observed.
+                if Some(split) == self.split_vertical {
+                    self.geometry.vertical_split = ratio;
+                } else if Some(split) == self.split_horizontal {
+                    self.geometry.horizontal_split = ratio;
+                }
+                self.geometry_dirty = true;
+            }
+            Message::TabHovered(which) => {
+                // A drag follows the pointer by hover, which is why the drop
+                // target costs no extra event plumbing.
+                self.hovered_tab = which;
+            }
+            Message::TabExited(group, i) => {
+                // Only clear if this is still the tab we think is hovered.
+                //
+                // Widgets publish in tree order, so moving the pointer *left*
+                // from one tab to its neighbour emits the neighbour's `on_enter`
+                // before the departed tab's `on_exit` — and an unconditional
+                // clear then wiped the hover that had just been set. Rightward
+                // moves happened to emit them in the useful order, which is why
+                // this surfaced as "dragging left does nothing" rather than as a
+                // hover bug.
+                if self.hovered_tab == Some((group, i)) {
+                    self.hovered_tab = None;
+                }
+            }
+            Message::TabPointerMoved(group, x) => {
+                let Some(drag) = &mut self.tab_drag else {
+                    return Task::none();
+                };
+                if drag.group != group {
+                    return Task::none();
+                }
+                // Measured against the strip, not against a tab: a position
+                // relative to whichever tab is under the pointer jumps when the
+                // pointer crosses between them, which would read as a direction
+                // change that never happened.
+                if let Some(prev) = drag.last_x
+                    && (x - prev).abs() > f32::EPSILON
+                {
+                    drag.dir = x - prev;
+                }
+                drag.last_x = Some(x);
+                let (at, dir) = (drag.at, drag.dir);
+
+                // Reconsidered on every pointer move rather than only when the
+                // pointer crosses into a tab. Crossing publishes exactly one
+                // `on_enter`, and the direction is still unknown on the very
+                // first one of a drag — deciding there meant a refused move was
+                // never retried and the tab simply never followed the pointer.
+                if let Some((hover_group, target)) = self.hovered_tab
+                    && hover_group == group
+                    && target != usize::MAX
+                    && target != at
+                {
+                    let forward = target > at;
+                    if (forward && dir > 0.0) || (!forward && dir < 0.0) {
+                        self.move_tab(group, at, target);
+                        if let Some(d) = &mut self.tab_drag {
+                            d.at = target;
+                        }
+                    }
+                }
+            }
+            Message::TabPressed(group, i) => {
+                match group {
+                    TabGroup::Editor => self.select_tab(i),
+                    TabGroup::Shell(id) => self.select_shell(id, i),
+                }
+                self.tab_drag = Some(TabDrag {
+                    group,
+                    origin: i,
+                    at: i,
+                    last_x: None,
+                    dir: 0.0,
+                });
+            }
+            Message::TabClosed(group, i) => match group {
+                TabGroup::Editor => return self.close_tab(i),
+                TabGroup::Shell(id) => self.close_shell(id, i),
+            },
+            Message::LeftReleased => {
+                // The list is already in its final order; releasing only ends the
+                // gesture. Persisting here rather than per crossed tab keeps a
+                // drag across five tabs to one file write, not five.
+                if let Some(drag) = self.tab_drag.take()
+                    && drag.origin != drag.at
+                {
+                    self.persist();
+                }
+                // A window resize and a splitter drag both *end* with the button
+                // coming up, so this is where geometry settles — no timer, and
+                // nothing written while the pointer is still moving.
+                if self.geometry_dirty {
+                    self.save_session();
+                }
+            }
+            Message::PromptInput(value) => {
+                if let Some(p) = &mut self.prompt {
+                    p.input = value;
+                    p.note = None;
+                    // Find searches as you type, always from the origin.
+                    if p.kind == PromptKind::Find {
+                        let (query, origin) = (p.input.clone(), p.origin);
+                        self.search(&query, origin, true);
+                    }
+                }
+            }
+            Message::Remote(ipc::Command::Open {
+                path,
+                line,
+                syntax,
+                review,
+                reply,
+            }) => {
+                let result = self.open_path(&path, line, syntax.as_deref(), review);
+                // Answer whatever happened. The client is a shell command that
+                // exits on this, so a failure has to travel back rather than be
+                // left in a window nobody is looking at.
+                let _ = reply.send(match &result {
+                    Ok(()) => sacrament_core::protocol::Response::Ok,
+                    Err(e) => sacrament_core::protocol::Response::Err(e.clone()),
+                });
+                if let Err(e) = result {
+                    self.failure = Some(e);
+                }
+            }
+            Message::FileChanged(path) => self.reload_changed(&path),
+            Message::SaveAsPicked(None, _) => {}
+            Message::SaveAsPicked(Some(path), then) => {
+                let hl = self.highlighter.clone();
+                let result = self
+                    .buf()
+                    .lock()
+                    .map(|mut b| b.save_as(path, hl.as_deref()))
+                    .ok();
+                match result {
+                    Some(Ok(())) => {
+                        self.failure = None;
+                        self.persist();
+                        // Whatever was waiting on the save can happen now.
+                        match then {
+                            AfterSave::Nothing => {}
+                            AfterSave::CloseTab(i) => self.discard_tab(i),
+                            AfterSave::Quit => return self.quit_now(),
+                        }
+                    }
+                    Some(Err(e)) => self.failure = Some(e.to_string()),
+                    None => self.failure = Some("buffer lock poisoned".to_string()),
+                }
+            }
+            Message::NewBuffer => self.new_buffer(),
+            Message::ToggleFold(row) => {
+                let rows = self.editor_rows;
+                self.focus = Focus::Editor;
+                if let Ok(mut b) = self.buf().lock() {
+                    b.toggle_fold(row);
+                    b.ensure_cursor_visible(rows);
+                }
+            }
+            Message::OpenPicked(paths) => {
+                for path in paths {
+                    if let Err(e) = self.open_path(&path, None, None, false) {
+                        self.failure = Some(e);
+                    }
+                }
+            }
+            Message::CloseTabAnswer(i, answer) => match answer {
+                Answer::Cancel => {}
+                Answer::Discard => self.discard_tab(i),
+                Answer::Save => {
+                    let path = self
+                        .buffers
+                        .get(i)
+                        .and_then(|b| b.lock().ok())
+                        .and_then(|b| b.path().map(|p| p.to_path_buf()));
+                    // An untitled buffer has nowhere to save yet, so the save
+                    // panel comes first and the close waits on it.
+                    if path.is_none() {
+                        self.active = i.min(self.buffers.len().saturating_sub(1));
+                        return save_as_dialog_for(None, AfterSave::CloseTab(i));
+                    }
+                    if let Some(buf) = self.buffers.get(i)
+                        && let Ok(mut b) = buf.lock()
+                        && let Err(e) = b.save()
+                    {
+                        // Don't close on a failed save — that's the case where
+                        // closing would destroy the very edits being rescued.
+                        self.failure = Some(e.to_string());
+                        return Task::none();
+                    }
+                    self.discard_tab(i);
+                }
+            },
+            Message::QuitAnswer(answer) => match answer {
+                Answer::Cancel => {}
+                Answer::Discard => return self.quit_now(),
+                Answer::Save => return self.save_all_then_quit(),
+            },
+            Message::ConflictAnswer(choice) => match choice {
+                Conflict::Cancel => {}
+                Conflict::Overwrite => {
+                    let result = self.buf().lock().map(|mut b| b.save_overwriting()).ok();
+                    self.failure = match result {
+                        Some(Ok(())) => None,
+                        Some(Err(e)) => Some(e.to_string()),
+                        None => Some("buffer lock poisoned".to_string()),
+                    };
+                }
+                Conflict::Reload => {
+                    let rows = self.editor_rows;
+                    let hl = self.highlighter.clone();
+                    if let Ok(mut b) = self.buf().lock() {
+                        b.discard_and_reload(hl.as_deref());
+                        b.ensure_cursor_visible(rows);
+                    }
+                    self.failure = None;
+                }
+            },
+            Message::WindowResized(size) => {
+                self.geometry.window_width = size.width;
+                self.geometry.window_height = size.height;
+                self.geometry_dirty = true;
+            }
+            Message::CloseRequested => return self.request_quit(),
+            Message::PaneDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
+                self.panes.drop(pane, target);
+            }
+            Message::PaneDragged(_) => {}
+            Message::Key(key, physical, mods, composed) => {
+                // An open prompt owns the keyboard. Its `text_input` has already
+                // handled typing, editing, selection and paste by the time this
+                // runs, so acting on those again would double-apply them — only
+                // the two keys the input doesn't handle are claimed here.
+                if self.prompt.is_some() {
+                    return self.prompt_key(&key, mods);
+                }
+                // Pane focus first: it's the one binding that isn't Cmd, and it
+                // has to win before the shell sees anything.
+                if is_app_ctrl(mods)
+                    && let iced::keyboard::Key::Character(c) = &key
+                {
+                    match c.as_str() {
+                        "1" => {
+                            self.focus = Focus::Editor;
+                            return Task::none();
+                        }
+                        "2" => {
+                            self.focus = Focus::Shell(PaneId::Bottom);
+                            return Task::none();
+                        }
+                        "3" => {
+                            self.focus = Focus::Shell(PaneId::Right);
+                            return Task::none();
+                        }
+                        // Sublime's binding. `Cmd+G` can't be goto-line because
+                        // macOS spends it on find-next.
+                        "g" | "G" => return self.open_prompt(PromptKind::GotoLine),
+                        _ => {}
+                    }
+                }
+                if let Some(task) = self.command_key(&key, physical, mods) {
+                    return task;
+                }
+                match self.focus {
+                    Focus::Shell(id) => {
+                        if let Some(bytes) = keymap(&key, mods, composed.as_deref())
+                            && let Some(shell) = self.pane(id).active()
+                        {
+                            // Typing snaps back to live output and drops the
+                            // selection — what every terminal does.
+                            if let Ok(mut t) = shell.terminal.lock() {
+                                t.scroll_to_bottom();
+                                t.clear_selection();
+                            }
+                            if let Some(h) = &shell.handle {
+                                h.write(bytes);
+                            }
+                        }
+                    }
+                    Focus::Editor => self.edit_key(&key, mods, composed.as_deref()),
+                }
+            }
+        }
+        Task::none()
+    }
+
+    /// The application shortcut table: every binding is `Cmd` (`Ctrl` off macOS),
+    /// which is what keeps `Ctrl` free for the shell.
+    ///
+    /// Returns `None` when nothing matched, so the caller can route the key on to
+    /// the editor or the PTY. Returning `Some` — even `Some(Task::none())` — means
+    /// the key was consumed.
+    ///
+    /// **Tab and window commands act on the focused pane**, not on the buffer
+    /// list: `Cmd+T` in a shell pane opens a shell, `Cmd+W` closes whatever tab
+    /// you're looking at. One binding per concept rather than v1's split of
+    /// `Ctrl+W` for buffers and `Ctrl+Shift+W` for shells.
+    fn command_key(
+        &mut self,
+        key: &iced::keyboard::Key,
+        physical: iced::keyboard::key::Physical,
+        mods: iced::keyboard::Modifiers,
+    ) -> Option<Task<Message>> {
+        use iced::keyboard::Key;
+        use iced::keyboard::key::{Code, Named, Physical};
+
+        if !mods.command() {
+            return None;
+        }
+        let shift = mods.shift();
+
+        // Folding is `Cmd+Option+[` / `]`, Sublime's binding, matched on the
+        // *physical* key. With Option held, macOS composes those keys into `“`
+        // and `‘`, so matching the character would bind the US layout only —
+        // which is the class of bug v1's `apply_shift` table existed to paper
+        // over. The physical key sidesteps it entirely.
+        if mods.alt() {
+            let bracket = match physical {
+                Physical::Code(Code::BracketLeft) => Some(false),
+                Physical::Code(Code::BracketRight) => Some(true),
+                _ => None,
+            };
+            if let Some(open) = bracket {
+                self.fold_command(open, shift);
+                return Some(Task::none());
+            }
+        }
+
+        // Cursor movement, macOS style. Editor only — in a shell these are the
+        // app's, not the PTY's, and are simply swallowed.
+        if let Key::Named(named) = key
+            && matches!(
+                named,
+                Named::ArrowLeft | Named::ArrowRight | Named::ArrowUp | Named::ArrowDown
+            )
+        {
+            if self.focus == Focus::Editor {
+                let rows = self.editor_rows;
+                if let Ok(mut b) = self.buf().lock() {
+                    match named {
+                        Named::ArrowLeft => b.move_home(shift),
+                        Named::ArrowRight => b.move_end(shift),
+                        Named::ArrowUp => b.move_doc_start(shift),
+                        _ => b.move_doc_end(shift),
+                    }
+                    b.ensure_cursor_visible(rows);
+                }
+            }
+            return Some(Task::none());
+        }
+        // Ctrl+Tab cycles tabs everywhere it exists, so it's kept alongside the
+        // macOS-native Cmd+Shift+[ and Cmd+Shift+].
+        if let Key::Named(Named::Tab) = key {
+            self.cycle_focused_tab(!shift);
+            return Some(Task::none());
+        }
+
+        let Key::Character(c) = key else {
+            return None;
+        };
+        // Shifted punctuation arrives composed — `Cmd+Shift+[` is `{` on a US
+        // layout — so both forms are matched rather than reading the raw key.
+        match c.as_str() {
+            "[" | "{" if shift => self.cycle_focused_tab(false),
+            "]" | "}" if shift => self.cycle_focused_tab(true),
+            // Indent / outdent, the Sublime and VS Code binding on macOS.
+            "]" => self.reindent(true),
+            "[" => self.reindent(false),
+            // Toggle comment. `/` needs no shift, so there's no second spelling.
+            "/" => self.toggle_comment(),
+            "s" | "S" if shift => return Some(self.save_as_dialog()),
+            "o" | "O" => return Some(open_dialog()),
+            "s" | "S" => return Some(self.save()),
+            "f" | "F" => return Some(self.open_prompt(PromptKind::Find)),
+            // macOS find-next. Repeats the last query with no prompt in the way.
+            "g" | "G" => return Some(self.find_next(shift)),
+            "n" | "N" => self.new_buffer(),
+            "t" | "T" => match self.focus {
+                Focus::Editor => self.new_buffer(),
+                Focus::Shell(id) => self.spawn_shell(id),
+            },
+            "w" | "W" => return Some(self.close_focused_tab()),
+            "q" | "Q" => return Some(self.request_quit()),
+            "z" | "Z" => self.history(shift),
+            "c" | "C" => {
+                return Some(match self.focus {
+                    Focus::Editor => self.copy(false),
+                    Focus::Shell(_) => self.copy_shell(),
+                });
+            }
+            "x" | "X" => {
+                if self.focus == Focus::Editor {
+                    return Some(self.copy(true));
+                }
+            }
+            "v" | "V" => return Some(iced::clipboard::read().map(Message::Pasted)),
+            "a" | "A" => {
+                if self.focus == Focus::Editor
+                    && let Ok(mut b) = self.buf().lock()
+                {
+                    b.select_all();
+                }
+            }
+            // Diagnostics only, and visible only under SACRAMENT_METRICS.
+            "r" | "R" if shift => self.metrics.reset(),
+            // Jump to a tab in the focused pane.
+            d if d.len() == 1 && matches!(d.as_bytes()[0], b'1'..=b'9') => {
+                let n = (d.as_bytes()[0] - b'1') as usize;
+                match self.focus {
+                    Focus::Editor => self.select_tab(n),
+                    Focus::Shell(id) => self.select_shell(id, n),
+                }
+            }
+            // Any other Cmd combination is still consumed: letting it through
+            // would type a bare character into the shell or the buffer.
+            _ => {}
+        }
+        Some(Task::none())
+    }
+
+    /// Persist now, because the tab set or its order just changed.
+    ///
+    /// The session used to be written *only* on close, which turned out to mean
+    /// "only when quit via the window button": on macOS, `Cmd+Q` is handled by
+    /// AppKit, which terminates the process without the key ever reaching the
+    /// application — no `CloseRequested`, no save. Writing on the changes
+    /// themselves makes persistence independent of how the app goes away, which
+    /// also covers a crash or a `SIGTERM`.
+    ///
+    /// Deliberately *not* used for geometry: a splitter drag emits an event per
+    /// frame. That flushes on mouse-up instead.
+    fn persist(&mut self) {
+        self.save_session();
+        // The watch set changes on the same events the session does — a tab
+        // opening, closing, or being renamed by save-as — so it's kept in step
+        // here rather than from each of those call sites.
+        self.sync_watches();
+    }
+
+    /// Move one tab within its strip.
+    ///
+    /// The dragged tab stays active, which is what makes a drag feel like moving
+    /// *this* tab rather than shuffling the strip underneath it — pressing it
+    /// already made it active, so `active` simply follows it.
+    ///
+    /// No `persist` here: this runs once per tab crossed during a drag, and the
+    /// release writes the result.
+    fn move_tab(&mut self, group: TabGroup, from: usize, to: usize) {
+        match group {
+            TabGroup::Editor => {
+                if move_item(&mut self.buffers, from, to) {
+                    self.active = to;
+                }
+            }
+            TabGroup::Shell(id) => {
+                let pane = self.pane_mut(id);
+                if move_item(&mut pane.shells, from, to) {
+                    pane.active = to;
+                }
+            }
+        }
+    }
+
+    /// Re-read every buffer showing `path`.
+    ///
+    /// Reached from the watcher, so it fires for our *own* saves too — the mtime
+    /// check inside `Buffer::reload` is what makes those a no-op, and it's also
+    /// why no debouncing is needed: once reloaded, the buffer's mtime matches
+    /// disk and the duplicate events notify emits for a single write do nothing.
+    fn reload_changed(&mut self, path: &std::path::Path) {
+        let rows = self.editor_rows;
+        let hl = self.highlighter.clone();
+        let mut conflict = None;
+        for buf in &self.buffers {
+            let Ok(mut b) = buf.lock() else { continue };
+            if b.path() != Some(path) {
+                continue;
+            }
+            match b.reload(hl.as_deref()) {
+                Ok(true) => b.ensure_cursor_visible(rows),
+                Ok(false) => {}
+                // Unsaved edits *and* a changed file. Nothing is discarded either
+                // way, so this only has to be said out loud — and it has to name
+                // the escape hatch, because plain Cmd+S will refuse too.
+                Err(buffer::ReloadError::Dirty) => {
+                    conflict = Some(format!(
+                        "{} changed on disk — unsaved edits kept; Cmd+S to resolve",
+                        b.display_name()
+                    ));
+                }
+                Err(buffer::ReloadError::Io(e)) => {
+                    conflict = Some(format!("{}: {e}", path.display()));
+                }
+            }
+        }
+        if let Some(msg) = conflict {
+            self.failure = Some(msg);
+        }
+    }
+
+    /// Tell the watcher which files are open.
+    ///
+    /// Declared as a whole set rather than added and removed one at a time, so
+    /// a path can't be left watched after its tab closes.
+    fn sync_watches(&self) {
+        let paths: Vec<std::path::PathBuf> = self
+            .buffers
+            .iter()
+            .filter_map(|b| b.lock().ok().and_then(|b| b.path().map(|p| p.to_path_buf())))
+            .collect();
+        watch::sync(paths);
+    }
+
+    /// Open a file as a tab, or focus it if it's already open.
+    ///
+    /// `review` marks a tool's open (the Claude Code hook): the tab appears but
+    /// does *not* become active, because something writing files in the
+    /// background must not yank the cursor out of what you're typing.
+    fn open_path(
+        &mut self,
+        path: &std::path::Path,
+        line: Option<usize>,
+        syntax: Option<&str>,
+        review: bool,
+    ) -> Result<(), String> {
+        let rows = self.editor_rows;
+        // Already open? Reuse the tab rather than stacking duplicates — an agent
+        // touching the same file repeatedly would otherwise fill the strip.
+        let existing = self.buffers.iter().position(|b| {
+            b.lock()
+                .map(|b| b.path() == Some(path))
+                .unwrap_or(false)
+        });
+        let index = match existing {
+            Some(i) => {
+                if let Some(n) = line
+                    && let Ok(mut b) = self.buffers[i].lock()
+                {
+                    b.goto_line(n);
+                    b.ensure_cursor_visible(rows);
+                }
+                i
+            }
+            None => {
+                let mut buf = Buffer::load(path, self.highlighter.as_deref())
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                buf.tab_width = self.config.tab_width.max(1);
+                if let Some(name) = syntax
+                    && let Some(hl) = self.highlighter.as_deref()
+                {
+                    buf.set_syntax_override(name, hl);
+                }
+                if let Some(n) = line {
+                    buf.goto_line(n);
+                    buf.ensure_cursor_visible(rows);
+                }
+                // An untouched, untitled, unmodified buffer is the placeholder
+                // from startup — replace it rather than leaving an empty tab
+                // beside the file that was just asked for.
+                let placeholder = self.buffers.len() == 1
+                    && self.buffers[0]
+                        .lock()
+                        .map(|b| b.path().is_none() && !b.dirty)
+                        .unwrap_or(false);
+                if placeholder {
+                    self.buffers.clear();
+                }
+                self.buffers.push(Arc::new(Mutex::new(buf)));
+                self.buffers.len() - 1
+            }
+        };
+        if review {
+            // Mark it so the tab says an agent touched it — unless it's the tab
+            // already on screen, where the mark could never be cleared without
+            // navigating away and back.
+            if index != self.active
+                && let Ok(mut b) = self.buffers[index].lock()
+            {
+                b.set_unreviewed(true);
+            }
+        } else {
+            self.active = index;
+            self.focus = Focus::Editor;
+            self.mark_active_reviewed();
+        }
+        self.persist();
+        Ok(())
+    }
+
+    /// A new empty buffer, made active. `Cmd+N`.
+    fn new_buffer(&mut self) {
+        self.buffers.push(Arc::new(Mutex::new(Buffer::empty())));
+        self.active = self.buffers.len() - 1;
+        self.persist();
+    }
+
+    /// Close the active tab of whichever pane has focus. `Cmd+W`.
+    fn close_focused_tab(&mut self) -> Task<Message> {
+        match self.focus {
+            Focus::Editor => self.close_tab(self.active),
+            Focus::Shell(id) => {
+                let i = self.pane(id).active;
+                self.close_shell(id, i);
+                Task::none()
+            }
+        }
+    }
+
+    /// Cycle tabs within the focused pane.
+    fn cycle_focused_tab(&mut self, forward: bool) {
+        match self.focus {
+            Focus::Editor => self.cycle_tab(forward),
+            Focus::Shell(id) => {
+                let pane = self.pane(id);
+                let n = pane.shells.len();
+                if n == 0 {
+                    return;
+                }
+                let next = if forward {
+                    (pane.active + 1) % n
+                } else {
+                    (pane.active + n - 1) % n
+                };
+                self.select_shell(id, next);
+            }
+        }
+    }
+
+    /// Open the bottom prompt.
+    ///
+    /// Focus moves to the editor first: all three prompts act on the buffer, so
+    /// running one while a shell has focus would otherwise leave the result
+    /// invisible.
+    fn open_prompt(&mut self, kind: PromptKind) -> Task<Message> {
+        self.focus = Focus::Editor;
+        self.search_note = None;
+        let (origin, selection) = match self.buf().lock() {
+            Ok(b) => ((b.cursor_row, b.cursor_col), b.selected_text()),
+            Err(_) => ((0, 0), None),
+        };
+        let input = match kind {
+            // Prefill from the selection, the way every find bar does. Multi-line
+            // selections are skipped since `find` only matches within a line.
+            PromptKind::Find => selection.filter(|s| !s.contains('\n')).unwrap_or_default(),
+            PromptKind::GotoLine => String::new(),
+        };
+        self.prompt = Some(Prompt {
+            kind,
+            input,
+            origin,
+            note: None,
+        });
+        // Focus, then select: opening save-as over an existing path should let a
+        // single keystroke replace it rather than append to it.
+        iced::widget::operation::focus(PROMPT_ID.clone())
+            .chain(iced::widget::operation::select_all(PROMPT_ID.clone()))
+    }
+
+    /// The only keys an open prompt acts on.
+    ///
+    /// Deliberately a very short list. Everything else — characters, arrows,
+    /// `Backspace`, `Cmd+V` — is the `text_input`'s, and this subscription sees
+    /// those events *after* it has handled them. Adding an arm here for anything
+    /// the input already does would apply it twice.
+    ///
+    /// `Cmd+Q` is the exception worth keeping: an open prompt shouldn't be able
+    /// to trap the application.
+    fn prompt_key(
+        &mut self,
+        key: &iced::keyboard::Key,
+        mods: iced::keyboard::Modifiers,
+    ) -> Task<Message> {
+        use iced::keyboard::Key;
+        use iced::keyboard::key::Named;
+        match key {
+            Key::Named(Named::Escape) => self.prompt = None,
+            // Shift+Enter searches backwards. The `text_input` is given no
+            // `on_submit` precisely so both cases can be told apart here.
+            Key::Named(Named::Enter) => return self.prompt_confirm(mods.shift()),
+            // Advancing with Cmd+G while the prompt is open should work too,
+            // rather than being swallowed as "not one of my keys".
+            Key::Character(c) if mods.command() && c.eq_ignore_ascii_case("g") => {
+                return self.prompt_confirm(mods.shift());
+            }
+            Key::Character(c) if mods.command() && c.eq_ignore_ascii_case("q") => {
+                return self.request_quit();
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
+    /// Act on the prompt's contents.
+    fn prompt_confirm(&mut self, reverse: bool) -> Task<Message> {
+        let Some(prompt) = self.prompt.clone() else {
+            return Task::none();
+        };
+        match prompt.kind {
+            PromptKind::Find => {
+                // Search on from the current match rather than the origin, or
+                // Enter would return the same hit forever. Forward continues from
+                // the match's end, backward from its start.
+                let from = match self.buf().lock() {
+                    Ok(b) => {
+                        let (start, end) = b
+                            .selection_range()
+                            .unwrap_or(((b.cursor_row, b.cursor_col), (b.cursor_row, b.cursor_col)));
+                        if reverse { start } else { end }
+                    }
+                    Err(_) => prompt.origin,
+                };
+                self.search(&prompt.input, from, !reverse);
+            }
+            PromptKind::GotoLine => match prompt.input.trim().parse::<usize>() {
+                Ok(line) => {
+                    let rows = self.editor_rows;
+                    if let Ok(mut b) = self.buf().lock() {
+                        b.goto_line(line);
+                        b.ensure_cursor_visible(rows);
+                    }
+                    self.prompt = None;
+                }
+                Err(_) => {
+                    if let Some(p) = &mut self.prompt {
+                        p.note = Some("not a line number".to_string());
+                    }
+                }
+            },
+        }
+        Task::none()
+    }
+
+    /// Repeat the last search without opening anything. `Cmd+G`.
+    ///
+    /// Falls back to opening the find prompt when there's no query yet — the
+    /// alternative is a key that does nothing the first time you press it.
+    fn find_next(&mut self, reverse: bool) -> Task<Message> {
+        let Some(query) = self.last_query.clone() else {
+            return self.open_prompt(PromptKind::Find);
+        };
+        // Continue from the current match, not the caret: forward from its end,
+        // backward from its start, or the same hit comes back every time.
+        let from = match self.buf().lock() {
+            Ok(b) => {
+                let here = (b.cursor_row, b.cursor_col);
+                let (start, end) = b.selection_range().unwrap_or((here, here));
+                if reverse { start } else { end }
+            }
+            Err(_) => (0, 0),
+        };
+        self.search(&query, from, !reverse);
+        Task::none()
+    }
+
+    /// Run a search and select the hit, or report that there wasn't one.
+    fn search(&mut self, query: &str, from: buffer::Pos, forward: bool) {
+        if query.is_empty() {
+            if let Some(p) = &mut self.prompt {
+                p.note = None;
+            }
+            self.search_note = None;
+            return;
+        }
+        // Remembered here rather than at the call sites, so every route into a
+        // search — typing, Enter, Cmd+G — keeps `Cmd+G` working afterwards.
+        self.last_query = Some(query.to_string());
+        let rows = self.editor_rows;
+        let found = match self.buf().lock() {
+            Ok(mut b) => match b.find(query, from, forward) {
+                Some((start, end)) => {
+                    b.select_range(start, end);
+                    b.ensure_cursor_visible(rows);
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        };
+        let note = (!found).then(|| format!("no match: {query}"));
+        match &mut self.prompt {
+            // With the prompt open the note belongs next to the query.
+            Some(p) => p.note = note.map(|_| "no match".to_string()),
+            // Without one, the bottom row is the only place to say so. Naming the
+            // query matters here: there's nothing else on screen to say what was
+            // searched for.
+            None => self.search_note = note,
+        }
+    }
+
+    /// Undo, or redo when `forward`. Scrolls to follow the restored cursor,
+    /// since an undo can land far from where you're looking.
+    fn history(&mut self, forward: bool) {
+        let rows = self.editor_rows;
+        if let Ok(mut b) = self.buf().lock() {
+            if forward { b.redo() } else { b.undo() };
+            b.ensure_cursor_visible(rows);
+        }
+    }
+
+    /// Route a grid gesture. Press/drag drive selection; scroll moves the
+    /// viewport without touching the cursor.
+    fn mouse(&mut self, focus: Focus, gesture: GridMouse) -> Task<Message> {
+        self.focus = focus;
+        // Starting a selection anywhere ends every other one. Two highlighted
+        // regions on screen claim to be "the selection" at once, and `Cmd+C` can
+        // only take one of them — which one being decided by focus, invisibly.
+        if matches!(gesture, GridMouse::Press { .. }) {
+            self.clear_selections_except(focus);
+        }
+        match (focus, gesture) {
+            (Focus::Editor, GridMouse::Press { row, col, count }) => {
+                let rows = self.editor_rows;
+                if let Ok(mut b) = self.buf().lock() {
+                    let pos = b.screen_to_doc(row, col, rows);
+                    if count >= 2 {
+                        // Double click selects a word; falling back to a plain
+                        // caret placement when there's no word under the pointer.
+                        if !b.select_word_at(pos) {
+                            b.clear_selection();
+                            b.cursor_row = pos.0;
+                            b.cursor_col = pos.1;
+                            b.clamp_to_content();
+                        }
+                    } else {
+                        b.clear_selection();
+                        b.cursor_row = pos.0;
+                        b.cursor_col = pos.1;
+                        b.clamp_to_content();
+                        // Anchor here so the drag that may follow has an origin.
+                        b.selection_anchor = Some((b.cursor_row, b.cursor_col));
+                    }
+                }
+            }
+            (Focus::Editor, GridMouse::Drag { row, col }) => {
+                let rows = self.editor_rows;
+                if let Ok(mut b) = self.buf().lock() {
+                    let (r, c) = b.screen_to_doc(row, col, rows);
+                    b.cursor_row = r;
+                    b.cursor_col = c;
+                    b.clamp_to_content();
+                }
+            }
+            (Focus::Editor, GridMouse::Release) => {
+                // A click with no movement leaves a collapsed selection; drop the
+                // anchor so it isn't reported as a selection.
+                if let Ok(mut b) = self.buf().lock()
+                    && !b.has_selection()
+                {
+                    b.clear_selection();
+                }
+            }
+            (Focus::Editor, GridMouse::Scroll { lines }) => {
+                let rows = self.editor_rows;
+                if let Ok(mut b) = self.buf().lock() {
+                    b.scroll_by(-(lines * SCROLL_ROWS) as isize, rows);
+                }
+            }
+            (Focus::Shell(id), GridMouse::Scroll { lines }) => {
+                if let Some(t) = self.pane(id).active().map(|s| s.terminal.clone())
+                    && let Ok(mut t) = t.lock()
+                {
+                    t.scroll((lines * SCROLL_ROWS) as i32);
+                }
+            }
+            (Focus::Shell(id), GridMouse::Press { row, col, count }) => {
+                if let Some(t) = self.pane(id).active().map(|s| s.terminal.clone())
+                    && let Ok(mut t) = t.lock()
+                {
+                    match count {
+                        1 => t.begin_selection(row, col, false),
+                        2 => t.begin_selection(row, col, true),
+                        _ => t.begin_line_selection(row, col),
+                    }
+                }
+            }
+            (Focus::Shell(id), GridMouse::Drag { row, col }) => {
+                if let Some(t) = self.pane(id).active().map(|s| s.terminal.clone())
+                    && let Ok(mut t) = t.lock()
+                {
+                    t.update_selection(row, col);
+                }
+            }
+            (Focus::Shell(id), GridMouse::Release) => {
+                // A click with no drag leaves an empty selection; drop it so the
+                // highlight doesn't linger on a single cell.
+                if let Some(t) = self.pane(id).active().map(|s| s.terminal.clone())
+                    && let Ok(mut t) = t.lock()
+                    && t.selected_text().is_none()
+                {
+                    t.clear_selection();
+                }
+            }
+        }
+        Task::none()
+    }
+
+    /// Drop every selection except the one in `keep`.
+    ///
+    /// Shell tabs that aren't on screen are cleared too: a selection left in a
+    /// background tab would reappear the moment you switched to it, which is the
+    /// same surprise arriving later.
+    fn clear_selections_except(&mut self, keep: Focus) {
+        if keep != Focus::Editor
+            && let Ok(mut b) = self.buf().lock()
+        {
+            b.clear_selection();
+        }
+        for id in PaneId::ALL {
+            let active = self.pane(id).active;
+            for (i, shell) in self.pane(id).shells.iter().enumerate() {
+                if keep == Focus::Shell(id) && i == active {
+                    continue;
+                }
+                if let Ok(mut t) = shell.terminal.lock() {
+                    t.clear_selection();
+                }
+            }
+        }
+    }
+
+    /// Copy the focused shell's selection.
+    fn copy_shell(&mut self) -> Task<Message> {
+        let Focus::Shell(id) = self.focus else {
+            return Task::none();
+        };
+        let text = self
+            .pane(id)
+            .active()
+            .and_then(|s| s.terminal.lock().ok().and_then(|t| t.selected_text()));
+        match text {
+            Some(t) => iced::clipboard::write(t),
+            None => Task::none(),
+        }
+    }
+
+    fn copy(&mut self, cut: bool) -> Task<Message> {
+        let text = {
+            let Ok(mut b) = self.buf().lock() else {
+                return Task::none();
+            };
+            let text = b.selected_text();
+            if cut && text.is_some() {
+                b.delete_selection();
+                b.ensure_cursor_visible(self.editor_rows);
+            }
+            text
+        };
+        match text {
+            Some(t) => iced::clipboard::write(t),
+            None => Task::none(),
+        }
+    }
+
+    fn paste_to_shell(&mut self, id: PaneId, text: &str) {
+        // Bracketed paste, so a shell that supports it treats the whole thing as
+        // literal input rather than interpreting newlines as submits.
+        if let Some(h) = self.pane(id).active().and_then(|s| s.handle.as_ref()) {
+            let mut bytes = Vec::with_capacity(text.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            h.write(bytes);
+        }
+    }
+
+    /// Write the session: open files, shell directories, and geometry.
+    ///
+    /// Untitled buffers are dropped — there's no path to reopen them from — and the
+    /// active index is remapped past the ones removed, or reopening would land on
+    /// the wrong tab. v1 does the same remapping for the same reason.
+    fn save_session(&mut self) {
+        use sacrament_core::session::{Session, SessionBuffer, ShellTabSession};
+
+        let mut buffers = Vec::new();
+        let mut active = 0;
+        for (i, buf) in self.buffers.iter().enumerate() {
+            let Ok(b) = buf.lock() else { continue };
+            let Some(path) = b.path() else { continue };
+            if i == self.active {
+                active = buffers.len();
+            }
+            buffers.push(SessionBuffer {
+                path: path.to_path_buf(),
+                cursor_row: b.cursor_row,
+                cursor_col: b.cursor_col,
+                scroll_row: b.scroll_row,
+                scroll_col: 0,
+                // Folding isn't ported yet; an empty list restores cleanly.
+                folds: b.fold_ranges(),
+                syntax_override: b.syntax_override().map(str::to_string),
+            });
+        }
+
+        // A shell's *directory* is what persists — a PTY isn't serializable, so
+        // restore re-spawns a shell there rather than reviving one.
+        // Every shell produces an entry, so the tab *count* survives even when a
+        // cwd can't be read. Filtering on the pid instead silently dropped tabs:
+        // a shell spawned moments ago has no pid yet (it arrives with
+        // `Event::Started`, after the deferred spawn), so a session written in
+        // that window lost the tab entirely rather than just its directory.
+        let shells = |id: PaneId| -> Vec<ShellTabSession> {
+            self.pane(id)
+                .shells
+                .iter()
+                .map(|sh| ShellTabSession {
+                    cwd: sh
+                        .pid
+                        .and_then(sacrament_core::proc::cwd_of)
+                        .or_else(|| sh.start_cwd.clone())
+                        .or_else(|| std::env::current_dir().ok())
+                        .unwrap_or_else(|| std::path::PathBuf::from("/")),
+                })
+                .collect()
+        };
+
+        let session = Session {
+            active,
+            buffers,
+            bottom_shells: shells(PaneId::Bottom),
+            bottom_active: self.bottom.active,
+            right_shells: shells(PaneId::Right),
+            right_active: self.right.active,
+            geometry: self.geometry.clone(),
+        };
+        // Reported rather than discarded. A silently-swallowed error here is
+        // exactly how "the session is never written" stayed invisible: the write
+        // was failing to even be attempted, and nothing said so.
+        if let Err(e) = sacrament_core::session::save(sacrament_core::APP_GUI, &session) {
+            self.failure = Some(format!("session not saved: {e}"));
+        }
+        self.geometry_dirty = false;
+    }
+
+    /// Save the active buffer.
+    ///
+    /// A file that changed underneath us asks what to do rather than refusing:
+    /// there are two reasonable answers and the editor can't pick. Replaced the
+    /// "press Cmd+S twice" idiom, which had to be discovered from a message and
+    /// offered no way to take the other side.
+    fn save(&mut self) -> Task<Message> {
+        let untitled = self
+            .buf()
+            .lock()
+            .map(|b| b.path().is_none())
+            .unwrap_or(false);
+        if untitled {
+            // Nowhere to write yet, so Cmd+S *is* save-as.
+            return save_as_dialog_for(None, AfterSave::Nothing);
+        }
+        // `.ok()` before assigning: a `PoisonError` holds the guard, which keeps
+        // `self` borrowed and blocks writing to `self.failure`.
+        let result = self.buf().lock().map(|mut b| b.save()).ok();
+        match result {
+            Some(Ok(())) => self.failure = None,
+            Some(Err(buffer::SaveError::ChangedOnDisk)) => {
+                let name = self
+                    .buf()
+                    .lock()
+                    .map(|b| b.display_name())
+                    .unwrap_or_else(|_| "This file".to_string());
+                let dialog = rfd::AsyncMessageDialog::new()
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_title("File changed on disk")
+                    .set_description(format!(
+                        "{name} changed on disk since it was opened. \
+                         Overwrite it with this version, or reload and lose these edits?"
+                    ))
+                    .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                        "Overwrite".into(),
+                        "Reload".into(),
+                        "Cancel".into(),
+                    ));
+                return Task::perform(
+                    async move {
+                        match dialog.show().await {
+                            rfd::MessageDialogResult::Custom(l) if l == "Overwrite" => {
+                                Conflict::Overwrite
+                            }
+                            rfd::MessageDialogResult::Custom(l) if l == "Reload" => {
+                                Conflict::Reload
+                            }
+                            _ => Conflict::Cancel,
+                        }
+                    },
+                    Message::ConflictAnswer,
+                );
+            }
+            Some(Err(e)) => self.failure = Some(e.to_string()),
+            None => self.failure = Some("buffer lock poisoned".to_string()),
+        }
+        Task::none()
+    }
+
+    /// Editor keystrokes. Deliberately small: no undo, no selection, no
+    /// clipboard yet — each is a self-contained port from v1 and none of them
+    /// changes the primitives underneath.
+    fn edit_key(
+        &mut self,
+        key: &iced::keyboard::Key,
+        mods: iced::keyboard::Modifiers,
+        composed: Option<&str>,
+    ) {
+        use iced::keyboard::Key;
+        use iced::keyboard::key::Named;
+
+        let extend = mods.shift();
+        let Ok(mut b) = self.buf().lock() else {
+            return;
+        };
+        match key {
+            // Esc drops the selection. The prompt claims Esc before this runs,
+            // and a focused shell gets it as a real escape byte, so this only
+            // fires for a plain editor keypress.
+            Key::Named(Named::Escape) => b.clear_selection(),
+            Key::Named(Named::Enter) => b.insert_newline(),
+            Key::Named(Named::Backspace) => b.backspace(),
+            Key::Named(Named::Delete) => b.delete_forward(),
+            // Honour both indent options: a literal tab when `indent_with_tabs`,
+            // otherwise `tab_width` spaces. Previously hardcoded to four spaces,
+            // which ignored a config the user had set.
+            Key::Named(Named::Tab) => {
+                if self.config.indent_with_tabs {
+                    b.insert_char('\t');
+                } else {
+                    b.insert_str(&" ".repeat(self.config.tab_width.max(1)));
+                }
+            }
+            Key::Named(Named::Space) => b.insert_char(' '),
+            // Shift with any movement extends the selection; without it, moving
+            // drops the selection. One flag, threaded through every mover.
+            // Option+arrow is word movement on macOS. Checked before the plain
+            // arrows or the modifier would be ignored.
+            Key::Named(Named::ArrowLeft) if mods.alt() => b.move_word_left(extend),
+            Key::Named(Named::ArrowRight) if mods.alt() => b.move_word_right(extend),
+            Key::Named(Named::ArrowLeft) => b.move_left(extend),
+            Key::Named(Named::ArrowRight) => b.move_right(extend),
+            Key::Named(Named::ArrowUp) => b.move_up(extend),
+            Key::Named(Named::ArrowDown) => b.move_down(extend),
+            Key::Named(Named::Home) => b.move_home(extend),
+            Key::Named(Named::End) => b.move_end(extend),
+            Key::Named(Named::PageUp) => b.move_page(-(self.editor_rows as isize), extend),
+            Key::Named(Named::PageDown) => b.move_page(self.editor_rows as isize, extend),
+            // Ctrl/Cmd combos are reserved; don't type them into the buffer.
+            Key::Character(_) if mods.control() || mods.command() => {}
+            Key::Character(_) => {
+                if let Some(text) = composed {
+                    b.insert_str(text);
+                }
+            }
+            _ => {}
+        }
+        b.ensure_cursor_visible(self.editor_rows);
+    }
+
+    /// One tab marker — the dirty dot or the unreviewed diamond.
+    ///
+    /// Shaped with fallback only when the configured font lacks the glyph, the
+    /// same rule `GridView` applies per cell. This is not hypothetical: `◇`
+    /// (U+25C7) is absent from Envy Code R, and with `Shaping::Basic` it would
+    /// draw as nothing at all — an invisible marker being strictly worse than no
+    /// marker, since it silently reports "reviewed".
+    fn marker(&self, glyph: &'static str, color: iced::Color) -> Element<'_, Message> {
+        let drawable = glyph.chars().all(|c| self.font.can_draw(c));
+        text(glyph)
+            .size(self.font.size)
+            .font(self.font.font)
+            .color(color)
+            .shaping(if drawable {
+                iced::widget::text::Shaping::Basic
+            } else {
+                iced::widget::text::Shaping::Advanced
+            })
+            .into()
+    }
+
+    /// One tab strip. Shared by the editor and both shell panes, so the three read
+    /// as the same control rather than three lookalikes.
+    ///
+    /// `plus` adds a trailing `+` when the pane can spawn (shells can; buffers need
+    /// a file, which needs an open dialog v2 doesn't have yet).
+    fn tab_strip<'a>(
+        &'a self,
+        group: TabGroup,
+        labels: Vec<TabLabel>,
+        active: usize,
+        plus: Option<Message>,
+    ) -> Element<'a, Message> {
+        let strip_bg = self.palette.background;
+        let divider = self.palette.dim();
+        let mut tabs: Vec<Element<'a, Message>> = Vec::new();
+
+        for (i, tab_label) in labels.into_iter().enumerate() {
+            let TabLabel {
+                name,
+                dirty,
+                unreviewed,
+            } = tab_label;
+            // The dragged tab reads as active for the whole gesture. Pressing it
+            // already made it active and `move_tab` keeps `active` following it,
+            // so this is belt-and-braces — but it states the intent rather than
+            // depending on that chain holding.
+            let dragged = self
+                .tab_drag
+                .is_some_and(|d| d.group == group && d.at == i);
+            let is_active = i == active || dragged;
+            let fg = if is_active {
+                self.palette.foreground
+            } else {
+                self.palette.dim()
+            };
+            let foreground = self.palette.foreground;
+
+            // Not a `button`: `button` hardcodes `Interaction::Pointer` on hover and
+            // offers no way to opt out, and a hand cursor over a tab strip is wrong —
+            // it's not a link. A `container` reports no interaction, so the pointer
+            // stays the normal arrow. The cost is tracking hover ourselves, which is
+            // what `hovered_tab` is for.
+            //
+            // Hover styling is suppressed for the duration of a drag. The tabs
+            // are sliding under the pointer, so lighting up whichever one it
+            // happens to be over reads as a second, competing highlight — and it
+            // lands on tabs the pointer never deliberately visited. The hover is
+            // still *tracked* throughout, because it's what tells the drag where
+            // the pointer is; only the styling is dropped.
+            let hovered = self.tab_drag.is_none() && self.hovered_tab == Some((group, i));
+            // Markers are their own widgets so they can keep their own color.
+            // Baking them into the label string would tint them with the tab's
+            // active/inactive color, which is the whole point of having them.
+            let mut line = row![
+                text(name)
+                    .size(self.font.size)
+                    .font(self.font.font)
+                    .color(if hovered { foreground } else { fg })
+            ];
+            if dirty {
+                line = line.push(self.marker(" •", self.palette.ansi_slot(DIRTY_SLOT)));
+            }
+            if unreviewed {
+                line = line.push(self.marker(" ◇", self.palette.ansi_slot(UNREVIEWED_SLOT)));
+            }
+            let tab = container(line)
+                .padding([4, 10])
+                .style(move |_theme| container::Style {
+                    background: Some(strip_bg.into()),
+                    ..container::Style::default()
+                });
+            tabs.push(
+                mouse_area(tab)
+                    .on_press(Message::TabPressed(group, i))
+                    // Middle-click closes, the usual tab-bar gesture.
+                    .on_middle_press(Message::TabClosed(group, i))
+                    .on_enter(Message::TabHovered(Some((group, i))))
+                    .on_exit(Message::TabExited(group, i))
+                    .into(),
+            );
+            tabs.push(vertical_divider(divider));
+        }
+
+        if let Some(msg) = plus {
+            let foreground = self.palette.foreground;
+            let dim = self.palette.dim();
+            // `usize::MAX` as the hover slot: the `+` isn't a tab index, and this
+            // keeps one hover field rather than a second variant for it.
+            let hovered =
+                self.tab_drag.is_none() && self.hovered_tab == Some((group, usize::MAX));
+            tabs.push(
+                mouse_area(
+                    container(text("+").size(self.font.size).font(self.font.font))
+                        .padding([4, 10])
+                        .style(move |_theme| container::Style {
+                            background: Some(strip_bg.into()),
+                            text_color: Some(if hovered { foreground } else { dim }),
+                            ..container::Style::default()
+                        }),
+                )
+                .on_press(msg)
+                .on_enter(Message::TabHovered(Some((group, usize::MAX))))
+                .on_exit(Message::TabExited(group, usize::MAX))
+                .into(),
+            );
+            // No trailing divider. Separators sit *between* tabs, and the `+` is
+            // the last thing in the strip — a rule after it would be dividing it
+            // from empty space.
+        }
+
+        let underline = rule::horizontal(TAB_BORDER).style(move |_theme| rule::Style {
+            color: divider,
+            radius: 0.0.into(),
+            fill_mode: rule::FillMode::Full,
+            snap: true,
+        });
+
+        // The strip-wide `mouse_area` exists only to report the pointer's x in
+        // one coordinate space. Per-tab `on_move` would give a position relative
+        // to whichever tab is under the pointer, which jumps at every boundary
+        // and would read as a direction reversal.
+        container(column![
+            mouse_area(container(row(tabs)).height(Length::Fill))
+                .on_move(move |p| Message::TabPointerMoved(group, p.x)),
+            underline
+        ])
+        .width(Length::Fill)
+        .height(Length::Fixed(TAB_BAR_HEIGHT))
+        .style(move |_theme| container::Style {
+            background: Some(strip_bg.into()),
+            ..container::Style::default()
+        })
+        .into()
+    }
+
+    /// Buffer tabs for the editor pane.
+    fn tab_bar(&self) -> Element<'_, Message> {
+        let labels: Vec<TabLabel> = self
+            .buffers
+            .iter()
+            .map(|b| match b.lock() {
+                Ok(b) => TabLabel {
+                    name: b.display_name(),
+                    dirty: b.dirty,
+                    unreviewed: b.unreviewed(),
+                },
+                Err(_) => TabLabel {
+                    name: "[locked]".to_string(),
+                    dirty: false,
+                    unreviewed: false,
+                },
+            })
+            .collect();
+        // `+` makes a new empty tab, the same as `Cmd+N` — a `+` on a tab strip
+        // means "one more of these", not "go find me a file". Opening is `Cmd+O`.
+        self.tab_strip(TabGroup::Editor, labels, self.active, Some(Message::NewBuffer))
+    }
+
+    /// Shell tabs for one pane, labelled by each shell's cwd basename.
+    fn shell_tab_bar(&self, id: PaneId) -> Element<'_, Message> {
+        let pane = self.pane(id);
+        let labels: Vec<TabLabel> = pane
+            .shells
+            .iter()
+            .map(|s| TabLabel {
+                name: s.label.clone(),
+                dirty: false,
+                unreviewed: false,
+            })
+            .collect();
+        self.tab_strip(
+            TabGroup::Shell(id),
+            labels,
+            pane.active,
+            Some(Message::SpawnShell(id)),
+        )
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        // Captured before the closure so it doesn't borrow `self` inside a
+        // `move` context alongside the other palette uses.
+        let pane_background = self.palette.background;
+        // The divider comes from the theme's muted slot — the only one of the 16
+        // that reads against the background in a typical dark scheme (`black` is
+        // usually the background itself). Same source as the inactive line
+        // numbers, so chrome stays one family.
+        let divider = self.palette.dim();
+        // Insets a pane's *content*. Applied per child rather than to the pane, so
+        // chrome like the tab strip can sit flush while text stays off the edge.
+        fn pad_content<'a>(
+            content: impl Into<Element<'a, Message>>,
+        ) -> Element<'a, Message> {
+            container(content)
+                .padding(PANE_PADDING)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        }
+
+        let grid = pane_grid(&self.panes, move |_pane, kind, _maximized| {
+            let inner: Element<'_, Message> = match kind {
+                PaneKind::Shell(id) => {
+                    let body: Element<'_, Message> = match self.pane(*id).active() {
+                        Some(shell) => {
+                            let key = shell.key;
+                            pad_content(
+                                GridView::new(
+                                    TerminalSource {
+                                        terminal: shell.terminal.clone(),
+                                        show_cursor: self.focus == Focus::Shell(*id),
+                                    },
+                                    &self.palette,
+                                    self.font,
+                                    move |r, c| Message::GridResized(key, r, c),
+                                )
+                                .on_mouse(move |g| Message::Mouse(Focus::Shell(*id), g)),
+                            )
+                        }
+                        // An empty pane renders blank until `+` is used. v1 does
+                        // the same; it's intended, not a missing case.
+                        None => container(text(""))
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .into(),
+                    };
+                    column![self.shell_tab_bar(*id), body].into()
+                }
+                // The same widget, different source. This is the whole point of
+                // the abstraction — the editor pane isn't a second renderer.
+                PaneKind::Editor => {
+                    let grid = GridView::new(
+                        BufferSource {
+                            buffer: self.buf().clone(),
+                            rows: self.editor_rows,
+                            highlighter: self.highlighter.clone(),
+                            focused: self.focus == Focus::Editor,
+                        },
+                        &self.palette,
+                        self.font,
+                        Message::EditorResized,
+                    )
+                    .on_mouse(|g| Message::Mouse(Focus::Editor, g));
+                    // `line_numbers = false` drops the gutter entirely rather
+                    // than drawing an empty one.
+                    let body: Element<'_, Message> = if self.config.line_numbers {
+                        row![
+                            Gutter::new(self.buf().clone(), self.font, &self.palette)
+                                .on_fold(Message::ToggleFold),
+                            grid
+                        ]
+                        .into()
+                    } else {
+                        grid.into()
+                    };
+                    // The tab strip is flush to the pane edges; only the content
+                    // below it is inset. Padding the whole pane would leave the
+                    // strip floating with a gap on three sides, and its underline
+                    // would stop short of the pane's width instead of reading as a
+                    // division of it.
+                    column![self.tab_bar(), pad_content(body)].into()
+                }
+            };
+            let focus = match kind {
+                PaneKind::Shell(id) => Focus::Shell(*id),
+                PaneKind::Editor => Focus::Editor,
+            };
+            // The pane itself carries no padding — its children decide what gets
+            // inset. Background is painted here so the inset area reads as part of
+            // the pane rather than a gap behind it. No border: the divider between
+            // panes is the gap behind them, not an outline around each one.
+            let padded = container(inner)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(move |_theme| container::Style {
+                    background: Some(pane_background.into()),
+                    ..container::Style::default()
+                });
+            // Catches clicks in the padding. The grid captures clicks on cells, so
+            // this only fires for the band around them.
+            pane_grid::Content::new(mouse_area(padded).on_press(Message::FocusPane(focus)))
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .spacing(PANE_DIVIDER)
+        // Suppress iced's hover/drag split highlights. The divider is visible at
+        // all times and the resize mouse cursor already signals grabbability, so
+        // the highlight was redundant motion. Width 0 rather than a transparent
+        // color: transparency isn't a theme color, and `theme_guard` enforces that.
+        .style(move |theme| pane_grid::Style {
+            hovered_split: pane_grid::Line {
+                color: divider,
+                width: 0.0,
+            },
+            picked_split: pane_grid::Line {
+                color: divider,
+                width: 0.0,
+            },
+            // Everything else keeps iced's default. Only the split lines were
+            // asked to go; `hovered_region` belongs to pane *dragging*, which is a
+            // different interaction.
+            ..pane_grid::default(theme)
+        })
+        .on_resize(8, Message::PaneResized)
+        .on_drag(Message::PaneDragged);
+
+        // This background is what shows through `pane_grid`'s spacing, so it *is*
+        // the divider.
+        let grid = container(grid)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(divider.into()),
+                ..container::Style::default()
+            });
+
+        // No permanent status bar — same rule as v1. The bottom row exists only
+        // when there's something to put in it: an open prompt, or a problem worth
+        // surfacing (a font family that didn't resolve, a PTY that failed).
+        // Throughput/memory numbers are diagnostics, not UI: they go to stderr
+        // under SACRAMENT_METRICS, not into the window.
+        match self.bottom_row() {
+            Some(rowel) => column![grid, rowel].into(),
+            None => grid.into(),
+        }
+    }
+
+    /// The bottom row: the prompt if one is open, otherwise a problem, otherwise
+    /// nothing. The prompt wins because it's the thing being interacted with.
+    fn bottom_row(&self) -> Option<Element<'_, Message>> {
+        let foreground = self.palette.foreground;
+        let dim = self.palette.dim();
+        let background = self.palette.background;
+
+        if let Some(prompt) = &self.prompt {
+            let label = text(prompt.kind.label())
+                .size(self.font.size)
+                .font(self.font.font)
+                .color(dim);
+            // A real `text_input`, not a hand-rolled line: it brings the caret,
+            // selection, arrow keys and Cmd+V with it. Every color still comes
+            // from the palette, and the border is zero-width because the strip's
+            // own presence is the affordance.
+            let field = text_input("", &prompt.input)
+                .id(PROMPT_ID.clone())
+                .on_input(Message::PromptInput)
+                .size(self.font.size)
+                .font(self.font.font)
+                .padding(0)
+                .style(move |_theme, _status| text_input::Style {
+                    background: background.into(),
+                    border: iced::Border {
+                        color: dim,
+                        width: 0.0,
+                        radius: 0.0.into(),
+                    },
+                    icon: dim,
+                    placeholder: dim,
+                    value: foreground,
+                    selection: self.palette.selection_background,
+                });
+            let mut line = row![label, field].spacing(8);
+            if let Some(note) = &prompt.note {
+                line = line.push(
+                    text(note.clone())
+                        .size(self.font.size)
+                        .font(self.font.font)
+                        .color(dim),
+                );
+            }
+            return Some(
+                container(line)
+                    .padding([2, 6])
+                    .width(Length::Fill)
+                    .style(move |_theme| container::Style {
+                        background: Some(background.into()),
+                        ..container::Style::default()
+                    })
+                    .into(),
+            );
+        }
+
+        self.search_note
+            .clone()
+            .or_else(|| self.problem())
+            .map(|msg| {
+                container(text(msg).size(self.font.size).font(self.font.font).color(dim))
+                    .padding([2, 6])
+                    .width(Length::Fill)
+                    .into()
+            })
+    }
+
+    /// The one thing worth stealing a row for, if any.
+    fn problem(&self) -> Option<String> {
+        if let Some(w) = &self.font_warning {
+            return Some(w.clone());
+        }
+        self.failure.clone()
+    }
+}
+
+/// Minimal key → bytes mapping, enough to drive a shell.
+///
+/// Note what's *absent* compared to v1's `shell::key_to_bytes`: no kitty
+/// protocol negotiation, no `apply_shift` US-layout table, no CSI leak guard.
+/// iced hands over real modifier state and already-composed text, so that whole
+/// class of terminal workaround disappears.
+fn keymap(
+    key: &iced::keyboard::Key,
+    mods: iced::keyboard::Modifiers,
+    composed: Option<&str>,
+) -> Option<Vec<u8>> {
+    use iced::keyboard::Key;
+    use iced::keyboard::key::Named;
+
+    // Cmd belongs to the application and never reaches the shell. Without this
+    // an unbound `Cmd+K` would send a bare "k" down the PTY, because the branch
+    // below falls through to the composed text.
+    if cfg!(target_os = "macos") && mods.logo() {
+        return None;
+    }
+    match key {
+        Key::Character(s) => {
+            let c = s.chars().next()?;
+            if mods.control() {
+                // Ctrl+A..Z → 0x01..0x1a, plus the standard punctuation cases.
+                let byte = match c.to_ascii_lowercase() {
+                    'a'..='z' => (c.to_ascii_lowercase() as u8) - b'a' + 1,
+                    '[' => 0x1b,
+                    '\\' => 0x1c,
+                    ']' => 0x1d,
+                    '^' => 0x1e,
+                    '_' | '?' | '/' => 0x1f,
+                    ' ' => 0x00,
+                    _ => return None,
+                };
+                return Some(vec![byte]);
+            }
+            let mut out = Vec::new();
+            if mods.alt() {
+                out.push(0x1b);
+            }
+            // Use the composed text when available — it has shift, IME, and
+            // dead-key composition already applied. This is the whole reason
+            // v1's `apply_shift` US-layout table isn't needed here.
+            out.extend_from_slice(composed.unwrap_or(s.as_str()).as_bytes());
+            Some(out)
+        }
+        Key::Named(named) => {
+            let seq: &[u8] = match named {
+                Named::Enter => b"\r",
+                Named::Tab => b"\t",
+                Named::Backspace => b"\x7f",
+                Named::Escape => b"\x1b",
+                Named::Space => b" ",
+                Named::ArrowUp => b"\x1b[A",
+                Named::ArrowDown => b"\x1b[B",
+                Named::ArrowRight => b"\x1b[C",
+                Named::ArrowLeft => b"\x1b[D",
+                Named::Home => b"\x1b[H",
+                Named::End => b"\x1b[F",
+                Named::PageUp => b"\x1b[5~",
+                Named::PageDown => b"\x1b[6~",
+                Named::Delete => b"\x1b[3~",
+                _ => return None,
+            };
+            Some(seq.to_vec())
+        }
+        _ => None,
+    }
+}
+
+/// A 1px full-height separator in the given color.
+///
+/// `iced::Border` applies to all four sides at once, so a single edge has to be a
+/// `rule` widget. Extracted because the tab strip draws one after every tab.
+fn vertical_divider(color: iced::Color) -> Element<'static, Message> {
+    rule::vertical(TAB_BORDER)
+        .style(move |_theme| rule::Style {
+            color,
+            radius: 0.0.into(),
+            fill_mode: rule::FillMode::Full,
+            snap: true,
+        })
+        .into()
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use iced::keyboard::{Key, Modifiers};
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    fn args(v: &[&str]) -> super::Args {
+        super::parse_args(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn flags_are_not_mistaken_for_filenames() {
+        // The bug this pins: `State::new` used to treat every argument as a path,
+        // so `--syntax=Rust` became a request to open a file by that name.
+        let a = args(&["--syntax=Rust", "src/main.rs", "--review"]);
+        assert_eq!(a.syntax.as_deref(), Some("Rust"));
+        assert!(a.review);
+        assert_eq!(a.files.len(), 1);
+        assert_eq!(a.files[0].0, std::path::PathBuf::from("src/main.rs"));
+
+        let a = args(&["-s", "Python", "x.txt"]);
+        assert_eq!(a.syntax.as_deref(), Some("Python"));
+        assert_eq!(a.files.len(), 1);
+    }
+
+    #[test]
+    fn several_files_open_as_several_tabs() {
+        let a = args(&["a.rs", "b.rs", "c.rs"]);
+        assert_eq!(a.files.len(), 3);
+        assert!(a.files.iter().all(|(_, line)| line.is_none()));
+    }
+
+    #[test]
+    fn an_unknown_flag_is_an_error_rather_than_a_filename() {
+        let argv = vec!["--nope".to_string()];
+        assert!(super::parse_args(&argv).is_err());
+        // But a bare `-` is a plausible filename, not a flag.
+        assert!(super::parse_args(&["-".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn a_line_suffix_is_split_off() {
+        assert_eq!(
+            super::split_line_suffix("src/main.rs:42"),
+            (std::path::PathBuf::from("src/main.rs"), Some(42))
+        );
+        // No suffix, and a colon that isn't a line number, both stay whole.
+        assert_eq!(
+            super::split_line_suffix("src/main.rs"),
+            (std::path::PathBuf::from("src/main.rs"), None)
+        );
+        assert_eq!(
+            super::split_line_suffix("weird:name"),
+            (std::path::PathBuf::from("weird:name"), None)
+        );
+    }
+
+    #[test]
+    fn moving_a_tab_slides_the_ones_it_passes() {
+        // Remove-then-insert, not swap: dragging A to C's slot must leave B and C
+        // in order, not exchange A and C.
+        let mut v = vec!['A', 'B', 'C', 'D'];
+        assert!(move_item(&mut v, 0, 2));
+        assert_eq!(v, vec!['B', 'C', 'A', 'D']);
+
+        let mut v = vec!['A', 'B', 'C', 'D'];
+        assert!(move_item(&mut v, 3, 1));
+        assert_eq!(v, vec!['A', 'D', 'B', 'C']);
+    }
+
+    #[test]
+    fn moving_a_tab_onto_itself_or_out_of_range_does_nothing() {
+        let mut v = vec!['A', 'B'];
+        assert!(!move_item(&mut v, 1, 1), "a plain click must not reorder");
+        assert!(!move_item(&mut v, 0, 9));
+        assert!(!move_item(&mut v, 9, 0));
+        assert_eq!(v, vec!['A', 'B']);
+        // An empty strip can be released over without panicking.
+        let mut empty: Vec<char> = Vec::new();
+        assert!(!move_item(&mut empty, 0, 0));
+    }
+
+    #[test]
+    fn a_moved_tab_ends_up_where_the_pointer_left_it() {
+        // The property the drop relies on: after the move, index `to` holds the
+        // dragged item. `active` is set to `to` on that basis.
+        for (from, to) in [(0, 3), (3, 0), (1, 2), (2, 1)] {
+            let mut v = vec!['A', 'B', 'C', 'D'];
+            let dragged = v[from];
+            move_item(&mut v, from, to);
+            assert_eq!(v[to], dragged, "moving {from} -> {to}");
+            assert_eq!(v.len(), 4, "nothing lost or duplicated");
+        }
+    }
+
+    #[test]
+    fn app_ctrl_is_plain_ctrl_on_macos() {
+        assert_eq!(is_app_ctrl(Modifiers::CTRL), cfg!(target_os = "macos"));
+        assert_eq!(
+            is_app_ctrl(Modifiers::CTRL | Modifiers::ALT),
+            !cfg!(target_os = "macos")
+        );
+        assert!(!is_app_ctrl(Modifiers::empty()));
+        assert!(!is_app_ctrl(Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn command_keys_never_reach_the_shell() {
+        // Without the guard, an unbound Cmd chord falls through to the composed
+        // text and types a bare letter into the PTY.
+        if cfg!(target_os = "macos") {
+            assert_eq!(keymap(&ch("k"), Modifiers::LOGO, Some("k")), None);
+            assert_eq!(keymap(&ch("s"), Modifiers::LOGO, Some("s")), None);
+        }
+    }
+
+    #[test]
+    fn ctrl_still_produces_control_codes_for_the_shell() {
+        // The whole point of moving the app onto Cmd: Ctrl belongs to the shell
+        // again. Ctrl+C must be SIGINT, Ctrl+R reverse search, Ctrl+W kill-word.
+        assert_eq!(keymap(&ch("c"), Modifiers::CTRL, Some("c")), Some(vec![0x03]));
+        assert_eq!(keymap(&ch("r"), Modifiers::CTRL, Some("r")), Some(vec![0x12]));
+        assert_eq!(keymap(&ch("w"), Modifiers::CTRL, Some("w")), Some(vec![0x17]));
+        assert_eq!(keymap(&ch("z"), Modifiers::CTRL, Some("z")), Some(vec![0x1a]));
+    }
+
+    #[test]
+    fn plain_typing_still_reaches_the_shell() {
+        assert_eq!(keymap(&ch("k"), Modifiers::empty(), Some("k")), Some(b"k".to_vec()));
+    }
+}

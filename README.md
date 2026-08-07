@@ -11,10 +11,18 @@ Requires Rust (stable, 2024 edition or newer).
 ```sh
 git clone https://github.com/tboddy/sacrament
 cd sacrament
-cargo install --path .
+cargo install --path crates/tui
 ```
 
 Then run `sacrament <file>[:line]`.
+
+> **2.0 in progress.** The repo is a Cargo workspace: `crates/tui` is the
+> shipping terminal editor described below, `crates/core` is the shared
+> framework-independent core, and `crates/gui` is an in-progress rewrite as a
+> native GUI app (via [iced](https://iced.rs)) that keeps the terminal-ish feel
+> without running in a terminal. The two install side by side as `sacrament` and
+> `sacrament2` and keep separate sockets and sessions, so nothing below changes
+> until the cutover.
 
 ## Features
 
@@ -24,6 +32,9 @@ Then run `sacrament <file>[:line]`.
 - **Syntax highlighting** via `syntect` (TextMate grammars), rendered in your terminal's ANSI 16-color palette. Swap your terminal theme, the editor follows.
 - **Code folding** (indent-based) with a clickable gutter chevron.
 - **Markdown read mode** — `Alt+M` toggles a `.md` / `.markdown` / `.mdx` buffer between source editing and a rendered, read-only view (headings, lists, code blocks, tables, links, emphasis).
+- **Diff / review view** — `Alt+D` shows the current file's git diff (added lines green, removed red, hunks cyan); the gutter also carries always-on change-bars (`▎` green = added, cyan = modified) vs `HEAD`. New, untracked files render as all-added.
+- **Linting** — `Alt+L` runs a configured linter for the file's language and marks problems in the gutter (`●` red error / yellow warning); `Alt+]` / `Alt+[` jump between them, and the message shows in the status strip when the cursor sits on a flagged line.
+- **Review surface for Claude Code** — a PostToolUse hook opens every file Claude edits as an *unreviewed* background tab (cyan `◇` marker), cleared when you view it. See [Reviewing AI-written code](#reviewing-ai-written-code).
 - **Search** (`Ctrl+F`), **goto-line** (`Ctrl+G`), and `sacrament file.rs:42` CLI syntax.
 - **Undo/redo** with coalesced character inserts.
 - **Mouse**: click to move, drag to select, double-click to select a word, scroll to navigate. Mouse in shell panes passes through to TUIs that opt into mouse reporting.
@@ -53,6 +64,9 @@ Where shown, `Ctrl` and `Cmd` are interchangeable (macOS-friendly).
 | Fold / unfold at cursor | `Cmd+Option+[` / `Cmd+Option+]` |
 | Fold / unfold all | `Cmd+Option+Shift+[` / `Cmd+Option+Shift+]` |
 | Toggle markdown read mode | `Alt+M` (or `Ctrl+Shift+M`) on `.md` buffers |
+| Toggle diff view (vs git `HEAD`) | `Alt+D` (or `Ctrl+Shift+D`) |
+| Lint current file | `Alt+L` (or `Ctrl+Shift+L`) |
+| Jump to next / prev diagnostic | `Alt+]` / `Alt+[` |
 | Focus editor / bottom shell / right shell | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` |
 | New shell tab in focused pane | `Ctrl+Shift+T` |
 | Close shell tab in focused pane | `Ctrl+Shift+W` |
@@ -70,14 +84,48 @@ indent_with_tabs = false
 line_numbers = true
 status_timeout_ms = 2000
 syntax_highlighting = true
+word_wrap = true
+
+# Optional: per-language linters for Alt+L. Key by the syntect language name
+# (e.g. "Rust", "Python") or a file extension. {file} is replaced with the file
+# name; the command runs in the file's directory. Output is scanned for
+# `path:line:col: message` lines (use formatters that emit that — clippy short,
+# ruff, eslint -f unix, shellcheck, tsc, gcc/clang).
+[lint.linters]
+Rust = { command = "cargo clippy --message-format=short" }
+Python = { command = "ruff check {file}" }
+JavaScript = { command = "eslint -f unix {file}" }
 ```
 
 ## Tips
 
 - Colors are driven by your terminal's 16-color ANSI palette. Change your terminal theme (e.g. iTerm2 / Ghostty / Alacritty color preset) and syntax highlighting follows automatically. This applies to shell output too — anything your shell would render in truecolor gets folded back to the nearest ANSI slot.
 - Clicking the `▾` / `▸` chevron in the gutter toggles that fold.
-- The tab-bar dirty marker is the light-yellow `•` after the filename.
+- The tab-bar dirty marker is the light-yellow `•` after the filename; a cyan `◇` means "touched, not yet reviewed" and clears when you switch to that tab.
+- Gutter markers sit just left of the text: a `▎` bar flags a line changed vs git (green added / cyan modified), and a `●` flags a lint problem (red error / yellow warning).
 - Click a shell tab to switch, or the `+` at the end of the strip to spawn a new shell in that pane. Closing the last tab in a pane is fine — the pane stays empty until you open a new one.
+
+## Reviewing AI-written code
+
+sacrament can double as a review surface for code an agent writes. Because any
+`sacrament <file>` joins the live session, a [Claude Code](https://claude.ai/code)
+hook can pop every file the agent touches into the editor for you to look over.
+
+This repo ships the wiring:
+
+- `scripts/claude-open-hook.sh` — reads the hook payload from stdin and runs
+  `sacrament --review <file>` (a no-op unless a sacrament server is running, so
+  it's harmless when the editor is closed).
+- `.claude/settings.json` — a `PostToolUse` hook matching `Edit|Write|MultiEdit`
+  that invokes the script.
+
+With sacrament open in this repo, edits Claude makes appear as background tabs
+marked unreviewed (cyan `◇`) without stealing focus — they pile up while you
+keep working. Switch to one and the mark clears; the gutter shows what changed
+(or `Alt+D` for the full diff), and `Alt+L` lints it. To use this in another
+project, copy both files there (the hook path is project-relative via
+`$CLAUDE_PROJECT_DIR`), or lift it into your global `~/.claude/settings.json`.
+`sacrament` must be on your `PATH` (or set `SACRAMENT_BIN` in the script).
 
 ## Architecture
 

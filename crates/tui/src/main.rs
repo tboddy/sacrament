@@ -1,17 +1,15 @@
-mod client;
-mod config;
 mod editor;
-mod highlight;
+mod hlstyle;
 mod markdown;
-mod protocol;
 mod server;
-mod session;
 mod shell;
 
 use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::Result;
+
+use sacrament_core::{APP_TUI, client, config};
 
 use crate::server::InitialOpen;
 
@@ -35,16 +33,32 @@ fn main() -> Result<()> {
             syntax: parsed.syntax.clone(),
         });
 
+    // A --review open (from a Claude Code hook) only makes sense against an
+    // already-running editor; it never creates files and never boots a server.
+    if parsed.review && target.is_none() {
+        return Ok(());
+    }
+
     if let Some(open) = &target {
-        if !open.path.exists() {
+        if !parsed.review && !open.path.exists() {
             if let Err(e) = std::fs::File::create(&open.path) {
                 eprintln!("sacrament: cannot create {}: {e}", open.path.display());
                 process::exit(1);
             }
         }
-        match client::try_send_open(&open.path, open.line, open.syntax.as_deref()) {
+        match client::try_send_open(
+            APP_TUI,
+            &open.path,
+            open.line,
+            open.syntax.as_deref(),
+            parsed.review,
+        ) {
             Ok(true) => return Ok(()),
-            Ok(false) => {}
+            Ok(false) => {
+                if parsed.review {
+                    return Ok(());
+                }
+            }
             Err(e) => {
                 eprintln!("sacrament: {e}");
                 process::exit(1);
@@ -59,11 +73,13 @@ fn main() -> Result<()> {
 struct ParsedArgs {
     file: Option<String>,
     syntax: Option<String>,
+    review: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
     let mut file: Option<String> = None;
     let mut syntax: Option<String> = None;
+    let mut review = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -79,6 +95,10 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
                 syntax = Some(s["--syntax=".len()..].to_string());
                 i += 1;
             }
+            "--review" => {
+                review = true;
+                i += 1;
+            }
             _ if file.is_none() => {
                 file = Some(a.clone());
                 i += 1;
@@ -86,7 +106,11 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
             _ => return Err(format!("unexpected argument: {a}")),
         }
     }
-    Ok(ParsedArgs { file, syntax })
+    Ok(ParsedArgs {
+        file,
+        syntax,
+        review,
+    })
 }
 
 fn parse_file_line(arg: &str) -> (PathBuf, Option<usize>) {

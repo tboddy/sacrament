@@ -5,10 +5,20 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::protocol::{Request, Response, socket_path};
+use crate::paths::socket_path;
+use crate::protocol::{Request, Response};
 
-pub fn try_send_open(path: &Path, line: Option<usize>, syntax: Option<&str>) -> Result<bool> {
-    let sock = socket_path();
+/// Try to hand an OPEN off to an already-running server for `app`
+/// (`crate::APP_TUI` / `crate::APP_GUI`). `Ok(false)` means no server was
+/// listening, so the caller should become the server itself.
+pub fn try_send_open(
+    app: &str,
+    path: &Path,
+    line: Option<usize>,
+    syntax: Option<&str>,
+    review: bool,
+) -> Result<bool> {
+    let sock = socket_path(app);
     if !sock.exists() {
         return Ok(false);
     }
@@ -28,6 +38,7 @@ pub fn try_send_open(path: &Path, line: Option<usize>, syntax: Option<&str>) -> 
         path: abs,
         line,
         syntax: syntax.map(|s| s.to_string()),
+        review,
     };
     stream.write_all(req.encode().as_bytes())?;
 

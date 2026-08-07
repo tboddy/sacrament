@@ -1,0 +1,24 @@
+[package]
+name = "sacrament-tui"
+version = "0.1.0"
+edition = "2024"
+
+# v1 — the shipping terminal editor. Frozen in behavior while v2 is built;
+# deleted once v2 takes over the `sacrament` binary name.
+[[bin]]
+name = "sacrament"
+path = "src/main.rs"
+
+[dependencies]
+sacrament-core = { path = "../core" }
+
+anyhow.workspace = true
+portable-pty.workspace = true
+unicode-width.workspace = true
+
+arboard = "3.6.1"
+crossterm = "0.29.0"
+notify = "8.2.0"
+pulldown-cmark = "0.13.3"
+ratatui = "0.30.0"
+vt100 = "0.16.2"
