@@ -56,9 +56,13 @@ pub enum GridMouse {
     Release,
     /// Positive scrolls toward earlier content (wheel up), matching how both a
     /// buffer and a terminal scrollback are indexed.
-    /// Whole rows and columns to scroll, already converted from whatever the
-    /// device sent.
-    Scroll { rows: i32, cols: i32 },
+    ///
+    /// `dy` is in **pixels**, not rows, and that is what makes scrolling smooth:
+    /// the app keeps the sub-row remainder and the renderer draws at that offset,
+    /// instead of the widget truncating every event to a whole row and the view
+    /// stepping a row at a time. `cols` stays whole — horizontal is already
+    /// column-quantised and the widget owns the only cell-width measurement.
+    Scroll { dy: f32, cols: i32 },
 }
 
 #[derive(Default)]
@@ -86,13 +90,9 @@ struct State {
     /// Sub-column scroll carried between events, for the same reason as
     /// `scroll_carry`: a trackpad's sideways movement is fractions of a column.
     scroll_carry_x: f32,
-    /// Sub-row scroll carried between events.
-    ///
-    /// Without it, a trackpad never scrolls: it sends a few *pixels* at a time,
-    /// which is a fraction of a row, and truncating each event to a whole number
-    /// of rows rounds every one of them to zero. Only an unusually hard flick
-    /// moved anything, which reads as "scrolling takes effort and then jumps".
-    scroll_carry: f32,
+    // No vertical carry: `dy` leaves here in pixels and the app accumulates it,
+    // because the remainder has to be *drawn* and the gutter has to see the same
+    // value. Widget state can't be read by a sibling widget.
 }
 
 pub struct GridView<'a, Message> {
@@ -108,6 +108,16 @@ pub struct GridView<'a, Message> {
     /// Mouse gestures, in cell coordinates. The widget reports; what a press or
     /// drag *means* (focus, caret, selection) is the app's decision.
     on_mouse: Option<Box<dyn Fn(GridMouse) -> Message + 'a>>,
+    /// Pixels the content is shifted **up** by — the sub-row remainder of the
+    /// scroll position, so scrolling moves by pixels rather than by whole rows.
+    ///
+    /// Supplied by the app rather than kept here, because the gutter is a separate
+    /// widget that must shift by exactly the same amount or the line numbers
+    /// desync from their text, and one widget cannot read another's state.
+    ///
+    /// Rounded to a whole pixel when drawing: this display is 1x, so a glyph at a
+    /// fractional y would be blurry. A whole pixel is still ~16x finer than a row.
+    offset: f32,
 }
 
 impl<'a, Message> GridView<'a, Message> {
@@ -122,12 +132,19 @@ impl<'a, Message> GridView<'a, Message> {
             palette,
             font,
             on_resize: Box::new(on_resize),
+            offset: 0.0,
             on_mouse: None,
         }
     }
 
     pub fn on_mouse(mut self, f: impl Fn(GridMouse) -> Message + 'a) -> Self {
         self.on_mouse = Some(Box::new(f));
+        self
+    }
+
+    /// Shift the content up by this many pixels. See [`GridView::offset`].
+    pub fn offset(mut self, pixels: f32) -> Self {
+        self.offset = pixels;
         self
     }
 
@@ -284,7 +301,9 @@ where
         // dragging past an edge should extend to that edge, not freeze.
         let cell_at = |p: iced::Point| -> (usize, usize) {
             let col = ((p.x - bounds.x) / cw).floor().clamp(0.0, (cols - 1) as f32) as usize;
-            let row = ((p.y - bounds.y) / ch).floor().clamp(0.0, (rows - 1) as f32) as usize;
+            let row = ((p.y - bounds.y + self.offset.round()) / ch)
+                .floor()
+                .clamp(0.0, (rows - 1) as f32) as usize;
             (row, col)
         };
 
@@ -338,22 +357,22 @@ where
                 // and only needs converting to rows. Multiplying that by the
                 // notch factor as well made trackpad scrolling fly.
                 let (rows, columns) = match delta {
+                    // A notch is a stepped unit, so it becomes a distance here;
+                    // a pixel delta already *is* one.
                     mouse::ScrollDelta::Lines { x, y } => {
-                        (*y * ROWS_PER_NOTCH, *x * ROWS_PER_NOTCH)
+                        (*y * ROWS_PER_NOTCH * ch, *x * ROWS_PER_NOTCH)
                     }
-                    mouse::ScrollDelta::Pixels { x, y } => (y / ch, x / cw),
+                    mouse::ScrollDelta::Pixels { x, y } => (*y, x / cw),
                 };
-                // Accumulate the fraction rather than discarding it, so small
-                // movements add up instead of rounding to nothing.
-                state.scroll_carry += rows;
+                // Only the horizontal remainder is carried here. The vertical one
+                // goes out as pixels for the app to accumulate and the renderer to
+                // draw.
                 state.scroll_carry_x += columns;
-                let whole = state.scroll_carry.trunc();
                 let whole_x = state.scroll_carry_x.trunc();
-                state.scroll_carry -= whole;
                 state.scroll_carry_x -= whole_x;
-                if whole != 0.0 || whole_x != 0.0 {
+                if rows != 0.0 || whole_x != 0.0 {
                     shell.publish(on_mouse(GridMouse::Scroll {
-                        rows: whole as i32,
+                        dy: rows,
                         cols: whole_x as i32,
                     }));
                 }
@@ -389,16 +408,25 @@ where
         let cols = ((bounds.width / cw).floor() as usize).max(1);
         let rows = ((bounds.height / ch).floor() as usize).max(1);
 
+        // Whole pixels: at 1x a glyph drawn at a fractional y is blurry, and a
+        // pixel is already ~16x finer than the row this used to step by.
+        let shift = self.offset.round();
+        // One row more than fits whenever the content is mid-row, so the bottom
+        // shows the next line coming in rather than a band of background. Every
+        // `fill_text` and quad below is clipped to `clip`, so the partial rows at
+        // both ends are trimmed by the renderer.
+        let drawn = if shift > 0.0 { rows + 1 } else { rows };
+
         // Allocated per frame. A persistent scratch would need mutable widget
         // state during `draw`, which iced doesn't offer; at a few dozen rows the
         // allocation is well under the draw cost it would save.
-        let mut grid: Vec<Vec<Cell>> = Vec::with_capacity(rows);
-        self.source.fill(self.palette, rows, cols, &mut grid);
+        let mut grid: Vec<Vec<Cell>> = Vec::with_capacity(drawn);
+        self.source.fill(self.palette, drawn, cols, &mut grid);
 
         // Background spans: one quad per contiguous same-color run, skipping the
         // default (already covered by the pane background above).
         for (row_idx, cells) in grid.iter().enumerate() {
-            let y = bounds.y + row_idx as f32 * ch;
+            let y = bounds.y + row_idx as f32 * ch - shift;
             let mut i = 0usize;
             while i < cells.len() {
                 let bg = cells[i].bg;
@@ -424,7 +452,7 @@ where
 
         // Text runs, coalesced by color + emphasis.
         for (row_idx, cells) in grid.iter().enumerate() {
-            let y = bounds.y + row_idx as f32 * ch;
+            let y = bounds.y + row_idx as f32 * ch - shift;
             let mut runs: Vec<Run> = Vec::new();
             for (col, cell) in cells.iter().enumerate() {
                 if cell.is_blank() {
@@ -484,7 +512,9 @@ where
             && ccol < cols
         {
             let x = bounds.x + ccol as f32 * cw;
-            let y = bounds.y + crow as f32 * ch;
+            // Same shift as the text, or the caret drifts off its own glyph while
+            // the view sits between rows.
+            let y = bounds.y + crow as f32 * ch - shift;
             renderer.fill_quad(
                 cell_quad(Rectangle {
                     x,

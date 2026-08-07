@@ -366,15 +366,39 @@ not the code.
 callbacks, since the app has to correlate them as a gesture anyway. Four details
 that matter:
 
-- **Scrolling converts to rows in the widget, and carries the fraction.** The two
-  `ScrollDelta` kinds mean different things: a wheel notch is one `Lines` unit
-  and should move `ROWS_PER_NOTCH` rows, while `Pixels` is the distance a finger
-  actually travelled and only needs dividing by the row height. Scaling both by
-  the notch factor made trackpad scrolling fly. Worse, truncating each event to
-  whole rows meant a trackpad never scrolled at all — a few pixels is a fraction
-  of a row, which rounds to zero every time, so only a hard flick moved anything.
-  `State::scroll_carry` keeps the remainder between events, and `GridMouse::Scroll`
-  carries whole `rows` so the app never sees device units.
+- **Scrolling leaves the widget in pixels, and the app draws the remainder.**
+  `GridMouse::Scroll` carries `dy` in **pixels**; the app accumulates it, spends
+  whole rows on the buffer or terminal, and keeps the sub-row remainder for the
+  renderer to draw at. That is what makes scrolling smooth: the widget used to
+  truncate every event to a whole row, so the view stepped a full row (~16px) at a
+  time however gently you scrolled.
+
+  The two `ScrollDelta` kinds still mean different things — a wheel notch is a
+  stepped unit and becomes `ROWS_PER_NOTCH * cell_height`, while `Pixels` already
+  *is* a distance. Scaling both by the notch factor made trackpad scrolling fly.
+
+  **The offset lives in app state, not widget state** (`State::editor_scroll_px`,
+  `Shell::scroll_px`), and that is forced: the gutter is a separate widget that
+  must shift by exactly the same amount or the line numbers desync from their
+  text, and no widget can read another's state. It is **rounded to a whole pixel**
+  when drawing — at 1x a glyph at a fractional y is blurry, and a pixel is already
+  ~16x finer than a row.
+
+  Three consequences:
+
+  - **The grid draws one row more than fits** while mid-row, so the bottom shows
+    the next line arriving rather than a band of background. Every quad and
+    `fill_text` is clipped to the viewport, so both partial rows are trimmed.
+  - **A clamped row move zeroes the offset.** At either end of the content there is
+    no partial row to show, so the view sits exactly on the boundary rather than
+    leaving a sliver nothing can scroll away. Detected by comparing the scroll
+    position before and after, since `scroll_by`/`scroll_read` clamp internally.
+  - **Shells only get it inside scrollback.** The extra row comes from the grid line
+    *below* the viewport, which exists only when `display_offset > 0`; at the live
+    screen the offset is forced to zero — where it also belongs, since live output
+    should not sit half a row out of line. `TerminalSource::fill` fills that row
+    through `convert_cell`, the one shared cell converter — a second copy of that
+    logic drifted immediately, re-enabling bold, which the app drops everywhere.
 
 - **Drag coordinates aren't required to be inside the widget.** `Press` uses
   `cursor.position_in`, but `Drag` uses `cursor.position()` and clamps into the
@@ -760,8 +784,16 @@ The general rule: **anything that must be a hairline is a `rule`, and nothing el
 gets a fill it doesn't need** — at scale 1 every extra filled rect is a chance to
 antialias over one.
 
-Because `tab_strip` is shared, this applies to all four strips at once — the
-section strip, the file strip, and both shell panes.
+**The tabs live in a horizontal `scrollable`, which is doing two jobs.** It
+**clips** — nothing in iced clips a child to its parent by default, so once the
+tabs were wider than the pane the strip drew straight over the pane beside it,
+with editor tab names appearing on top of a shell. And it makes the overflow
+reachable, which v1 had (`tabs_scroll`) and v2 had lost; the wheel over a strip
+scrolls it. The scrollbar is suppressed to zero width, as in the Jira pane — a bar
+under a 26px strip would be most of its height.
+
+Because `tab_strip` is shared, all of this applies to all four strips at once —
+the section strip, the file strip, and both shell panes.
 
 Tab text uses `font.size` — the same size as the editor and the shells, so the
 chrome doesn't read as a different app.

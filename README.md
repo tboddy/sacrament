@@ -2,7 +2,9 @@
 
 A small text editor in Rust. Fast, keyboard-first, no config required.
 
-Built as a daily driver — the feature set is what I actually reach for, nothing more. It's a native GUI app (via [iced](https://iced.rs)) that keeps a terminal's feel without running inside one: the whole window is a styled cell grid, edge to edge, with no status bar and no chrome it doesn't need. **Two built-in shell panes** (bottom + right) sit beside the editor, so editing and terminal work share one window. Colors come from 16 ANSI slots you set in `config.toml`, so the editor and the shells are one palette.
+Built as a daily driver — the feature set is what I actually reach for, nothing more. It's a native GUI app (via [iced](https://iced.rs)) that keeps a terminal's feel without running inside one: the editor and the shells are one styled cell grid, edge to edge, with no status bar and no chrome it doesn't need. **Two built-in shell panes** (bottom + right) sit beside the editor, so editing and terminal work share one window. Colors come from 16 ANSI slots you set in `config.toml`, so the editor and the shells are one palette.
+
+The editor pane holds **sections**, chosen by a tab strip above the file tabs: the editor is one, and a read-only [Jira dashboard](#jira) is another. The file tabs belong to the editor section rather than to the pane, so switching section takes them with it.
 
 One process per user: `sacrament <file>` from any shell opens a tab in the window that's already running.
 
@@ -30,7 +32,8 @@ The `.app` and the `$PATH` binary are separate installs and update separately, b
 
 ## Features
 
-- **Buffer tabs** — clickable, closeable (middle-click), and reorderable by dragging. `Cmd+1..9` jumps directly.
+- **Buffer tabs** — clickable, closeable (middle-click), and reorderable by dragging. `Cmd+1..9` jumps directly. A strip that overflows its pane scrolls sideways under the wheel rather than spilling over the pane beside it.
+- **Sections** — the editor pane's outer tab strip. The editor is one section; the [Jira dashboard](#jira) is another. Commands that act on what's on screen go quiet while another section shows, so `Cmd+Z` can't edit a file you can't see; commands whose job is to *show* you something (`Cmd+O`, `Cmd+N`, `Cmd+F`) switch back to the editor.
 - **Remote open** — a second `sacrament foo.rs` in another terminal opens as a new tab in the already-running instance instead of starting a rival window. A path that's already open reuses its tab.
 - **Integrated shells** — a bottom pane and a right-side pane, each with its own shell tabs, backed by `alacritty_terminal`. `Ctrl+1/2/3` moves focus between editor / bottom / right. Tab labels track each shell's cwd as you `cd` around. Full 256-color and truecolor. Shells start as **login shells**, so your `PATH`, credential helpers and profile are exactly what a terminal would give you.
 - **Ctrl belongs to the shell.** Every application binding is `Cmd`, so `Ctrl+C` is SIGINT, `Ctrl+R` is reverse history search, `Ctrl+W` is kill-word. `Shift+Enter` sends a newline (for TUIs that compose multi-line input) and `Option+←/→` moves by word.
@@ -38,11 +41,13 @@ The `.app` and the `$PATH` binary are separate installs and update separately, b
 - **Syntax highlighting** via `syntect` (TextMate grammars), rendered in the 16 ANSI slots from `[theme]` — plus a hand-written TOML highlighter, since syntect ships no grammar for it.
 - **Soft wrap** with hanging indentation, so a wrapped continuation lines up under its own statement instead of returning to the margin.
 - **Code folding** (indent-based) with a clickable gutter chevron.
-- **Markdown read mode** — `Cmd+Shift+M` toggles a `.md` / `.markdown` / `.mdx` buffer between source editing and a rendered, read-only view (headings, lists, code blocks, tables, links, emphasis). Wide tables scroll sideways rather than wrapping, which would destroy their alignment.
+- **Markdown read mode** — `.md` / `.markdown` / `.mdx` files **open rendered** (headings, lists, code blocks, tables, links, emphasis); `Cmd+Shift+M` toggles back to the source. Opening with a line — `sacrament NOTES.md:42` — gives you the source instead, since a rendered view has no source lines to jump to. Wide tables scroll sideways rather than wrapping, which would destroy their alignment.
 - **Review surface for Claude Code** — a PostToolUse hook opens every file the agent edits as an *unreviewed* background tab (cyan `◇` marker), cleared when you look at it. See [Reviewing AI-written code](#reviewing-ai-written-code).
 - **Find** (`Cmd+F`, searches as you type, smart case), **find next/prev** (`Cmd+G` / `Cmd+Shift+G`), **goto-line** (`Ctrl+G`), and `sacrament file.rs:42` CLI syntax.
 - **Undo/redo** storing deltas rather than snapshots, with runs of typing coalesced into one step.
 - **Mouse** — click to move, drag to select, double-click for a word, scroll to navigate. In a shell, selection works in grid coordinates so it survives scrolling, and double/triple click select word and line.
+- **Smooth scrolling** — the editor and the shells scroll by the pixel, not a row at a time, so a trackpad glides instead of stepping. Snapped to whole pixels, so glyphs stay crisp. (In a shell this applies to scrollback; live output stays line-aligned, where it belongs.)
+- **Clickable links** — `Shift+click` a URL in a shell opens it in your browser, reading the whole logical line so a wrapped URL still resolves. `http`/`https` only, deliberately: `open` will launch a handler for *any* scheme, and terminal output is often not yours.
 - **External-change detection** via `notify` — a clean buffer reloads itself when the file changes underneath it, keeping your caret and scroll; a *dirty* buffer refuses and tells you, rather than silently discarding unsaved edits.
 - **Save that can't lose work** — writes go to a temp file and get renamed, and a file that changed on disk since it was read asks whether to overwrite or reload instead of clobbering it.
 - **Session persistence** — open tabs, cursor positions, scroll, fold state, read mode, each shell pane's tab cwds, window size and pane ratios all survive quit and relaunch. Written when state changes, not only on a clean exit.
@@ -80,6 +85,7 @@ Every application binding is `Cmd`. The only two exceptions are `Ctrl`, because 
 | Fold / unfold at cursor | `Cmd+Option+[` / `Cmd+Option+]` |
 | Fold / unfold all | `Cmd+Option+Shift+[` / `Cmd+Option+Shift+]` |
 | Toggle markdown read mode | `Cmd+Shift+M` on `.md` buffers |
+| Refresh the section | `Cmd+R` (Jira; the editor is kept current by the file watcher) |
 | Focus editor / bottom shell / right shell | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` |
 
 Extend selection by holding `Shift` with any movement key.
@@ -131,7 +137,18 @@ bright_blue    = "#83a598"
 bright_magenta = "#d3869b"
 bright_cyan    = "#8ec07c"
 bright_white   = "#ebdbb2"
+
+[jira]
+# Optional — omit the table and the Jira section just shows setup instructions.
+site  = "your-company"          # or your-company.atlassian.net, or the full URL
+email = "you@your-company.com"
+query = "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
+max_results = 50
 ```
+
+The Jira **API token is deliberately not in here** — this file is plain text and
+shared with the terminal version. It lives in the macOS Keychain; see
+[Jira](#jira).
 
 Window geometry is *not* config — it lives in the session file, because rewriting `config.toml` on every resize would delete your own comments.
 
@@ -144,8 +161,44 @@ Window geometry is *not* config — it lives in the session file, because rewrit
 - The tab dirty marker is the bright-yellow `•` after the filename; a bright-cyan `◇` means "touched by a tool, not yet reviewed" and clears when you switch to that tab.
 - Drag a tab within its strip to reorder it. The strip rearranges as you move, so there's no drop marker to aim at.
 - Click a shell tab to switch, or the `+` at the end of any strip to add one more of that thing — a shell in a shell pane, an empty buffer in the editor. Closing the last tab in a shell pane is fine; it stays empty until you press `+`.
+- The tab strip's underline breaks under the active tab, which is what joins it to the pane below.
 - The 1px line between panes is a splitter — drag it. Window size and both ratios are restored next launch.
 - `SACRAMENT_METRICS=1` prints feed time, throughput and memory footprint to stderr. Diagnostics are never drawn in the window.
+
+## Jira
+
+The Jira section shows what you're meant to be working on without leaving the
+editor: issues grouped by status, in real tables that follow the pane's width.
+It's read-only — nothing here writes to Jira.
+
+Two pieces of setup. The non-secret half goes in `config.toml` (see
+[Config](#config)); the token goes in the Keychain:
+
+```sh
+security add-generic-password -s sacrament-jira -a you@your-company.com -w '<token>'
+```
+
+Create the token at
+[id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
+`SACRAMENT_JIRA_TOKEN` overrides the Keychain if you'd rather pass it in from a
+shell. With nothing configured the section shows these instructions instead of a
+dashboard, so you can see it working before you go and mint anything.
+
+Click **Jira** to load, **Refresh** or `Cmd+R` to reload. The fetch happens the
+first time you open the section, not at startup — an editor launched to open a
+file shouldn't make a network request nobody asked for.
+
+One thing worth knowing about the default query: it's `statusCategory != Done`,
+not the more obvious `resolution = Unresolved`. Plenty of workflows have terminal
+statuses that never set a resolution, so Unresolved quietly matches finished
+work — on the instance this was built against it returned 50 issues of which 35
+were released or rejected. `statusCategory` keys off the fixed To Do / In Progress
+/ Done grouping that exists underneath whatever custom status names a project
+invented.
+
+[docs/jira-integration.md](./docs/jira-integration.md) has the design notes and
+the planned next steps (ticket detail, the linked Confluence spec, status
+transitions, branch-and-PR).
 
 ## Reviewing AI-written code
 

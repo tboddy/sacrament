@@ -284,6 +284,15 @@ impl Terminal {
         last.min(self.size.rows.saturating_sub(1))
     }
 
+    /// How far the viewport sits above the live screen, in lines.
+    ///
+    /// Zero means the bottom — which is also the only place with no grid line
+    /// *below* the viewport, so it decides whether a partial row can be drawn
+    /// while smooth-scrolling.
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
     /// Scroll the viewport through scrollback. Positive moves toward older
     /// content. `Term` clamps internally, and `renderable_content()` already
     /// applies the resulting display offset, so nothing else has to know.
@@ -326,6 +335,60 @@ pub struct TerminalSource {
     pub show_cursor: bool,
 }
 
+/// One alacritty cell as a grid [`Cell`].
+///
+/// Shared by the viewport walk and by the extra row drawn while smooth-scrolling.
+/// A second copy of this drifted the moment it existed — it re-enabled bold, which
+/// the app drops everywhere — so there is deliberately only one.
+fn convert_cell(
+    cell: &alacritty_terminal::term::cell::Cell,
+    point: Point,
+    palette: &crate::palette::Palette,
+    selection: Option<alacritty_terminal::selection::SelectionRange>,
+) -> crate::grid::Cell {
+    use alacritty_terminal::term::cell::Flags;
+    let flags = cell.flags;
+    // INVERSE swaps fg/bg at the source, so downstream never has to know about it.
+    let (fg_src, bg_src) = if flags.contains(Flags::INVERSE) {
+        (cell.bg, cell.fg)
+    } else {
+        (cell.fg, cell.bg)
+    };
+    let mut out = crate::grid::Cell {
+        c: if flags.contains(Flags::WIDE_CHAR_SPACER) {
+            '\0'
+        } else {
+            cell.c
+        },
+        fg: palette.resolve(fg_src, false),
+        bg: palette.resolve(bg_src, true),
+        // SGR 1 is dropped rather than drawn. The app uses no bold faces anywhere,
+        // and a shell is where that rule is most visible — prompts and TUI headers
+        // set it constantly, and a second weight reads as a different font mid-line.
+        // Only the *weight* goes; the colour the program asked for is still its own.
+        bold: false,
+        italic: flags.contains(Flags::ITALIC),
+        underline: flags.contains(Flags::UNDERLINE),
+    };
+    // SGR 2 / 8 resolve to theme colours rather than alpha blends: dim text takes
+    // the muted slot, hidden text takes the background so it genuinely disappears.
+    if flags.contains(Flags::DIM) {
+        out.fg = palette.dim();
+    }
+    if flags.contains(Flags::HIDDEN) {
+        out.fg = out.bg;
+    }
+    // Selection overrides cell colours, same rule as the editor: a highlighted
+    // region has to stay legible over whatever is under it.
+    if let Some(range) = selection
+        && range.contains(point)
+    {
+        out.fg = palette.selection_foreground;
+        out.bg = palette.selection_background;
+    }
+    out
+}
+
 impl crate::grid::GridSource for TerminalSource {
     fn fill(
         &self,
@@ -334,7 +397,6 @@ impl crate::grid::GridSource for TerminalSource {
         cols: usize,
         out: &mut Vec<Vec<crate::grid::Cell>>,
     ) {
-        use alacritty_terminal::term::cell::Flags;
         use crate::grid::{Cell, reset_rows};
 
         reset_rows(out, rows);
@@ -349,6 +411,31 @@ impl crate::grid::GridSource for TerminalSource {
         // those rows and shifts everything up, which reads as rows being eaten from
         // the bottom.
         let offset = content.display_offset as i32;
+        // `display_iter` yields exactly the viewport. The widget asks for one row
+        // more while the view sits between rows, so that extra row is filled from
+        // the grid line just below the viewport — which exists only when scrolled
+        // up, and the app only sets an offset in that case. Written before the
+        // viewport walk, which never touches this index.
+        let screen = terminal.size.rows;
+        if rows > screen && offset >= 1 {
+            let line = Line(screen as i32 - offset);
+            let grid = terminal.term.grid();
+            let mut extra = Vec::with_capacity(cols);
+            for col in 0..cols {
+                if col >= terminal.size.cols {
+                    extra.push(Cell::blank(palette.foreground, palette.background));
+                    continue;
+                }
+                let column = Column(col);
+                extra.push(convert_cell(
+                    &grid[line][column],
+                    Point::new(line, column),
+                    palette,
+                    selection,
+                ));
+            }
+            out[screen] = extra;
+        }
         for indexed in content.display_iter {
             let line = indexed.point.line.0 + offset;
             if line < 0 {
@@ -358,52 +445,7 @@ impl crate::grid::GridSource for TerminalSource {
             if row >= rows || col >= cols {
                 continue;
             }
-            let flags = indexed.cell.flags;
-            // INVERSE swaps fg/bg at the source, so downstream never has to
-            // know about it.
-            let (fg_src, bg_src) = if flags.contains(Flags::INVERSE) {
-                (indexed.cell.bg, indexed.cell.fg)
-            } else {
-                (indexed.cell.fg, indexed.cell.bg)
-            };
-            let mut cell = Cell {
-                c: if flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    '\0'
-                } else {
-                    indexed.cell.c
-                },
-                fg: palette.resolve(fg_src, false),
-                bg: palette.resolve(bg_src, true),
-                // SGR 1 is dropped rather than drawn. The app uses no bold
-                // faces anywhere, and a shell is where that rule is most
-                // visible — prompts and TUI headers set it constantly, and a
-                // second weight reads as a different font mid-line.
-                //
-                // Only the *weight* goes: the colour the program asked for is
-                // still its own. Terminals that brighten bold text do so by
-                // remapping colours 0-7 to 8-15, which is a separate setting and
-                // isn't something this ever did.
-                bold: false,
-                italic: flags.contains(Flags::ITALIC),
-                underline: flags.contains(Flags::UNDERLINE),
-            };
-            // SGR 2 / 8 resolve to theme colors rather than alpha blends: dim
-            // text takes the theme's muted slot, hidden text takes the
-            // background so it genuinely disappears against it.
-            if flags.contains(Flags::DIM) {
-                cell.fg = palette.dim();
-            }
-            if flags.contains(Flags::HIDDEN) {
-                cell.fg = cell.bg;
-            }
-            // Selection overrides cell colors, same rule as the editor: a
-            // highlighted region has to stay legible over whatever's under it.
-            if let Some(range) = selection
-                && range.contains(indexed.point)
-            {
-                cell.fg = palette.selection_foreground;
-                cell.bg = palette.selection_background;
-            }
+            let cell = convert_cell(indexed.cell, indexed.point, palette, selection);
             // display_iter walks in order, but pad defensively so a gap can't
             // shift the rest of the row left.
             let dest = &mut out[row];
@@ -736,5 +778,86 @@ mod url_tests {
         t.feed(b"https://example.com/a");
         assert_eq!(t.url_at(0, 38), None, "trailing blanks are not the url");
         assert_eq!(t.url_at(3, 0), None, "an empty row below has none");
+    }
+}
+
+#[cfg(test)]
+mod smooth_scroll_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::grid::GridSource;
+
+    fn row_text(row: &[crate::grid::Cell]) -> String {
+        row.iter()
+            .map(|c| if c.c == '\0' { ' ' } else { c.c })
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    fn source(t: Terminal) -> TerminalSource {
+        TerminalSource {
+            terminal: Arc::new(Mutex::new(t)),
+            show_cursor: false,
+        }
+    }
+
+    /// One row more than the viewport, taken from the grid line below it. That
+    /// extra row is what lets the renderer draw a partial line while the view sits
+    /// between rows, instead of a band of background at the bottom.
+    #[test]
+    fn an_extra_row_comes_from_below_the_viewport_when_scrolled() {
+        let mut t = Terminal::new(3, 12);
+        t.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        t.scroll(2);
+        assert!(t.display_offset() > 0, "test needs to be in scrollback");
+
+        let src = source(t);
+        let palette = crate::palette::Palette::default();
+        let mut three = Vec::new();
+        src.fill(&palette, 3, 12, &mut three);
+        let mut four = Vec::new();
+        src.fill(&palette, 4, 12, &mut four);
+
+        assert_eq!(four.len(), 4);
+        // The extra row is additive, not a shift: every row already on screen has
+        // to stay exactly where it was, or the content would jump by a row as soon
+        // as a scroll began.
+        for i in 0..3 {
+            assert_eq!(row_text(&three[i]), row_text(&four[i]), "row {i} moved");
+        }
+        assert!(
+            !row_text(&four[3]).is_empty(),
+            "the extra row should hold the line below the viewport"
+        );
+    }
+
+    /// At the live screen there is no line below the viewport, so the grid index
+    /// would be out of range. The app doesn't set an offset there — but the source
+    /// is what would panic if it ever did, so it has to be safe on its own.
+    #[test]
+    fn an_extra_row_at_the_bottom_is_blank_rather_than_a_panic() {
+        let mut t = Terminal::new(3, 12);
+        t.feed(b"one\r\ntwo\r\nthree\r\n");
+        assert_eq!(t.display_offset(), 0);
+
+        let src = source(t);
+        let mut out = Vec::new();
+        src.fill(&crate::palette::Palette::default(), 4, 12, &mut out);
+        assert_eq!(out.len(), 4);
+        assert_eq!(row_text(&out[3]), "");
+    }
+
+    /// Bold is dropped everywhere in this app, and the extra row goes through the
+    /// same converter as the viewport so it cannot quietly disagree.
+    #[test]
+    fn the_shared_converter_drops_bold() {
+        let mut t = Terminal::new(2, 12);
+        t.feed(b"\x1b[1mbold\x1b[0m\r\n");
+        let src = source(t);
+        let mut out = Vec::new();
+        src.fill(&crate::palette::Palette::default(), 2, 12, &mut out);
+        assert!(out[0].iter().all(|c| !c.bold), "no cell may be bold");
     }
 }

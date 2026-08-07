@@ -46,6 +46,9 @@ pub struct Gutter<'a, Message> {
     palette: &'a Palette,
     /// Emitted with a line index when its chevron is clicked.
     on_fold: Option<Box<dyn Fn(usize) -> Message + 'a>>,
+    /// Pixels the content is shifted up by — must equal the grid's, or the numbers
+    /// slide out of line with their text. See `GridView::offset`.
+    offset: f32,
 }
 
 impl<'a, Message> Gutter<'a, Message> {
@@ -55,7 +58,14 @@ impl<'a, Message> Gutter<'a, Message> {
             font,
             palette,
             on_fold: None,
+            offset: 0.0,
         }
+    }
+
+    /// Shift the numbers up by this many pixels, matching the grid beside it.
+    pub fn offset(mut self, pixels: f32) -> Self {
+        self.offset = pixels;
+        self
     }
 
     pub fn on_fold(mut self, f: impl Fn(usize) -> Message + 'a) -> Self {
@@ -170,6 +180,13 @@ where
         // its own; both are Fill in the same row, and row pitch is arithmetic
         // rather than measured, so the two counts agree by construction.
         let visible = ((bounds.height / ch).floor() as usize).max(1);
+        // The grid's sub-row scroll offset, applied identically here. This is the
+        // third thing gutter/text alignment now depends on, alongside the shared
+        // row pitch and the single row-mapping producer — which is exactly why the
+        // value lives in app state and is handed to both widgets, rather than being
+        // recomputed or kept in either one's widget state.
+        let shift = self.offset.round();
+        let visible = if shift > 0.0 { visible + 1 } else { visible };
         let rows: Vec<GutterRow> = self
             .buffer
             .lock()
@@ -188,7 +205,7 @@ where
 
         let fg = self.palette.foreground;
         for (i, row) in rows.iter().enumerate() {
-            let y = bounds.y + i as f32 * ch;
+            let y = bounds.y + i as f32 * ch - shift;
             if y >= bounds.y + bounds.height {
                 break;
             }

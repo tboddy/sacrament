@@ -817,6 +817,11 @@ struct Shell {
     /// Throttles the cwd syscall — output can arrive thousands of times a second
     /// during a flood, and the directory changes at human speed.
     last_cwd_check: Option<Instant>,
+    /// Sub-row scroll offset for this shell's grid, in pixels. See
+    /// `State::editor_scroll_px`. Forced to zero unless scrolled into scrollback:
+    /// the extra grid line a partial row needs only exists above the live screen,
+    /// and live output should not sit half a row out of line anyway.
+    scroll_px: f32,
 }
 
 impl Shell {
@@ -847,6 +852,7 @@ impl Shell {
             rows: 24,
             pid: None,
             last_cwd_check: None,
+            scroll_px: 0.0,
         }
     }
 }
@@ -938,6 +944,14 @@ struct State {
     /// scrolling and cursor-following can clamp against the real viewport
     /// rather than a guess.
     editor_rows: usize,
+    /// Sub-row scroll offset for the editor grid, in pixels the content is shifted
+    /// **up** by. Always in `[0, cell_height)`.
+    ///
+    /// In `State` rather than in `Buffer` or the widget: the grid and the gutter are
+    /// separate widgets that must shift identically, and neither can read the
+    /// other's state. Not persisted — it is a fraction of a row, and a restored
+    /// session landing on a row boundary is right.
+    editor_scroll_px: f32,
     /// Columns the editor grid last reported. Read mode wraps to the real pane
     /// width regardless of `word_wrap`, so it needs this even when the editor's
     /// own wrap width is zero.
@@ -1151,6 +1165,7 @@ impl State {
             focus: Focus::Editor,
             editor_rows: 24,
             editor_cols: 80,
+            editor_scroll_px: 0.0,
             alerts: Vec::new(),
             showing_alerts: Vec::new(),
         };
@@ -2878,39 +2893,72 @@ impl State {
                     b.clear_selection();
                 }
             }
-            (
-                Focus::Editor,
-                GridMouse::Scroll {
-                    rows: dy,
-                    cols: dx,
-                },
-            ) => {
+            (Focus::Editor, GridMouse::Scroll { dy, cols: dx }) => {
                 let (rows, cols) = (self.editor_rows, self.editor_cols);
-                // `read_target`, not `buf()`: with the Jira section showing, the
-                // wheel must move the dashboard rather than a file that isn't on
-                // screen.
+                let ch = self.font.cell_height().max(1.0);
+                // Negated: a positive delta means "toward the start of the
+                // content", which is a smaller index.
+                let advance = -dy;
+                let dx = -dx as isize;
+
+                // Accumulate pixels, spend whole rows, keep the remainder for the
+                // renderer. This is what makes the view move by pixels instead of
+                // jumping a row at a time.
+                let target = self.editor_scroll_px + advance;
+                let whole = (target / ch).floor();
+                let remainder = target - whole * ch;
+
+                let mut clamped = false;
                 if let Ok(mut b) = self.read_target().lock() {
-                    // Both negated: a positive delta means "toward the start of
-                    // the content", which is a smaller index.
-                    let (dy, dx) = (-dy as isize, -dx as isize);
                     if b.view_mode() == buffer::ViewMode::Read {
-                        b.scroll_read(dy, rows, cols);
+                        let before = b.read_scroll();
+                        if whole != 0.0 {
+                            b.scroll_read(whole as isize, rows, cols);
+                            clamped = b.read_scroll() == before;
+                        }
                         b.scroll_read_cols(dx, cols);
                     } else {
-                        b.scroll_by(dy, rows);
+                        let before = (b.scroll_row, b.scroll_seg);
+                        if whole != 0.0 {
+                            b.scroll_by(whole as isize, rows);
+                            clamped = (b.scroll_row, b.scroll_seg) == before;
+                        }
                         b.scroll_cols(dx, cols);
                     }
                 }
+                // A clamped row move means an end of the content: sit exactly on
+                // the boundary rather than leaving a partial row of background
+                // showing that nothing can scroll away.
+                self.editor_scroll_px = if clamped { 0.0 } else { remainder };
             }
             // A terminal reflows to its width, so it has nothing off to the
             // side; the horizontal component is dropped rather than ignored
             // silently in the widget, which would cost the editor its own.
-            (Focus::Shell(id), GridMouse::Scroll { rows: delta, .. }) => {
-                if let Some(t) = self.pane(id).active().map(|s| s.terminal.clone())
-                    && let Ok(mut t) = t.lock()
-                {
-                    t.scroll(delta);
+            (Focus::Shell(id), GridMouse::Scroll { dy, .. }) => {
+                let ch = self.font.cell_height().max(1.0);
+                let active = self.pane(id).active;
+                let Some(shell) = self.pane_mut(id).shells.get_mut(active) else {
+                    return Task::none();
+                };
+                let target = shell.scroll_px + -dy;
+                let whole = (target / ch).floor();
+                let remainder = target - whole * ch;
+                let terminal = shell.terminal.clone();
+
+                let mut offset = 0;
+                if let Ok(mut t) = terminal.lock() {
+                    if whole != 0.0 {
+                        // `Terminal::scroll` takes lines toward *older* content, so
+                        // the sign flips back here.
+                        t.scroll(-(whole as i32));
+                    }
+                    offset = t.display_offset();
                 }
+                // A partial row needs one grid line below the viewport, and that
+                // only exists while scrolled into scrollback. At the live screen
+                // there is nothing below to reveal — and live output should not be
+                // drawn half a row out of line — so it snaps to the boundary.
+                shell.scroll_px = if offset > 0 { remainder } else { 0.0 };
             }
             (Focus::Shell(id), GridMouse::Press {
                 row,
@@ -3498,10 +3546,27 @@ impl State {
         ]
         .width(Length::Fill);
 
+        // The tabs scroll horizontally, and the `scrollable` is doing two jobs.
+        //
+        // It **clips**, which is the bug it fixes: nothing in iced clips a child to
+        // its parent by default, so once the tabs were wider than the pane the
+        // strip simply drew over the pane beside it — editor tab names appearing
+        // on top of a shell.
+        //
+        // And it makes the overflow reachable, which v1 had (`tabs_scroll`) and v2
+        // had lost. The wheel over the strip scrolls it.
+        //
+        // Scrollbar suppressed to zero width, as in the Jira pane: a bar under a
+        // 26px strip would be most of its height, and the strip is chrome.
+        let tabs_bar = scrollable::Scrollbar::new().width(0).scroller_width(0);
         container(iced::widget::stack![
             line,
-            mouse_area(row(tabs).height(Length::Fill))
-                .on_move(move |p| Message::TabPointerMoved(group, p.x)),
+            scrollable(
+                mouse_area(row(tabs).height(Length::Fill))
+                    .on_move(move |p| Message::TabPointerMoved(group, p.x)),
+            )
+            .direction(scrollable::Direction::Horizontal(tabs_bar))
+            .height(Length::Fill),
         ])
         .width(Length::Fill)
         .height(Length::Fixed(TAB_BAR_HEIGHT))
@@ -3595,6 +3660,7 @@ impl State {
                 Message::EditorResized,
             )
         }
+        .offset(self.editor_scroll_px)
         .on_mouse(|g| Message::Mouse(Focus::Editor, g));
         // `line_numbers = false` drops the gutter entirely rather than drawing
         // an empty one.
@@ -3603,6 +3669,9 @@ impl State {
         } else if self.config.line_numbers {
             row![
                 Gutter::new(self.buf().clone(), self.font, &self.palette)
+                    // Same value the grid gets, or the numbers slide out of line
+                    // with their text while the view sits between rows.
+                    .offset(self.editor_scroll_px)
                     .on_fold(Message::ToggleFold),
                 grid
             ]
@@ -3861,6 +3930,7 @@ impl State {
                                     self.font,
                                     move |r, c| Message::GridResized(key, r, c),
                                 )
+                                .offset(shell.scroll_px)
                                 .on_mouse(move |g| Message::Mouse(Focus::Shell(*id), g)),
                             )
                         }
