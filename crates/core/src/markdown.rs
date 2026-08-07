@@ -85,7 +85,7 @@ pub struct Span {
 }
 
 /// One logical line of rendered markdown — a whole paragraph, however long.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Line {
     pub spans: Vec<Span>,
     /// Columns that continuations should hang under, so a wrapped list item
@@ -93,6 +93,22 @@ pub struct Line {
     /// first row's prefix is already in `spans`; this is what the rows *after*
     /// it owe.
     pub indent: usize,
+    /// Whether this line may be broken across rows.
+    ///
+    /// False for table rows. Wrapping one moves half its cells onto a row of
+    /// their own, and the column alignment that makes a table legible is gone —
+    /// so a wide table scrolls sideways instead, which keeps its shape.
+    pub wrappable: bool,
+}
+
+impl Default for Line {
+    fn default() -> Self {
+        Self {
+            spans: Vec::new(),
+            indent: 0,
+            wrappable: true,
+        }
+    }
 }
 
 impl Line {
@@ -297,7 +313,7 @@ impl State {
                         }
                         self.out.push(Line {
                             spans: vec![Span { text: s, style: MUTED }],
-                            indent: 0,
+                            ..Line::default()
                         });
                     }
                 }
@@ -473,7 +489,7 @@ impl State {
                 text: "─".repeat(self.width),
                 style: MUTED,
             }],
-            indent: 0,
+            ..Line::default()
         });
         self.need_blank = true;
     }
@@ -499,6 +515,7 @@ impl State {
                 // Continuations of an over-long code line hang under the two
                 // spaces of padding, not under the margin.
                 indent: 2,
+                wrappable: true,
             });
         }
     }
@@ -522,6 +539,7 @@ impl State {
         let mut line = Line {
             spans: Vec::new(),
             indent: indent + bq_prefix.width() + prefix_width,
+            wrappable: true,
         };
         if indent > 0 {
             line.spans.push(Span {
@@ -595,7 +613,11 @@ impl State {
                     });
                 }
             }
-            self.out.push(Line { spans, indent: 0 });
+            self.out.push(Line {
+                spans,
+                indent: 0,
+                wrappable: false,
+            });
 
             if row_idx == 0 && row.is_header {
                 let mut sep: Vec<Span> = Vec::new();
@@ -614,6 +636,7 @@ impl State {
                 self.out.push(Line {
                     spans: sep,
                     indent: 0,
+                    wrappable: false,
                 });
             }
         }

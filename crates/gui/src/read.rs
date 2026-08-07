@@ -54,7 +54,7 @@ impl Rendered {
 pub fn row_index(lines: &[markdown::Line], line: usize, seg: usize, cols: usize) -> usize {
     let mut index = 0;
     for l in lines.iter().take(line.min(lines.len())) {
-        index += text::wrap_line(&l.text(), cols, 1, l.indent).len();
+        index += segments_of(l, &l.text(), cols).len();
     }
     index + seg
 }
@@ -63,7 +63,7 @@ pub fn row_index(lines: &[markdown::Line], line: usize, seg: usize, cols: usize)
 pub fn row_at(lines: &[markdown::Line], target: usize, cols: usize) -> (usize, usize) {
     let mut seen = 0;
     for (i, l) in lines.iter().enumerate() {
-        let segs = text::wrap_line(&l.text(), cols, 1, l.indent).len();
+        let segs = segments_of(l, &l.text(), cols).len();
         if target < seen + segs {
             return (i, target - seen);
         }
@@ -108,7 +108,7 @@ pub fn visible_rows(
     while out.len() < rows && line < lines.len() {
         let text = lines[line].text();
         let indent = text::clamp_hanging_indent(lines[line].indent, cols);
-        let segments = text::wrap_line(&text, cols, 1, lines[line].indent);
+        let segments = segments_of(&lines[line], &text, cols);
         if seg >= segments.len() {
             seg = 0;
             line += 1;
@@ -132,12 +132,36 @@ pub fn visible_rows(
     out
 }
 
+/// How a rendered line breaks into rows.
+///
+/// A table row is unwrappable, so it stays one row however wide it is and is
+/// reached by scrolling sideways instead. Wrapping it would put half its cells
+/// on a row of their own and destroy the column alignment that makes it a table.
+fn segments_of(line: &markdown::Line, text: &str, cols: usize) -> Vec<(usize, usize)> {
+    if line.wrappable {
+        text::wrap_line(text, cols, 1, line.indent)
+    } else {
+        vec![(0, text.chars().count())]
+    }
+}
+
 /// How many screen rows the whole document occupies at `cols`.
 pub fn total_rows(lines: &[markdown::Line], cols: usize) -> usize {
     lines
         .iter()
-        .map(|l| text::wrap_line(&l.text(), cols, 1, l.indent).len())
+        .map(|l| segments_of(l, &l.text(), cols).len())
         .sum()
+}
+
+/// Widest rendered row, in columns — how far right scrolling may go.
+pub fn widest_row(lines: &[markdown::Line], cols: usize) -> usize {
+    lines
+        .iter()
+        .filter(|l| !l.wrappable)
+        .map(|l| l.text().chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(cols)
 }
 
 /// Draws a buffer's markdown rendering.
@@ -158,6 +182,7 @@ impl GridSource for ReadSource {
             return;
         };
         let (from_line, from_seg) = buffer.read_scroll();
+        let shift = buffer.read_scroll_col();
         let fg = palette.foreground;
         let bg = palette.background;
 
@@ -170,15 +195,18 @@ impl GridSource for ReadSource {
             };
             let text = line.text();
             let dest = &mut out[screen_row];
-            for _ in 0..rr.indent.min(cols) {
+            // `col` counts columns of the line, `screen` counts columns of the
+            // pane; they differ by the horizontal scroll.
+            let mut col = rr.indent;
+            let mut screen = col.saturating_sub(shift).min(cols);
+            for _ in 0..screen {
                 dest.push(Cell::blank(fg, bg));
             }
-            let mut col = rr.indent.min(cols);
             for (index, c) in text.chars().enumerate() {
                 if index < rr.start {
                     continue;
                 }
-                if index >= rr.end || col >= cols {
+                if index >= rr.end || screen >= cols {
                     break;
                 }
                 let style = line.style_at(index);
@@ -194,19 +222,25 @@ impl GridSource for ReadSource {
                 cell.italic = style.emphasis.italic;
                 cell.underline = style.emphasis.underline;
                 let width = text::char_display_width(c, col, 1).max(1);
-                dest.push(cell);
-                col += 1;
-                // A wide glyph's second column carries the same background so
-                // the row stays a grid.
-                for _ in 1..width {
-                    if col >= cols {
+                for i in 0..width {
+                    // Skip columns scrolled off the left rather than drawing and
+                    // clipping them.
+                    if col + i < shift {
+                        continue;
+                    }
+                    if screen >= cols {
                         break;
                     }
-                    let mut spacer = cell;
-                    spacer.c = '\0';
-                    dest.push(spacer);
-                    col += 1;
+                    let mut c = cell;
+                    // The glyph belongs to the first column; the rest are the
+                    // spacer half of a wide character.
+                    if i > 0 || col < shift {
+                        c.c = '\0';
+                    }
+                    dest.push(c);
+                    screen += 1;
                 }
+                col += width;
             }
         }
     }
@@ -286,5 +320,60 @@ mod tests {
         let all = visible_rows(&lines, 0, 0, 100, 40);
         let from_second = visible_rows(&lines, all[2].line, 0, 100, 40);
         assert_eq!(from_second[0].line, all[2].line);
+    }
+}
+
+#[cfg(test)]
+mod hscroll_tests {
+    use super::*;
+
+    const TABLE: &str = "| name | description | notes |\n|---|---|---|\n\
+                         | one | a fairly long description cell | plus more |";
+
+    #[test]
+    fn a_table_row_stays_one_row_however_narrow_the_pane() {
+        // Wrapping a table row puts half its cells on a row of their own and
+        // the column alignment is gone, so it scrolls sideways instead.
+        let lines = render(TABLE, 200);
+        let table: Vec<&markdown::Line> = lines.iter().filter(|l| !l.wrappable).collect();
+        assert!(!table.is_empty(), "the table rows are marked unwrappable");
+        let rows = visible_rows(&lines, 0, 0, 100, 20);
+        for (line_idx, line) in lines.iter().enumerate() {
+            if line.wrappable {
+                continue;
+            }
+            let mine = rows.iter().filter(|r| r.line == line_idx).count();
+            assert_eq!(mine, 1, "table row {line_idx} occupies one row");
+        }
+    }
+
+    #[test]
+    fn prose_still_wraps_beside_a_table() {
+        let lines = render(&format!("{TABLE}\n\nsome prose that is long enough to wrap"), 200);
+        let rows = visible_rows(&lines, 0, 0, 200, 20);
+        let prose = lines
+            .iter()
+            .position(|l| l.text().starts_with("some prose"))
+            .expect("prose line");
+        assert!(
+            rows.iter().filter(|r| r.line == prose).count() > 1,
+            "prose is unaffected by the table rule"
+        );
+    }
+
+    #[test]
+    fn horizontal_scroll_reaches_past_the_pane_but_no_further() {
+        let lines = render(TABLE, 200);
+        let widest = widest_row(&lines, 20);
+        assert!(widest > 20, "the table is wider than the pane");
+        // The bound is the widest unwrappable row minus the pane, so the last
+        // column can be brought on screen and no further.
+        assert_eq!(widest.saturating_sub(20), widest - 20);
+    }
+
+    #[test]
+    fn a_document_with_no_table_has_nothing_to_scroll_to() {
+        let lines = render("just prose, wrapped like everything else", 200);
+        assert_eq!(widest_row(&lines, 30), 30, "bound collapses to the pane width");
     }
 }

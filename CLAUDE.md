@@ -93,6 +93,27 @@ editor buffer logic is work, not risk; it ports from a known-good v1.
   (`coalesce_end` tracks where the next keystroke must land); cursor movement,
   newlines, and multi-char pastes break the run so they undo separately.
 
+  **Horizontal scroll** (`scroll_col`) exists for when wrapping is off, where a
+  long line would otherwise be unreachable past the right edge. Held in *visual
+  columns*, not character indices, because that's what the viewport measures — a
+  tab is one character but several columns.
+
+  Three consequences, and each is a bug if missed: `fill` tracks the line's
+  column and the pane's column separately (they differ by the scroll) rather than
+  deriving one from the other; `screen_to_doc` adds the scroll back, or clicking
+  lands several columns left of the pointer; and `ensure_cursor_visible_in`
+  carries the view with the caret, or typing past the right edge edits text you
+  can't see. Wrapping being on pins it to zero — nothing is off-screen then — and
+  the right-hand bound comes from the widest line in the whole buffer rather than
+  the visible ones, so the stop doesn't move as you scroll down.
+
+  Read mode has its own (`read_scroll_col`), and it is the reason **table rows
+  don't wrap** (`markdown::Line::wrappable`). Wrapping one puts half its cells on
+  a row of their own and destroys the column alignment that makes it a table, so
+  a wide table stays one row and is reached sideways instead. Everything else in
+  a document still wraps, so a file with no table has nothing to scroll to and
+  the bound collapses to the pane width.
+
   **Soft wrap.** A line occupies one screen row per wrap segment, from
   `text::wrap_line`. Two consequences run through everything:
 
@@ -214,6 +235,25 @@ editor buffer logic is work, not risk; it ports from a known-good v1.
 
   The bound on the wait matters too: an unconditional wait would hang forever if a
   size never came. A shell at the placeholder size beats no shell.
+
+  **The shell is spawned as a *login* shell** —
+  `CommandBuilder::new_default_prog()`, which resolves `$SHELL` (falling back to
+  the password database rather than `/bin/sh`) and sets argv0 to `-zsh`, the
+  leading dash being how a shell knows. This is what every terminal emulator does,
+  and getting it wrong is why `docker`, `brew` and MacPorts couldn't be found:
+  without the dash zsh reads `~/.zshrc` and nothing else — no `/etc/zprofile`, so
+  `/usr/libexec/path_helper` never runs and `/etc/paths.d` is never read, and no
+  `~/.zprofile`, where `brew shellenv` and credential helpers usually live.
+
+  **It's invisible when the app is started from a terminal**, which is why it
+  survived the whole spike: the full `PATH` is inherited from the launching shell,
+  so only a Dock launch shows it — there the parent environment is launchd's
+  `/usr/bin:/bin:/usr/sbin:/sbin`. Measured, Dock-launched: the non-login `PATH`
+  had no `/usr/local/bin` (where Docker Desktop puts its CLI *and*
+  `docker-credential-osxkeychain`) and no `/opt/local/bin`; the login one had both,
+  plus everything `path_helper` contributes. `ps -axo comm` is the quick check —
+  the children should read `-zsh`, not `/bin/zsh`. v1 never had the bug because it
+  only ever ran inside an emulator.
 
   **Two shells means two subscriptions**, distinguished by hashing a `ShellId`
   through `run_with` — plain `run` would identify them by function pointer alone
@@ -487,8 +527,8 @@ leaves an empty untitled one — so `buf()` never has to handle an empty list.
 `syntax_highlighting`, `word_wrap`, plus `[theme]` and `[font]`.
 `syntax_highlighting = false` skips *building* the `Highlighter`, not just its
 output — loading syntect's syntax set is the cost the option exists to avoid.
-Deliberately unread: `status_timeout_ms` (v2 has no transient status, only the
-persistent problem strip) and `[lint]` (v2 does no linting).
+Deliberately unread: `status_timeout_ms` (v2 has no status line at all — see
+"Alerts") and `[lint]` (v2 does no linting).
 
 **Pane chrome** (`PANE_PADDING` / `PANE_BORDER` in `main.rs`): each pane's content
 is wrapped in a `container` carrying the padding, background, and border. The grid
@@ -524,13 +564,48 @@ clicks on cells, so a `mouse_area` around the padded container catches the rest
 and emits `FocusPane` (focus moves, cursor doesn't). Without it the band would be
 dead to clicks, which reads as the pane ignoring you.
 
-**No permanent status bar**, same rule as v1. The window is the grid, edge to
-edge. A one-row strip appears at the bottom only when something is wrong worth
-surfacing — a font family that didn't resolve, a PTY that failed — and is absent
-otherwise (`State::problem`). Throughput and memory counters are *not* UI: run
-with `SACRAMENT_METRICS=1` and they go to stderr every 200 chunks. `Ctrl+R`
-resets them. `SACRAMENT_SPIKE_CMD='<cmd>'` auto-runs a command on attach, so a
-scripted perf run needs no typing.
+**No status bar at all.** The window is the grid, edge to edge. The bottom row
+exists only while a *prompt* is open, and a prompt is an input, not a message.
+Throughput and memory counters are *not* UI: run with `SACRAMENT_METRICS=1` and
+they go to stderr every 200 chunks. `Cmd+Shift+R` resets them.
+`SACRAMENT_SPIKE_CMD='<cmd>'` auto-runs a command on attach, so a scripted perf
+run needs no typing.
+
+#### Alerts (`State::alert`)
+
+**Everything the app has to *say* is a native alert with an OK button.** There was
+a one-row strip at the bottom for this, and it failed in the two ways a status
+line does: it was easy not to notice, and a persistent condition (`failure`,
+`font_warning`) left text sitting there with nothing to clear it — "not a markdown
+file" stayed on screen until something else overwrote it.
+
+The rule that separates the three ways of speaking: a **dialog with choices** is
+for a decision the app can't make (see "Native dialogs"), an **alert** is for
+something it can only report, and the **window title** is for state that changes
+continuously (the dirty dot).
+
+Three things about the implementation:
+
+- **Alerts are queued, not returned.** `State::alert` pushes onto
+  `State::alerts`, and `update` flushes it after `handle` has run. Threading a
+  `Task` out of every site that needs to say something — `toggle_comment`,
+  `search`, `save_session`, the watcher — would have restructured half the file to
+  deliver a dialog. One flush point also means a queued message is shown exactly
+  once, and everything from a single message goes in *one* dialog rather than a
+  queue the user has to clear.
+- **Repeats are suppressed while one is on screen** (`State::showing_alerts`,
+  cleared by `Message::AlertDismissed`). This isn't hypothetical: `notify` emits
+  several events for one write, and a refused reload reports on every one of them,
+  so a dirty-buffer conflict would otherwise stack a dialog per event. The same
+  message can be raised again once the first is acknowledged.
+- **The prompt's own note stays inline.** `Prompt::note` ("no match") is the one
+  message that arrives *while typing*, and a dialog there would have to be
+  dismissed between keystrokes. A promptless `Cmd+G` miss is an alert, and it names
+  the query — with no prompt open there's nothing else on screen to say what was
+  searched for.
+
+The font warning is raised from `State::new`'s returned `Task` rather than the
+queue: it's a config error, and there's no message yet to queue it behind.
 
 #### Keybindings — v2
 
@@ -599,15 +674,59 @@ Four things here are load-bearing:
 reaches the PTY, and that `Ctrl+C`/`R`/`W`/`Z` still produce `0x03`/`0x12`/`0x17`/
 `0x1a`.
 
-Not bound, because the underlying capability doesn't exist yet: `Option+Backspace`
-(delete word), `Cmd+Shift+F` (find in project), replace.
+Not bound in the *editor*, because the underlying capability doesn't exist yet:
+`Option+Backspace` (delete word), `Cmd+Shift+F` (find in project), replace.
+
+**What a shell gets beyond the plain keys** (`keymap`'s `Named` arm), all of it
+the macOS terminal convention rather than anything invented here:
+
+| key | bytes | why |
+|---|---|---|
+| `Shift+Enter` | `\n` | A newline for a TUI composing multi-line input |
+| `Option+←` / `→` | `\x1bb` / `\x1bf` | `backward-word` / `forward-word` |
+| `Option+Backspace` | `\x1b\x7f` | `backward-kill-word` |
+
+Two details worth keeping:
+
+- **`Shift+Enter` sends `\n`, not `\x1b\r`.** The `\x1b\r` form is what Claude
+  Code's own `/terminal-setup` installs into iTerm2 and VS Code, and it works —
+  but at a *plain shell prompt* `\e\r` is unbound in zsh's emacs keymap, so
+  Shift+Enter would silently stop submitting commands. `\n` is what `Ctrl+J`
+  sends, which is the escape hatch people already use for this, and it's also
+  `accept-line` in zsh and readline. One byte that satisfies both.
+- **Word movement is Esc-prefixed, not CSI.** `\x1bb` / `\x1bf` is what iTerm2's
+  "natural text editing" preset and Ghostty's defaults send, and zsh and readline
+  bind them out of the box. The xterm form (`\x1b[1;3D`) needs the shell to have
+  bound it, so it does nothing in a default zsh.
+
+The `alt()` check runs *before* the plain-arrow table, which otherwise ignores
+modifiers and would swallow the whole thing.
+
+#### Drag and drop (`State::drop_file`)
+
+A file dropped on the window is **routed by focus**, not by where the pointer was:
+`window::Event::FileDropped` carries no position — winit exposes none, so neither
+does iced — and nothing else is available, because the OS owns the pointer for the
+length of a drag and no `CursorMoved` arrives during one. v1 behaved the same way
+for a different reason: the emulator handed the path over as pasted text, which
+went wherever focus was.
+
+- **Shell focus** → the escaped path, as a bracketed paste, plus a trailing space.
+  That's what every terminal puts there, and it's how Claude Code receives a
+  dropped image.
+- **Editor focus** → opened as a tab, the same path as `Cmd+O`. A file it can't
+  read (an image) reports that rather than opening blank.
+
+`shell_escaped` backslashes everything that isn't alphanumeric or safe
+punctuation. Non-ASCII letters pass through — they aren't shell-special, and
+escaping them turns a legible path into noise.
 
 #### Native dialogs (`rfd`)
 
 Anything that is a *question with consequences* is a system dialog rather than
-in-app chrome. The rule that separates them: a dialog is for a decision the app
-can't make and must block on; the bottom row is for information it can only
-report.
+in-app chrome. The rule that separates them: a dialog with choices is for a
+decision the app can't make and must block on; an alert (see "Alerts") is for
+what it can only report.
 
 | flow | dialog |
 |---|---|
@@ -654,9 +773,10 @@ dialogs sheets too; worth doing if their look ever matters.
 
 #### The prompt (`State::prompt`)
 
-One `Prompt` serves find, goto-line and save-as — a single line of text with a
-label and an optional note, in the bottom row that the problem strip already
-owns. Three lookalike inputs would have been three sets of the same bugs.
+One `Prompt` serves find and goto-line — a single line of text with a label and an
+optional note, in a bottom row that exists only while it's open. Two lookalike
+inputs would have been two sets of the same bugs. (Save-as was a third until the
+native panel replaced it.)
 
 **It's a real `text_input`, not a hand-rolled line.** Caret, selection, arrow
 keys, `Cmd+V` and IME all come from iced. Colors still come from `Palette`, and
@@ -700,17 +820,12 @@ Per-prompt behavior:
   opens the find prompt, rather than being a key that does nothing the first time
   you press it. `Cmd+G` also advances *while* the prompt is open, so it isn't
   swallowed as "not one of my keys".
-- **A promptless search needs somewhere to report a miss.** `State::search_note`
-  is that place: the bottom row, naming the query, since with no prompt open
-  nothing else on screen says what was searched for. A silent no-op reads as a
-  broken key.
+- **A promptless search needs somewhere to report a miss**, so `Cmd+G` with no
+  prompt open raises an *alert*, naming the query — with no prompt on screen
+  nothing else says what was searched for, and a silent no-op reads as a broken
+  key. A miss *with* the prompt open is `Prompt::note` instead: that one arrives
+  while typing, and a dialog between keystrokes would be unusable.
 - **Goto line** is 1-based and clamps.
-- **Save-as** prefills the current path, so it starts as "rename", and
-  `focus`-then-`select_all` means one keystroke replaces it. **A path that already
-  exists takes a second `Enter`**: there's no file dialog to warn in, and silently
-  replacing a file the user didn't mean to name is the one unrecoverable mistake
-  the feature can make. Editing the path withdraws that consent, since it was
-  given for the old path.
 
 `Buffer::save_as` adopts the *target's* mtime before writing. Without that,
 `save`'s changed-on-disk guard rejects every save-as onto an existing file — the
@@ -1019,11 +1134,11 @@ so v2 would restore v1's tabs and shells over its own, and both would then
 contend for one socket. `/tmp/sacrament2-$USER.sock` belonging to a binary called
 `sacrament` is the cost of not doing that.
 
-16 tests, all in the config/theme/font layer (`cargo test --workspace`). `core`
-and the gui's `font.rs` are where tests are cheap — no UI to stand up. Still
-untested and worth covering next, all pure functions: `git::parse_hunks`,
-`lint::parse_output`, and `protocol::Request::{parse,encode}`. v1's `editor.rs`
-has no tests and getting any would mean standing up a `Buffer` first.
+252 tests (`cargo test --workspace`): 70 in `core`, 182 in the gui — buffer
+mutation and undo, terminal reflow, the key map, fonts, and `theme_guard`. v1 has
+none, and getting any would mean standing up a `Buffer` first. Still untested and
+worth covering next, all pure functions: `git::parse_hunks`, `lint::parse_output`,
+and `protocol::Request::{parse,encode}`.
 
 There is no lint config for *this* repo beyond `cargo clippy` defaults — note the in-editor lint feature (`Alt+L`, `[lint.linters]`) is a separate, user-configured thing, unrelated to how you'd lint sacrament itself.
 
@@ -1339,8 +1454,8 @@ v1 parses `[theme]` and ignores it — it renders through the terminal's own
 palette by design. Shared config, one consumer.
 
 `Palette::iced_theme()` derives iced's `Theme` from the same 16 slots so app
-chrome (the status strip now; tab bars and splitters later) lives in one color
-system rather than looking like two apps stapled together.
+chrome (tab strips, the prompt row, splitters) lives in one color system rather
+than looking like two apps stapled together.
 
 ### Font selection (crates/core/src/font.rs + crates/gui/src/font.rs) — v2 only
 
@@ -1359,9 +1474,9 @@ would draw *nothing*. `gui/src/font.rs` therefore validates the name up front
 against `fontdb`, which is the same crate and version cosmic-text loads system
 fonts through, so the list is exactly what iced can resolve rather than an
 approximation from something like `system_profiler`. An unmatched name falls
-back to the default monospace and reports it. The warning lives in its own
-`State::font_warning`, *not* in `status` — a bad font is a persistent config
-error, and `status` is overwritten by the next PTY event.
+back to the default monospace and says so, in an alert raised from `State::new`'s
+returned `Task` — a bad font is a config error, and it's the one message that has
+nothing to queue behind it.
 
 **A resolved family still isn't enough — glyph coverage is separate.** Validating
 the *name* says nothing about whether the face has the *characters*, and with no
@@ -1376,9 +1491,8 @@ edges rendered fine, which reads as a rendering bug rather than a font gap.
 via `ttf-parser` (candidates from `codepoints()` are each confirmed against
 `glyph_index`, since a candidate can map to no glyph) and stored as an ASCII array
 plus a `HashSet` for the rest — ASCII is nearly every cell and this is consulted
-per cell per frame, so the common case must not hash. `GridView` then shapes only
-the uncovered cells with `Shaping::Advanced`, which *does* consult system fonts.
-Three things about it:
+per cell per frame, so the common case must not hash. `GridView` then substitutes
+for the uncovered cells (`Glyphs`, below). Three things about it:
 
 - **A fallback run is always one cell.** The fallback font's advance width isn't
   ours, so a multi-cell run drawn in it would drift progressively out of the grid.
@@ -1409,7 +1523,61 @@ leaked the same way, which is what keeps `FontSpec` `Copy`.
 
 `SystemFonts` wraps one `fontdb::Database` because loading system fonts isn't
 free and both family validation and coverage need it — previously
-`installed_families()` built and dropped its own.
+`installed_families()` built and dropped its own. It's consumed at the end of
+startup by `into_fallback`, which keeps the database alive for the process.
+
+#### Fallback is ours, not cosmic-text's — and that's what keeps emoji out
+
+`Shaping::Advanced` is the only shaping that consults system fonts, so it was
+doing the substituting. **It's also where the emoji came from.** cosmic-text's
+macOS chain is `.SF NS`, `Menlo`, **`Apple Color Emoji`**, `Geneva`,
+`Arial Unicode MS`, walked in order — so any character the first two lack and the
+emoji font has is drawn as a colour emoji. Claude Code's bullet is `⏺` (U+23FA, a
+*record button* whose Unicode default presentation happens to be emoji), Menlo
+doesn't have it, and the result was a cartoon dot in the middle of terminal output.
+
+`font::Fallback` takes the decision back. `GridView::glyphs_for` returns a three-way
+`Glyphs`, and it's a strict preference order:
+
+1. `Configured` — the font has it. `Shaping::Basic`, batched into runs. Unchanged.
+2. `Family(name)` — the first family in `FALLBACK_CHAIN` that has it, drawn with
+   `Shaping::Basic` in that family. Monochrome, deterministic, one cell.
+3. `System` — nothing in the chain has it, so `Shaping::Advanced` picks. This is
+   the *genuine* emoji path (`🔴`, `✅` and `😀` exist in no text font on macOS)
+   and the path for scripts the chain doesn't reach.
+
+So a symbol that merely has emoji *presentation* renders as text in the theme's
+colours, and an emoji that only exists as an emoji still renders as one — which is
+the rule for the app: never turn something into an emoji, but don't refuse to draw
+one that's genuinely in the content.
+
+Measured on this machine, which is where the chain order came from:
+
+| chars | resolves to |
+|---|---|
+| `⏺ ⏸ ⏹ ⏱` | STIX Two Math |
+| `⎿ ⧉` | Apple Symbols |
+| `✻ ✽ ✳ ✓ ❯ ⚒ ⚠ ─ ╰` | Menlo |
+| `中` | Arial Unicode MS |
+| `✅ 🔴 😀` | nothing — `Advanced` |
+
+Four things about it:
+
+- **The colour test is structural, not a name list.** A face carrying `COLR`,
+  `CBDT`, `sbix` or `SVG` is refused, so adding an emoji family to the chain can't
+  reintroduce emoji, and a renamed font can't sneak past.
+- **Lookups are lazy and cached per character.** Resolving one means reading a
+  font file — measured at ~2.4 ms for a chain walk that reaches the third entry —
+  and reading every chain member at startup would mean paying for the 20 MB CJK
+  faces to answer a question nothing has asked. Each character is resolved once;
+  after that it's a `HashMap` hit.
+- **The chain is ordered monospaced-first**, so a substituted glyph matches the
+  grid's width where it can, then symbol faces, then broad text coverage, then CJK.
+- **An empty or unresolvable chain degrades to the old behavior**, since everything
+  then falls to `System`.
+
+`Family::Name` wants `&'static str`, which the chain entries already are — that's
+why they can be handed straight to `iced::Font`.
 
 Ligatures do not form, and shouldn't: they're a shaping feature `Basic` skips,
 and a ligature spanning two cells would break grid alignment. Fira Code renders
@@ -1437,6 +1605,14 @@ State that exists but doesn't do what its name suggests. Don't build on it witho
 ## Conventions
 
 - No backwards-compat shims or feature flags. Behavior changes go straight in.
+- **The app never renders an emoji it wasn't given.** No emoji in labels, markers,
+  messages, comments or docs, and — the part that needs code to enforce — no
+  *turning a symbol into one*. A codepoint that merely has emoji presentation
+  (`⏺`, `⏸`, `⚠`) is drawn from a monochrome font in the theme's colours; only a
+  character that exists nowhere but a colour font is drawn as a colour emoji,
+  because at that point it genuinely is one and refusing would just be a blank
+  cell. See "Fallback is ours, not cosmic-text's" — the mechanism is a
+  monochrome-first chain we control, not a substitution table.
 - Terminal palette is the source of truth for colors — don't introduce RGB colors. This applies to the shell renderer too (`vt_color_to_ratatui` collapses `vt100::Color::Rgb` to `Color::Reset`).
 - **v2: every color comes from `Palette`, and nothing synthesizes one.** No alpha
   blending, no darkening a theme color to make a variant, no color literals. A

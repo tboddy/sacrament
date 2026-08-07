@@ -296,6 +296,12 @@ enum Message {
     Remote(ipc::Command),
     /// A watched file changed on disk.
     FileChanged(std::path::PathBuf),
+    /// A file was dragged in from the Finder and dropped on the window.
+    FileDropped(std::path::PathBuf),
+    /// An alert was acknowledged. Carries nothing — it exists so the dialog's
+    /// future has somewhere to land, and so a repeat of the same message can
+    /// stop being suppressed once the first one is gone.
+    AlertDismissed,
     /// The save panel closed. `None` means it was cancelled.
     SaveAsPicked(Option<std::path::PathBuf>, AfterSave),
     /// The open panel closed.
@@ -358,8 +364,9 @@ const PANE_DIVIDER: f32 = 1.0;
 
 /// What the one-line prompt at the bottom is currently asking for.
 ///
-/// Find, goto-line and save-as all need a single line of text, so they share one
-/// prompt rather than growing three lookalike inputs.
+/// Find and goto-line both need a single line of text, so they share one prompt
+/// rather than growing two lookalike inputs. (Save-as used to be a third; it's a
+/// native panel now.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptKind {
     Find,
@@ -523,6 +530,48 @@ fn confirm_unsaved(title: &str, body: String) -> impl std::future::Future<Output
     }
 }
 
+/// An informational alert with a single OK button.
+///
+/// Async through `Task::perform` for the same reason every other dialog here is:
+/// a blocking dialog on the UI thread deadlocks against the event loop that has
+/// to keep drawing it. `AlertDismissed` is where the future lands.
+fn alert_dialog(body: String) -> Task<Message> {
+    Task::perform(
+        async move {
+            rfd::AsyncMessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("Sacrament")
+                .set_description(body)
+                .set_buttons(rfd::MessageButtons::Ok)
+                .show()
+                .await;
+        },
+        |()| Message::AlertDismissed,
+    )
+}
+
+/// Backslash-escape a path for insertion at a shell prompt.
+///
+/// This is what a terminal does when a file is dropped into it, and it's the
+/// reason a path with a space in it still arrives as one word. Alphanumerics —
+/// including non-ASCII letters, which aren't shell-special and would only be
+/// turned into noise — plus the punctuation that can't be misread pass through
+/// unchanged; everything else is escaped, which is the safe default for the
+/// characters this list hasn't thought about.
+fn shell_escaped(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let safe = c.is_alphanumeric()
+            || matches!(c, '/' | '.' | '_' | '-' | '+' | ',' | ':' | '@' | '%' | '=');
+        if !safe {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Move one element of a `Vec` to another index, returning whether it happened.
 ///
 /// Remove-then-insert, deliberately, rather than a swap: dragging a tab three
@@ -677,10 +726,6 @@ struct State {
     palette: Palette,
     /// Resolved once at startup from `[font]` in config.toml.
     font: FontSpec,
-    /// Set when the configured font family couldn't be used. A misconfigured
-    /// font is a persistent condition, not a transient event, so it lives
-    /// separately from `status` — which every PTY event overwrites.
-    font_warning: Option<String>,
     focus: Focus,
     /// The whole loaded config, so options are read where they're used rather
      /// than copied into a field each. v1 and v2 share `config.toml`.
@@ -703,9 +748,6 @@ struct State {
     prompt: Option<Prompt>,
     /// Last find query, so `Cmd+G` can repeat it after the prompt has closed.
     last_query: Option<String>,
-    /// Feedback from a promptless search — `Cmd+G` has no prompt to write a note
-    /// into, and a search that silently does nothing reads as a broken key.
-    search_note: Option<String>,
     /// Editor viewport height in rows, reported by the grid. Needed so keyboard
     /// scrolling and cursor-following can clamp against the real viewport
     /// rather than a guess.
@@ -714,10 +756,21 @@ struct State {
     /// width regardless of `word_wrap`, so it needs this even when the editor's
     /// own wrap width is zero.
     editor_cols: usize,
-    /// A hard failure worth showing the user. Distinct from the chatter that
-    /// used to live in `status` ("shell attached", counters) — that was spike
-    /// scaffolding and is gone.
-    failure: Option<String>,
+    /// Messages queued to become native alerts, drained by `update` once the
+    /// message that produced them has been fully handled.
+    ///
+    /// A queue rather than a `Task` returned from each site: the things that need
+    /// to say something — a failed save, a search that found nothing, a comment
+    /// key with no comment syntax — are plain `&mut self` methods, and threading
+    /// a `Task` back out of every one of them would restructure half the file to
+    /// deliver a dialog.
+    alerts: Vec<String>,
+    /// What the alert currently on screen says. A burst of identical messages is
+    /// real — the file watcher emits several events for one write, and a refused
+    /// reload reports on each — and stacking a dialog per event would bury the
+    /// window. Cleared when the alert is acknowledged, so the same message can be
+    /// raised again later.
+    showing_alerts: Vec<String>,
 }
 
 impl State {
@@ -799,7 +852,13 @@ impl State {
         let coverage = fonts
             .coverage(&font.font.family)
             .map(|c| &*Box::leak(Box::new(c)));
-        let font = font.with_coverage(coverage);
+        // The chain that draws what the configured font can't. Leaked for the same
+        // reason, and it consumes `fonts` because its lookups happen at draw time
+        // rather than here — see `font::Fallback`.
+        let fallback: &'static font::Fallback = Box::leak(Box::new(fonts.into_fallback()));
+        let font = font
+            .with_coverage(coverage)
+            .with_fallback(Some(fallback));
 
         // Open a file if one was given on the command line, else an empty
         // buffer. Real argument parsing and the client/server open flow come
@@ -859,6 +918,7 @@ impl State {
                     b.cursor_row = sb.cursor_row.min(b.line_count().saturating_sub(1));
                     b.cursor_col = sb.cursor_col;
                     b.scroll_row = sb.scroll_row.min(b.line_count().saturating_sub(1));
+                    b.scroll_col = sb.scroll_col;
                     b.clamp_to_content();
                     // After the text is in place: restoring a fold needs the
                     // line count to validate against.
@@ -893,19 +953,25 @@ impl State {
             geometry_dirty: false,
             prompt: None,
             last_query: None,
-            search_note: None,
             metrics: Metrics::new(),
             palette,
             font,
-            font_warning,
             focus: Focus::Editor,
             editor_rows: 24,
             editor_cols: 80,
-            failure: None,
+            alerts: Vec::new(),
+            showing_alerts: Vec::new(),
         };
         // `persist` keeps these in step later, but it hasn't run yet.
         state.sync_watches();
-        (state, Task::none())
+        // A font family that didn't resolve is a config error, so it's said once
+        // at startup rather than queued — nothing has happened yet to queue it
+        // behind.
+        let boot = match font_warning {
+            Some(w) => alert_dialog(w),
+            None => Task::none(),
+        };
+        (state, boot)
     }
 
     /// Window title carries the filename and the dirty marker. That's the save
@@ -1002,11 +1068,9 @@ impl State {
             .lock()
             .map(|mut b| b.toggle_read_mode())
             .unwrap_or(false);
-        self.failure = if ok {
-            None
-        } else {
-            Some("not a markdown file".to_string())
-        };
+        if !ok {
+            self.alert("Not a markdown file.");
+        }
     }
 
     /// Comment or uncomment the selected lines.
@@ -1022,18 +1086,16 @@ impl State {
         let Ok(mut b) = self.buf().lock() else { return };
         let Some(syntax) = b.syntax_name().map(str::to_string) else {
             drop(b);
-            self.failure = Some("no syntax — nothing to comment with".to_string());
+            self.alert("No syntax for this file — nothing to comment with.");
             return;
         };
         let Some(prefix) = sacrament_core::highlight::line_comment_for(&syntax) else {
             drop(b);
-            self.failure = Some(format!("no comment style for {syntax}"));
+            self.alert(format!("No comment style known for {syntax}."));
             return;
         };
         b.toggle_comment(prefix);
         b.ensure_cursor_visible(rows);
-        drop(b);
-        self.failure = None;
     }
 
     /// Looking at a tab counts as reviewing it.
@@ -1098,7 +1160,6 @@ impl State {
         if index >= self.buffers.len() {
             return;
         }
-        self.failure = None;
         self.buffers.remove(index);
         if self.buffers.is_empty() {
             let mut b = Buffer::empty();
@@ -1162,7 +1223,7 @@ impl State {
                 // Stop rather than quit: a failed save here means quitting would
                 // throw away exactly what the user asked to keep.
                 self.active = i;
-                self.failure = Some(e.to_string());
+                self.alert(e.to_string());
                 return Task::none();
             }
         }
@@ -1319,6 +1380,10 @@ impl State {
             iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                 iced::mouse::Button::Left,
             )) => Some(Message::LeftReleased),
+            // Files dragged in from the Finder. One event per file.
+            iced::Event::Window(iced::window::Event::FileDropped(path)) => {
+                Some(Message::FileDropped(path))
+            }
             _ => None,
         });
         let resizes = iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size));
@@ -1334,7 +1399,37 @@ impl State {
         )
     }
 
+    /// Handle a message, then raise anything it asked to tell the user.
+    ///
+    /// Flushing in one place is what lets every site queue a message with a plain
+    /// assignment instead of returning a `Task`, and it's also the only point that
+    /// can guarantee a queued message is shown exactly once.
     fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        if self.alerts.is_empty() {
+            return task;
+        }
+        // Everything one message produced goes in one dialog. Two dialogs from
+        // one keystroke would be a queue the user has to clear.
+        let queued = std::mem::take(&mut self.alerts);
+        let body = queued.join("\n");
+        self.showing_alerts = queued;
+        Task::batch([task, alert_dialog(body)])
+    }
+
+    /// Queue a message to be shown as a native alert.
+    ///
+    /// Suppressed if it's already on screen or already queued — see
+    /// `showing_alerts`.
+    fn alert(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        if self.showing_alerts.contains(&msg) || self.alerts.contains(&msg) {
+            return;
+        }
+        self.alerts.push(msg);
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         // Done here rather than in `main`: the menu doesn't exist until winit has
         // finished launching the application, and this has to run on the main
         // thread — which is where iced drives `update` from.
@@ -1371,7 +1466,6 @@ impl State {
                     handle.write(format!("{cmd}\n").into_bytes());
                 }
                 shell.handle = Some(handle);
-                self.failure = None;
             }
             Message::Pty(key, pty::Event::Started { pid }) => {
                 if let Some(shell) = self.shell_by_key(key) {
@@ -1410,7 +1504,7 @@ impl State {
                 }
             }
             Message::Pty(_, pty::Event::Failed(e)) => {
-                self.failure = Some(format!("pty failed: {e}"));
+                self.alert(format!("The shell couldn't be started: {e}"));
             }
             Message::GridResized(key, rows, cols) => {
                 let Some(shell) = self.shell_by_key(key) else {
@@ -1590,10 +1684,12 @@ impl State {
                     Err(e) => sacrament_core::protocol::Response::Err(e.clone()),
                 });
                 if let Err(e) = result {
-                    self.failure = Some(e);
+                    self.alert(e);
                 }
             }
             Message::FileChanged(path) => self.reload_changed(&path),
+            Message::FileDropped(path) => self.drop_file(path),
+            Message::AlertDismissed => self.showing_alerts.clear(),
             Message::SaveAsPicked(None, _) => {}
             Message::SaveAsPicked(Some(path), then) => {
                 let hl = self.highlighter.clone();
@@ -1604,7 +1700,6 @@ impl State {
                     .ok();
                 match result {
                     Some(Ok(())) => {
-                        self.failure = None;
                         self.persist();
                         // Whatever was waiting on the save can happen now.
                         match then {
@@ -1613,8 +1708,8 @@ impl State {
                             AfterSave::Quit => return self.quit_now(),
                         }
                     }
-                    Some(Err(e)) => self.failure = Some(e.to_string()),
-                    None => self.failure = Some("buffer lock poisoned".to_string()),
+                    Some(Err(e)) => self.alert(e.to_string()),
+                    None => self.alert("Buffer lock poisoned — nothing was written."),
                 }
             }
             Message::NewBuffer => self.new_buffer(),
@@ -1629,7 +1724,7 @@ impl State {
             Message::OpenPicked(paths) => {
                 for path in paths {
                     if let Err(e) = self.open_path(&path, None, None, false) {
-                        self.failure = Some(e);
+                        self.alert(e);
                     }
                 }
             }
@@ -1648,13 +1743,17 @@ impl State {
                         self.active = i.min(self.buffers.len().saturating_sub(1));
                         return save_as_dialog_for(None, AfterSave::CloseTab(i));
                     }
-                    if let Some(buf) = self.buffers.get(i)
-                        && let Ok(mut b) = buf.lock()
-                        && let Err(e) = b.save()
-                    {
+                    // The guard has to be gone before `alert` can borrow `self`,
+                    // hence taking the error out first rather than reporting
+                    // inside the `if let` chain.
+                    let failed = self
+                        .buffers
+                        .get(i)
+                        .and_then(|buf| buf.lock().ok().and_then(|mut b| b.save().err()));
+                    if let Some(e) = failed {
                         // Don't close on a failed save — that's the case where
                         // closing would destroy the very edits being rescued.
-                        self.failure = Some(e.to_string());
+                        self.alert(e.to_string());
                         return Task::none();
                     }
                     self.discard_tab(i);
@@ -1669,11 +1768,11 @@ impl State {
                 Conflict::Cancel => {}
                 Conflict::Overwrite => {
                     let result = self.buf().lock().map(|mut b| b.save_overwriting()).ok();
-                    self.failure = match result {
-                        Some(Ok(())) => None,
-                        Some(Err(e)) => Some(e.to_string()),
-                        None => Some("buffer lock poisoned".to_string()),
-                    };
+                    match result {
+                        Some(Ok(())) => {}
+                        Some(Err(e)) => self.alert(e.to_string()),
+                        None => self.alert("Buffer lock poisoned — nothing was written."),
+                    }
                 }
                 Conflict::Reload => {
                     let rows = self.editor_rows;
@@ -1682,7 +1781,6 @@ impl State {
                         b.discard_and_reload(hl.as_deref());
                         b.ensure_cursor_visible(rows);
                     }
-                    self.failure = None;
                 }
             },
             Message::WindowResized(size) => {
@@ -1960,7 +2058,8 @@ impl State {
                 // the escape hatch, because plain Cmd+S will refuse too.
                 Err(buffer::ReloadError::Dirty) => {
                     conflict = Some(format!(
-                        "{} changed on disk — unsaved edits kept; Cmd+S to resolve",
+                        "{} changed on disk. Your unsaved edits are kept — press Cmd+S to \
+                         choose between them.",
                         b.display_name()
                     ));
                 }
@@ -1969,8 +2068,39 @@ impl State {
                 }
             }
         }
+        // One write produces several watch events, and a refused reload reports
+        // on every one of them — `alert` collapses the repeats.
         if let Some(msg) = conflict {
-            self.failure = Some(msg);
+            self.alert(msg);
+        }
+    }
+
+    /// A file dropped on the window from the Finder.
+    ///
+    /// Routed by **focus**, not by where the pointer landed: the drop event
+    /// carries no position — winit exposes none, so neither does iced — and
+    /// nothing else is available to decide with, since the OS owns the pointer
+    /// for the length of a drag and no `CursorMoved` arrives during one. v1
+    /// behaved the same way for a different reason: the emulator handed the path
+    /// over as pasted text, which went wherever focus was.
+    ///
+    /// A shell gets the escaped path, which is what every terminal puts there —
+    /// and what Claude Code reads a dropped image from. The editor opens it as a
+    /// tab, the same as `Cmd+O`: a text editor's answer to a dropped file is to
+    /// show it, and a file it can't read reports that rather than opening blank.
+    fn drop_file(&mut self, path: std::path::PathBuf) {
+        match self.focus {
+            Focus::Shell(id) => {
+                // Trailing space, so a second drop or typing afterwards doesn't
+                // run into the path.
+                let text = format!("{} ", shell_escaped(&path));
+                self.paste_to_shell(id, &text);
+            }
+            Focus::Editor => {
+                if let Err(e) = self.open_path(&path, None, None, false) {
+                    self.alert(e);
+                }
+            }
         }
     }
 
@@ -2109,7 +2239,6 @@ impl State {
     /// invisible.
     fn open_prompt(&mut self, kind: PromptKind) -> Task<Message> {
         self.focus = Focus::Editor;
-        self.search_note = None;
         let (origin, selection) = match self.buf().lock() {
             Ok(b) => ((b.cursor_row, b.cursor_col), b.selected_text()),
             Err(_) => ((0, 0), None),
@@ -2234,7 +2363,6 @@ impl State {
             if let Some(p) = &mut self.prompt {
                 p.note = None;
             }
-            self.search_note = None;
             return;
         }
         // Remembered here rather than at the call sites, so every route into a
@@ -2252,14 +2380,16 @@ impl State {
             },
             Err(_) => false,
         };
-        let note = (!found).then(|| format!("no match: {query}"));
         match &mut self.prompt {
-            // With the prompt open the note belongs next to the query.
-            Some(p) => p.note = note.map(|_| "no match".to_string()),
-            // Without one, the bottom row is the only place to say so. Naming the
-            // query matters here: there's nothing else on screen to say what was
-            // searched for.
-            None => self.search_note = note,
+            // With the prompt open the note belongs next to the query: it's the
+            // one message that arrives *while typing*, so it can't be a dialog —
+            // one would have to be dismissed between keystrokes.
+            Some(p) => p.note = (!found).then(|| "no match".to_string()),
+            // `Cmd+G` with no prompt open has nothing on screen to say what was
+            // searched for, so the alert names the query. A silent no-op there
+            // reads as a broken key.
+            None if !found => self.alert(format!("No match for “{query}”.")),
+            None => {}
         }
     }
 
@@ -2331,20 +2461,31 @@ impl State {
                     b.clear_selection();
                 }
             }
-            (Focus::Editor, GridMouse::Scroll { rows: delta }) => {
+            (
+                Focus::Editor,
+                GridMouse::Scroll {
+                    rows: dy,
+                    cols: dx,
+                },
+            ) => {
                 let (rows, cols) = (self.editor_rows, self.editor_cols);
                 if let Ok(mut b) = self.buf().lock() {
-                    // Negated: a positive wheel delta means "toward the top of
-                    // the document", which is a smaller row index.
-                    let delta = -delta as isize;
+                    // Both negated: a positive delta means "toward the start of
+                    // the content", which is a smaller index.
+                    let (dy, dx) = (-dy as isize, -dx as isize);
                     if b.view_mode() == buffer::ViewMode::Read {
-                        b.scroll_read(delta, rows, cols);
+                        b.scroll_read(dy, rows, cols);
+                        b.scroll_read_cols(dx, cols);
                     } else {
-                        b.scroll_by(delta, rows);
+                        b.scroll_by(dy, rows);
+                        b.scroll_cols(dx, cols);
                     }
                 }
             }
-            (Focus::Shell(id), GridMouse::Scroll { rows: delta }) => {
+            // A terminal reflows to its width, so it has nothing off to the
+            // side; the horizontal component is dropped rather than ignored
+            // silently in the widget, which would cost the editor its own.
+            (Focus::Shell(id), GridMouse::Scroll { rows: delta, .. }) => {
                 if let Some(t) = self.pane(id).active().map(|s| s.terminal.clone())
                     && let Ok(mut t) = t.lock()
                 {
@@ -2473,7 +2614,7 @@ impl State {
                 cursor_row: b.cursor_row,
                 cursor_col: b.cursor_col,
                 scroll_row: b.scroll_row,
-                scroll_col: 0,
+                scroll_col: b.scroll_col,
                 // Folding isn't ported yet; an empty list restores cleanly.
                 folds: b.fold_ranges(),
                 syntax_override: b.syntax_override().map(str::to_string),
@@ -2516,7 +2657,7 @@ impl State {
         // exactly how "the session is never written" stayed invisible: the write
         // was failing to even be attempted, and nothing said so.
         if let Err(e) = sacrament_core::session::save(sacrament_core::APP_GUI, &session) {
-            self.failure = Some(format!("session not saved: {e}"));
+            self.alert(format!("The session couldn't be saved: {e}"));
         }
         self.geometry_dirty = false;
     }
@@ -2537,11 +2678,11 @@ impl State {
             // Nowhere to write yet, so Cmd+S *is* save-as.
             return save_as_dialog_for(None, AfterSave::Nothing);
         }
-        // `.ok()` before assigning: a `PoisonError` holds the guard, which keeps
-        // `self` borrowed and blocks writing to `self.failure`.
+        // `.ok()` before matching: a `PoisonError` holds the guard, which keeps
+        // `self` borrowed and blocks queueing an alert.
         let result = self.buf().lock().map(|mut b| b.save()).ok();
         match result {
-            Some(Ok(())) => self.failure = None,
+            Some(Ok(())) => {}
             Some(Err(buffer::SaveError::ChangedOnDisk)) => {
                 let name = self
                     .buf()
@@ -2575,8 +2716,8 @@ impl State {
                     Message::ConflictAnswer,
                 );
             }
-            Some(Err(e)) => self.failure = Some(e.to_string()),
-            None => self.failure = Some("buffer lock poisoned".to_string()),
+            Some(Err(e)) => self.alert(e.to_string()),
+            None => self.alert("Buffer lock poisoned — nothing was written."),
         }
         Task::none()
     }
@@ -2667,7 +2808,10 @@ impl State {
             }
             _ => {}
         }
-        b.ensure_cursor_visible(self.editor_rows);
+        // Horizontal too: with wrapping off, typing past the right edge has to
+        // bring the caret back into view or you're editing something you can't
+        // see.
+        b.ensure_cursor_visible_in(self.editor_rows, self.editor_cols);
     }
 
     /// One tab marker — the dirty dot or the unreviewed diamond.
@@ -3029,20 +3173,20 @@ impl State {
                 ..container::Style::default()
             });
 
-        // No permanent status bar — same rule as v1. The bottom row exists only
-        // when there's something to put in it: an open prompt, or a problem worth
-        // surfacing (a font family that didn't resolve, a PTY that failed).
-        // Throughput/memory numbers are diagnostics, not UI: they go to stderr
-        // under SACRAMENT_METRICS, not into the window.
-        match self.bottom_row() {
+        // No status bar of any kind — the window is the grid, edge to edge. The
+        // bottom row appears only while a prompt is open, and a prompt is an
+        // *input*, not a message: everything the app has to say goes through
+        // `alert` and a native dialog, which can't be missed and can't be left
+        // sitting on screen. Throughput/memory numbers aren't UI either — they go
+        // to stderr under SACRAMENT_METRICS.
+        match self.prompt_row() {
             Some(rowel) => column![grid, rowel].into(),
             None => grid.into(),
         }
     }
 
-    /// The bottom row: the prompt if one is open, otherwise a problem, otherwise
-    /// nothing. The prompt wins because it's the thing being interacted with.
-    fn bottom_row(&self) -> Option<Element<'_, Message>> {
+    /// The bottom row, which exists only while a prompt is open.
+    fn prompt_row(&self) -> Option<Element<'_, Message>> {
         let foreground = self.palette.foreground;
         let dim = self.palette.dim();
         let background = self.palette.background;
@@ -3094,24 +3238,7 @@ impl State {
                     .into(),
             );
         }
-
-        self.search_note
-            .clone()
-            .or_else(|| self.problem())
-            .map(|msg| {
-                container(text(msg).size(self.font.size).font(self.font.font).color(dim))
-                    .padding([2, 6])
-                    .width(Length::Fill)
-                    .into()
-            })
-    }
-
-    /// The one thing worth stealing a row for, if any.
-    fn problem(&self) -> Option<String> {
-        if let Some(w) = &self.font_warning {
-            return Some(w.clone());
-        }
-        self.failure.clone()
+        None
     }
 }
 
@@ -3163,7 +3290,33 @@ fn keymap(
             Some(out)
         }
         Key::Named(named) => {
+            // Word-wise editing, checked before the plain arrows because those
+            // ignore modifiers. `Esc`-prefixed `b`/`f`/`DEL` is the macOS
+            // terminal convention — iTerm2's "natural text editing" preset and
+            // Ghostty's defaults both send exactly this, and it's what zsh and
+            // readline already bind to backward-word / forward-word /
+            // backward-kill-word. The CSI form (`\x1b[1;3D`) is xterm's and
+            // needs the shell to have bound it.
+            if mods.alt() {
+                let seq: Option<&[u8]> = match named {
+                    Named::ArrowLeft => Some(b"\x1bb"),
+                    Named::ArrowRight => Some(b"\x1bf"),
+                    Named::Backspace => Some(b"\x1b\x7f"),
+                    _ => None,
+                };
+                if let Some(seq) = seq {
+                    return Some(seq.to_vec());
+                }
+            }
             let seq: &[u8] = match named {
+                // Shift+Enter is a newline rather than a submit, which is what a
+                // TUI composing multi-line input wants. Sent as `\n` (what
+                // `Ctrl+J` produces) rather than the `\x1b\r` that Claude Code's
+                // own `/terminal-setup` installs elsewhere, because `\n` is
+                // *also* `accept-line` in zsh and readline — so a plain shell
+                // prompt still submits on Shift+Enter, while `\x1b\r` there is
+                // unbound and would do nothing.
+                Named::Enter if mods.shift() => b"\n",
                 Named::Enter => b"\r",
                 Named::Tab => b"\t",
                 Named::Backspace => b"\x7f",
@@ -3343,5 +3496,63 @@ mod key_tests {
     #[test]
     fn plain_typing_still_reaches_the_shell() {
         assert_eq!(keymap(&ch("k"), Modifiers::empty(), Some("k")), Some(b"k".to_vec()));
+    }
+
+    fn named(n: iced::keyboard::key::Named) -> Key {
+        Key::Named(n)
+    }
+
+    #[test]
+    fn shift_enter_is_a_newline_and_plain_enter_still_submits() {
+        use iced::keyboard::key::Named;
+        assert_eq!(
+            keymap(&named(Named::Enter), Modifiers::SHIFT, None),
+            Some(b"\n".to_vec())
+        );
+        assert_eq!(
+            keymap(&named(Named::Enter), Modifiers::empty(), None),
+            Some(b"\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn option_arrows_move_by_word_in_the_shell() {
+        use iced::keyboard::key::Named;
+        // Esc+b / Esc+f, the convention zsh and readline already bind. Without
+        // the modifier these must stay the bare cursor keys.
+        assert_eq!(
+            keymap(&named(Named::ArrowLeft), Modifiers::ALT, None),
+            Some(b"\x1bb".to_vec())
+        );
+        assert_eq!(
+            keymap(&named(Named::ArrowRight), Modifiers::ALT, None),
+            Some(b"\x1bf".to_vec())
+        );
+        assert_eq!(
+            keymap(&named(Named::Backspace), Modifiers::ALT, None),
+            Some(b"\x1b\x7f".to_vec())
+        );
+        assert_eq!(
+            keymap(&named(Named::ArrowLeft), Modifiers::empty(), None),
+            Some(b"\x1b[D".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_dropped_path_is_escaped_for_the_shell() {
+        use std::path::Path;
+        assert_eq!(
+            shell_escaped(Path::new("/tmp/a b.png")),
+            "/tmp/a\\ b.png",
+            "a space has to be escaped or the shell reads two words"
+        );
+        assert_eq!(shell_escaped(Path::new("/tmp/plain.png")), "/tmp/plain.png");
+        assert_eq!(
+            shell_escaped(Path::new("/tmp/it's $HOME(1).png")),
+            "/tmp/it\\'s\\ \\$HOME\\(1\\).png"
+        );
+        // Non-ASCII letters aren't shell-special, so they pass through as
+        // themselves rather than being backslashed into noise.
+        assert_eq!(shell_escaped(Path::new("/tmp/café.png")), "/tmp/café.png");
     }
 }

@@ -49,8 +49,9 @@ pub enum GridMouse {
     Release,
     /// Positive scrolls toward earlier content (wheel up), matching how both a
     /// buffer and a terminal scrollback are indexed.
-    /// Whole rows to scroll, already converted from whatever the device sent.
-    Scroll { rows: i32 },
+    /// Whole rows and columns to scroll, already converted from whatever the
+    /// device sent.
+    Scroll { rows: i32, cols: i32 },
 }
 
 #[derive(Default)]
@@ -66,6 +67,9 @@ struct State {
     dragging: bool,
     /// For double-click detection.
     last_press: Option<(Instant, usize, usize)>,
+    /// Sub-column scroll carried between events, for the same reason as
+    /// `scroll_carry`: a trackpad's sideways movement is fractions of a column.
+    scroll_carry_x: f32,
     /// Sub-row scroll carried between events.
     ///
     /// Without it, a trackpad never scrolls: it sends a few *pixels* at a time,
@@ -110,20 +114,66 @@ impl<'a, Message> GridView<'a, Message> {
         self.on_mouse = Some(Box::new(f));
         self
     }
+
+    /// Where this character's glyph has to come from.
+    fn glyphs_for(&self, c: char) -> Glyphs {
+        if self.font.can_draw(c) {
+            return Glyphs::Configured;
+        }
+        match self.font.fallback_family(c) {
+            Some(name) => Glyphs::Family(name),
+            None => Glyphs::System,
+        }
+    }
+
+    /// The font and shaping mode a run is drawn with.
+    ///
+    /// `Advanced` is the only shaping that consults system fonts, and it's the
+    /// expensive one — so it's reserved for the cells nothing else can draw.
+    fn draw_font(&self, glyphs: Glyphs, bold: bool, italic: bool) -> (iced::Font, text::Shaping) {
+        let font = self.font.variant(bold, italic);
+        match glyphs {
+            Glyphs::Configured => (font, text::Shaping::Basic),
+            Glyphs::Family(name) => (
+                iced::Font {
+                    family: iced::font::Family::Name(name),
+                    ..font
+                },
+                text::Shaping::Basic,
+            ),
+            Glyphs::System => (font, text::Shaping::Advanced),
+        }
+    }
 }
 
 /// Rows moved per notch of a stepped mouse wheel. Pixel deltas from a trackpad
 /// are *not* scaled by this — they already carry a real distance.
 const ROWS_PER_NOTCH: f32 = 3.0;
 
-/// One coalesced run of cells sharing color and emphasis.
+/// Where a cell's glyph comes from.
+///
+/// Only [`Glyphs::Configured`] batches: the other two are per-cell, because a
+/// substituted face's advance width isn't ours and a multi-cell run drawn in one
+/// would drift progressively out of the grid.
+#[derive(Clone, Copy, PartialEq)]
+enum Glyphs {
+    /// The configured font has the character.
+    Configured,
+    /// It doesn't, but a monochrome family in the fallback chain does. Drawn with
+    /// `Shaping::Basic` in that family — deliberately *not* left to cosmic-text's
+    /// own fallback, which would reach `Apple Color Emoji` and turn a record
+    /// button or a warning sign into a cartoon. See `font::Fallback`.
+    Family(&'static str),
+    /// Nothing in the chain has it, so cosmic-text picks. This is the path a
+    /// genuine emoji takes — no text font on macOS has `🔴` — and the one for
+    /// scripts the chain doesn't reach.
+    System,
+}
+
+/// One coalesced run of cells sharing color, emphasis and glyph source.
 struct Run {
     text: String,
-    /// False when the font lacks these glyphs, so the run needs fallback
-    /// shaping. Runs never mix the two: fallback runs are always a single cell,
-    /// because a fallback font's advance width isn't ours and a multi-cell run
-    /// would drift out of the grid.
-    drawable: bool,
+    glyphs: Glyphs,
     col: usize,
     fg: Color,
     bold: bool,
@@ -260,17 +310,25 @@ where
                 // finger actually travelled, which is already a real measurement
                 // and only needs converting to rows. Multiplying that by the
                 // notch factor as well made trackpad scrolling fly.
-                let rows = match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => *y * ROWS_PER_NOTCH,
-                    mouse::ScrollDelta::Pixels { y, .. } => y / ch,
+                let (rows, columns) = match delta {
+                    mouse::ScrollDelta::Lines { x, y } => {
+                        (*y * ROWS_PER_NOTCH, *x * ROWS_PER_NOTCH)
+                    }
+                    mouse::ScrollDelta::Pixels { x, y } => (y / ch, x / cw),
                 };
                 // Accumulate the fraction rather than discarding it, so small
                 // movements add up instead of rounding to nothing.
                 state.scroll_carry += rows;
+                state.scroll_carry_x += columns;
                 let whole = state.scroll_carry.trunc();
+                let whole_x = state.scroll_carry_x.trunc();
                 state.scroll_carry -= whole;
-                if whole != 0.0 {
-                    shell.publish(on_mouse(GridMouse::Scroll { rows: whole as i32 }));
+                state.scroll_carry_x -= whole_x;
+                if whole != 0.0 || whole_x != 0.0 {
+                    shell.publish(on_mouse(GridMouse::Scroll {
+                        rows: whole as i32,
+                        cols: whole_x as i32,
+                    }));
                 }
                 // Captured even when the carry hasn't reached a whole row yet:
                 // the event was for this pane either way.
@@ -347,11 +405,11 @@ where
                 }
                 // A glyph the font doesn't have would draw as nothing under
                 // `Shaping::Basic` — no fallback is the price of the cheap path.
-                // Those cells get their own run and `Advanced` shaping below.
-                let drawable = self.font.can_draw(cell.c);
-                let extends = drawable
+                // Those cells get their own run and a substitute below.
+                let glyphs = self.glyphs_for(cell.c);
+                let extends = glyphs == Glyphs::Configured
                     && runs.last().is_some_and(|r| {
-                        r.drawable
+                        r.glyphs == Glyphs::Configured
                             && r.fg == cell.fg
                             && r.bold == cell.bold
                             && r.italic == cell.italic
@@ -363,7 +421,7 @@ where
                 } else {
                     runs.push(Run {
                         text: cell.c.to_string(),
-                        drawable,
+                        glyphs,
                         col,
                         fg: cell.fg,
                         bold: cell.bold,
@@ -372,7 +430,8 @@ where
                 }
             }
             for run in runs {
-                let font = self.font.variant(run.bold, run.italic);
+                let (font, shaping) =
+                    self.draw_font(run.glyphs, run.bold, run.italic);
                 let width = run.text.chars().count() as f32 * cw;
                 renderer.fill_text(
                     text::Text {
@@ -383,14 +442,7 @@ where
                         font: font.into(),
                         align_x: text::Alignment::Left,
                         align_y: alignment::Vertical::Top,
-                        shaping: if run.drawable {
-                            text::Shaping::Basic
-                        } else {
-                            // Advanced is the only shaping that consults system
-                            // fonts. It's the expensive one, which is why it's
-                            // scoped to the cells that would otherwise be blank.
-                            text::Shaping::Advanced
-                        },
+                        shaping,
                         wrapping: text::Wrapping::None,
                     },
                     Point::new(bounds.x + run.col as f32 * cw, y),
@@ -426,20 +478,18 @@ where
             if let Some(cell) = grid.get(crow).and_then(|r| r.get(ccol))
                 && !cell.is_blank()
             {
+                let (font, shaping) =
+                    self.draw_font(self.glyphs_for(cell.c), cell.bold, cell.italic);
                 renderer.fill_text(
                     text::Text {
                         content: cell.c.to_string(),
                         bounds: Size::new(cw, ch),
                         size: self.font.size.into(),
                         line_height: text::LineHeight::Relative(self.font.line_height),
-                        font: self.font.variant(cell.bold, cell.italic).into(),
+                        font: font.into(),
                         align_x: text::Alignment::Left,
                         align_y: alignment::Vertical::Top,
-                        shaping: if self.font.can_draw(cell.c) {
-                            text::Shaping::Basic
-                        } else {
-                            text::Shaping::Advanced
-                        },
+                        shaping,
                         wrapping: text::Wrapping::None,
                     },
                     Point::new(x, y),

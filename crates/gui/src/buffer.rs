@@ -113,6 +113,12 @@ pub struct Buffer {
     pub scroll_row: usize,
     /// Which wrap segment of `scroll_row` sits at the top of the viewport.
     pub scroll_seg: usize,
+    /// First visual column drawn, for when wrapping is off.
+    ///
+    /// Held in *visual* columns rather than character indices, because that's
+    /// what the viewport measures: a tab is one character but several columns,
+    /// and scrolling has to move by what's on screen.
+    pub scroll_col: usize,
     pub cursor_row: usize,
     /// Char index within the cursor's line — chars, not bytes, so it indexes
     /// the same units as everything else here.
@@ -158,6 +164,9 @@ pub struct Buffer {
     /// the field made its meaning depend on the mode.
     read_scroll_row: usize,
     read_scroll_seg: usize,
+    /// Read mode's horizontal scroll. Only tables can exceed the pane, since
+    /// everything else wraps.
+    read_scroll_col: usize,
     /// Touched by an external tool and not looked at since. Set by a `--review`
     /// open, cleared the moment the tab is made active. Not persisted — v1
     /// doesn't either, and "unreviewed" is about this sitting, not the file.
@@ -175,6 +184,7 @@ impl Buffer {
             path: None,
             scroll_row: 0,
             scroll_seg: 0,
+            scroll_col: 0,
             cursor_row: 0,
             cursor_col: 0,
             wrap_width: 0,
@@ -195,6 +205,7 @@ impl Buffer {
             rendered: None,
             read_scroll_row: 0,
             read_scroll_seg: 0,
+            read_scroll_col: 0,
             unreviewed: false,
             line_state_before: vec![None],
             highlights: vec![None],
@@ -217,6 +228,7 @@ impl Buffer {
             path: Some(path.to_path_buf()),
             scroll_row: 0,
             scroll_seg: 0,
+            scroll_col: 0,
             cursor_row: 0,
             cursor_col: 0,
             wrap_width: 0,
@@ -237,6 +249,7 @@ impl Buffer {
             rendered: None,
             read_scroll_row: 0,
             read_scroll_seg: 0,
+            read_scroll_col: 0,
             unreviewed: false,
             line_state_before: vec![None; n],
             highlights: vec![None; n],
@@ -463,9 +476,10 @@ impl Buffer {
             return (self.cursor_row, self.cursor_col);
         };
         let line = self.lines.get(vr.line).map(String::as_str).unwrap_or("");
-        // Screen column minus the row's hanging indent gives the column *within*
-        // the segment; clicking inside the indent lands on the segment start.
-        let target = col.saturating_sub(vr.indent);
+        // Pane column plus the horizontal scroll gives the column in the *line*;
+        // minus the row's hanging indent gives the column within the segment, so
+        // clicking inside the indent lands on the segment start.
+        let target = (col + self.scroll_col).saturating_sub(vr.indent);
         let c = text::col_at_vis_in_segment(line, vr.start, vr.end, target, self.tab_width);
         (vr.line, c)
     }
@@ -1645,6 +1659,7 @@ impl Buffer {
         };
         self.read_scroll_row = 0;
         self.read_scroll_seg = 0;
+        self.read_scroll_col = 0;
         self.clear_selection();
         true
     }
@@ -1660,6 +1675,20 @@ impl Buffer {
 
     pub fn read_scroll(&self) -> (usize, usize) {
         (self.read_scroll_row, self.read_scroll_seg)
+    }
+
+    pub fn read_scroll_col(&self) -> usize {
+        self.read_scroll_col
+    }
+
+    /// Scroll the rendered view sideways, bounded by the widest unwrappable row.
+    pub fn scroll_read_cols(&mut self, delta: isize, viewport_cols: usize) {
+        let cols = viewport_cols.max(1);
+        let Some(rendered) = &self.rendered else {
+            return;
+        };
+        let max = crate::read::widest_row(&rendered.lines, cols).saturating_sub(cols);
+        self.read_scroll_col = self.read_scroll_col.saturating_add_signed(delta).min(max);
     }
 
     /// Render if the text or the width has changed since last time.
@@ -1818,12 +1847,66 @@ impl Buffer {
         self.cursor_col = self.cursor_col.min(self.line_len(self.cursor_row));
     }
 
+    /// Scroll sideways. A no-op while wrapping is on, since nothing is off-screen.
+    pub fn scroll_cols(&mut self, delta: isize, viewport_cols: usize) {
+        if self.wrap_width != 0 {
+            self.scroll_col = 0;
+            return;
+        }
+        let max = self
+            .widest_visual_column()
+            .saturating_sub(viewport_cols.max(1) / 2);
+        self.scroll_col = self.scroll_col.saturating_add_signed(delta).min(max);
+    }
+
+    /// Widest line in the buffer, in visual columns.
+    ///
+    /// Bounds how far right scrolling can go. Measured across the whole buffer
+    /// rather than the visible rows so the limit doesn't shift as you scroll
+    /// down — a moving stop reads as the view fighting you.
+    fn widest_visual_column(&self) -> usize {
+        self.lines
+            .iter()
+            .map(|l| text::char_idx_to_vis_col(l, l.chars().count(), self.tab_width))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Bring the caret's column into view. Paired with `ensure_cursor_visible`,
+    /// which handles rows.
+    fn ensure_column_visible(&mut self, viewport_cols: usize) {
+        if self.wrap_width != 0 {
+            self.scroll_col = 0;
+            return;
+        }
+        let cols = viewport_cols.max(1);
+        let caret = self.screen_col_of(self.cursor_row, self.cursor_col);
+        if caret < self.scroll_col {
+            self.scroll_col = caret;
+        } else if caret >= self.scroll_col + cols {
+            // `+ 1` so the caret sits *inside* the last column rather than half
+            // off the edge of it.
+            self.scroll_col = caret + 1 - cols;
+        }
+    }
+
     /// Scroll the minimum needed to keep the cursor on screen.
     ///
     /// Works in screen rows because that's what wrapping makes meaningful: a
     /// cursor on the same *line* as the viewport top can still be several rows
     /// below its bottom.
     pub fn ensure_cursor_visible(&mut self, viewport_rows: usize) {
+        self.ensure_cursor_visible_in(viewport_rows, 0);
+    }
+
+    /// As `ensure_cursor_visible`, but also bringing the column into view.
+    ///
+    /// Separate entry point because most callers only move vertically and don't
+    /// know the viewport width; passing `0` skips the horizontal half.
+    pub fn ensure_cursor_visible_in(&mut self, viewport_rows: usize, viewport_cols: usize) {
+        if viewport_cols > 0 {
+            self.ensure_column_visible(viewport_cols);
+        }
         let rows = viewport_rows.max(1);
         // Above the viewport: pull the top up to the cursor's own segment.
         let cursor_seg = self.segment_of(self.cursor_row, self.cursor_col);
@@ -2162,17 +2245,21 @@ impl GridSource for BufferSource {
             // Walk chars with their byte offsets so highlight spans (which are
             // byte-ranged) can be matched without a second pass.
             let mut span_cursor = 0usize;
-            // Start past the hanging indent, emitting it as blanks so every
-            // downstream column lines up with what's drawn.
-            let mut vis = vr.indent.min(cols);
-            for _ in 0..vis {
+            // `vis` counts columns of the *line*; `screen` counts columns of the
+            // pane. They differ by the horizontal scroll, which is why the two
+            // are tracked separately rather than one being derived from the
+            // other at each use.
+            let shift = buffer.scroll_col;
+            let mut vis = vr.indent;
+            let mut screen = vis.saturating_sub(shift).min(cols);
+            for _ in 0..screen {
                 dest.push(Cell::blank(fg, bg));
             }
             for (col, (byte_offset, c)) in text.char_indices().enumerate() {
                 if col < vr.start {
                     continue;
                 }
-                if col >= vr.end || vis >= cols {
+                if col >= vr.end || screen >= cols {
                     break;
                 }
                 let width = text::char_display_width(c, vis, buffer.tab_width);
@@ -2207,14 +2294,24 @@ impl GridSource for BufferSource {
                 // Zero-width characters occupy no cell; wide ones occupy their
                 // extra columns as blanks carrying the same styling.
                 for i in 0..width {
-                    if vis + i >= cols {
+                    // Columns scrolled off the left are skipped rather than
+                    // drawn and clipped, so a tab straddling the edge keeps the
+                    // part of itself that's still on screen.
+                    if vis + i < shift {
+                        continue;
+                    }
+                    if screen >= cols {
                         break;
                     }
                     let mut c = cell;
-                    if i > 0 {
+                    // The glyph belongs to the character's first column; the
+                    // rest are padding, as is a first column scrolled halfway
+                    // off.
+                    if i > 0 || vis < shift {
                         c.c = ' ';
                     }
                     dest.push(c);
+                    screen += 1;
                 }
                 vis += width;
             }
@@ -3928,3 +4025,72 @@ mod word_and_find_tests {
     }
 }
 
+
+#[cfg(test)]
+mod hscroll_tests {
+    use super::*;
+
+    fn wide() -> Buffer {
+        let mut b = Buffer::empty();
+        b.lines = vec![
+            "0123456789abcdefghij".to_string(),
+            "short".to_string(),
+        ];
+        b.line_state_before = vec![None; 2];
+        b.highlights = vec![None; 2];
+        b.wrap_width = 0; // wrapping off — the only time this matters
+        b
+    }
+
+    #[test]
+    fn scrolling_right_is_bounded_by_the_widest_line() {
+        let mut b = wide();
+        b.scroll_cols(1000, 10);
+        assert!(b.scroll_col <= 20, "can't scroll past the content");
+        assert!(b.scroll_col > 0, "but can scroll");
+    }
+
+    #[test]
+    fn wrapping_on_pins_the_horizontal_scroll_at_zero() {
+        // Nothing is off-screen when every line wraps, so a sideways gesture
+        // must not shift the view.
+        let mut b = wide();
+        b.wrap_width = 10;
+        b.scroll_cols(5, 10);
+        assert_eq!(b.scroll_col, 0);
+    }
+
+    #[test]
+    fn a_click_lands_on_the_character_under_it_after_scrolling() {
+        // The hit-test has to add the scroll back, or clicking selects a
+        // character several columns to the left of the pointer.
+        let mut b = wide();
+        b.scroll_col = 6;
+        let (row, col) = b.screen_to_doc(0, 0, 4);
+        assert_eq!(row, 0);
+        assert_eq!(col, 6, "pane column 0 is line column 6");
+        let (_, col) = b.screen_to_doc(0, 3, 4);
+        assert_eq!(col, 9);
+    }
+
+    #[test]
+    fn the_caret_is_pulled_back_into_view_when_it_leaves_the_right_edge() {
+        let mut b = wide();
+        b.cursor_row = 0;
+        b.cursor_col = 19;
+        b.ensure_cursor_visible_in(4, 10);
+        assert!(b.scroll_col > 0, "view followed the caret");
+        let caret = b.screen_col_of(0, 19);
+        assert!(caret >= b.scroll_col && caret < b.scroll_col + 10, "caret on screen");
+    }
+
+    #[test]
+    fn moving_back_left_brings_the_view_with_it() {
+        let mut b = wide();
+        b.cursor_col = 19;
+        b.ensure_cursor_visible_in(4, 10);
+        b.cursor_col = 0;
+        b.ensure_cursor_visible_in(4, 10);
+        assert_eq!(b.scroll_col, 0, "back to the margin");
+    }
+}

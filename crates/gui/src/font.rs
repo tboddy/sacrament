@@ -31,6 +31,29 @@
 //! and record which characters it can actually draw. `GridView` consults it per
 //! cell and shapes the few uncovered ones with `Shaping::Advanced`, which *does*
 //! fall back to system fonts. Cheap path stays cheap; missing glyphs appear.
+//!
+//! ## Why fallback can't simply be left to `Shaping::Advanced`
+//!
+//! Because that's where the emoji come from. cosmic-text's macOS fallback chain
+//! is `.SF NS`, `Menlo`, **`Apple Color Emoji`**, `Geneva`, `Arial Unicode MS`,
+//! walked in order — so any character the first two lack and the emoji font has
+//! is drawn as a colour emoji. Claude Code's bullet is `⏺` (U+23FA, a *record
+//! button* whose Unicode default presentation happens to be emoji), Menlo
+//! doesn't have it, and the result is a cartoon dot in the middle of terminal
+//! output.
+//!
+//! [`Fallback`] takes that decision back: a curated chain of monochrome families
+//! is consulted ourselves, and the first one that has the glyph draws it under
+//! `Shaping::Basic` — no guessing, no colour. Only when *nothing* in the chain
+//! has the character does the cell go to `Shaping::Advanced`, which is the case
+//! that genuinely is an emoji (`🔴` exists in no text font on macOS) or a script
+//! the chain doesn't reach. So a pasted emoji still renders as one, and a symbol
+//! that merely has emoji *presentation* renders as text, in the theme's colours,
+//! at the grid's own width.
+//!
+//! The colour test is structural, not a name list: a face carrying `COLR`,
+//! `CBDT`, `sbix` or `SVG` is refused. Adding an emoji family to the chain
+//! therefore can't reintroduce emoji.
 
 use std::collections::HashSet;
 
@@ -93,6 +116,104 @@ impl Coverage {
     }
 }
 
+/// Families consulted, in order, for a character the configured font lacks.
+///
+/// Monospaced first, so a glyph that has to come from elsewhere still matches the
+/// grid's width where possible; then the symbol faces that carry the technical
+/// and media-control codepoints TUIs reach for (`⎿`, `⧉`, `⏺`); then broad text
+/// coverage; then CJK. Every entry is a monochrome face — and the search verifies
+/// that rather than trusting this list.
+///
+/// Off macOS the chain is the common Linux set. A name that isn't installed is
+/// simply skipped, and an empty chain means every uncovered character goes to
+/// `Shaping::Advanced` — the behavior before any of this existed.
+#[cfg(target_os = "macos")]
+const FALLBACK_CHAIN: &[&str] = &[
+    "Menlo",
+    "Apple Symbols",
+    "STIX Two Math",
+    "Arial Unicode MS",
+    "Hiragino Sans",
+    "PingFang SC",
+    "Apple SD Gothic Neo",
+];
+#[cfg(not(target_os = "macos"))]
+const FALLBACK_CHAIN: &[&str] = &[
+    "DejaVu Sans Mono",
+    "Noto Sans Symbols 2",
+    "DejaVu Sans",
+    "Noto Sans",
+    "Noto Sans CJK SC",
+];
+
+/// The monochrome fallback chain, resolved against the installed fonts.
+///
+/// Holds the font database because the lookups are lazy: resolving one character
+/// means reading a font file, and reading every chain member up front would mean
+/// paying for the 20 MB CJK faces at startup to answer a question nothing has
+/// asked yet. Each character is resolved once and cached.
+pub struct Fallback {
+    db: fontdb::Database,
+    /// Chain entries that resolved on this machine, in consultation order.
+    chain: Vec<(&'static str, fontdb::ID)>,
+    cache: std::sync::Mutex<std::collections::HashMap<char, Option<&'static str>>>,
+}
+
+impl std::fmt::Debug for Fallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The database has no useful `Debug`, and printing it would be pages of
+        // face records.
+        f.debug_struct("Fallback")
+            .field("chain", &self.chain.iter().map(|(n, _)| *n).collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl Fallback {
+    /// Which chain family should draw this character, if any.
+    ///
+    /// `None` means "not in the chain" — the caller should hand the cell to
+    /// `Shaping::Advanced`, which is where genuine emoji and unreached scripts
+    /// get resolved.
+    pub fn family_for(&self, c: char) -> Option<&'static str> {
+        if let Ok(cache) = self.cache.lock()
+            && let Some(answer) = cache.get(&c)
+        {
+            return *answer;
+        }
+        let answer = self
+            .chain
+            .iter()
+            .find(|(_, id)| self.face_draws(*id, c))
+            .map(|(name, _)| *name);
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(c, answer);
+        }
+        answer
+    }
+
+    /// Whether this face can draw the character *in monochrome*.
+    fn face_draws(&self, id: fontdb::ID, c: char) -> bool {
+        self.db
+            .with_face_data(id, |data, index| {
+                let Ok(face) = ttf_parser::Face::parse(data, index) else {
+                    return false;
+                };
+                // A colour table is what makes a font an emoji font, and it's a
+                // far better test than matching on the family name: it can't be
+                // fooled by a rename and it doesn't need a list to be kept up to
+                // date.
+                let tables = face.tables();
+                let colour = tables.colr.is_some()
+                    || tables.cbdt.is_some()
+                    || tables.sbix.is_some()
+                    || tables.svg.is_some();
+                !colour && face.glyph_index(c).is_some()
+            })
+            .unwrap_or(false)
+    }
+}
+
 /// Font settings resolved into renderer-native values, once at startup.
 #[derive(Clone, Copy, Debug)]
 pub struct FontSpec {
@@ -106,6 +227,10 @@ pub struct FontSpec {
     /// `&'static` keeps `FontSpec` `Copy`; it's leaked once at startup for the
     /// same reason the family name is (see the module docs).
     pub coverage: Option<&'static Coverage>,
+    /// Where a character the font lacks comes from instead. `None` disables the
+    /// monochrome chain, leaving cosmic-text's own fallback — which is what
+    /// produces the emoji this exists to prevent.
+    pub fallback: Option<&'static Fallback>,
 }
 
 impl FontSpec {
@@ -127,9 +252,23 @@ impl FontSpec {
         }
     }
 
+    /// Which family draws a character this font lacks, if the chain has one.
+    ///
+    /// Only meaningful for characters `can_draw` refused; asking about a covered
+    /// one would read font files to answer a question already settled.
+    pub fn fallback_family(&self, c: char) -> Option<&'static str> {
+        self.fallback?.family_for(c)
+    }
+
     /// Attach coverage read from the system font database.
     pub fn with_coverage(mut self, coverage: Option<&'static Coverage>) -> Self {
         self.coverage = coverage;
+        self
+    }
+
+    /// Attach the monochrome fallback chain.
+    pub fn with_fallback(mut self, fallback: Option<&'static Fallback>) -> Self {
+        self.fallback = fallback;
         self
     }
 
@@ -165,6 +304,7 @@ pub fn resolve(cfg: &FontConfig, available: &[String]) -> (FontSpec, Option<Stri
             size: cfg.size,
             line_height: cfg.line_height,
             coverage: None,
+            fallback: None,
         },
         warning,
     )
@@ -245,6 +385,28 @@ impl SystemFonts {
             // treat it as unknown so we don't route every cell through fallback.
             (!cov.is_empty()).then_some(cov)
         })?
+    }
+
+    /// Resolve [`FALLBACK_CHAIN`] against what's installed.
+    ///
+    /// Consumes `self` because the database has to outlive startup: the chain's
+    /// per-character lookups happen later, at draw time.
+    pub fn into_fallback(self) -> Fallback {
+        let chain = FALLBACK_CHAIN
+            .iter()
+            .filter_map(|name| {
+                let id = self.db.query(&fontdb::Query {
+                    families: &[fontdb::Family::Name(name)],
+                    ..Default::default()
+                })?;
+                Some((*name, id))
+            })
+            .collect();
+        Fallback {
+            db: self.db,
+            chain,
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 }
 
@@ -366,6 +528,35 @@ mod system_tests {
         let families = super::SystemFonts::load().families();
         assert!(!families.is_empty(), "no system fonts found");
         assert!(families.iter().any(|f| f.eq_ignore_ascii_case("Menlo")));
+    }
+
+    /// The chain resolves a character the configured font may lack, and refuses
+    /// to answer with a colour font.
+    ///
+    /// Both halves matter. `╰` (U+2570) is a rounded box corner Envy Code R
+    /// doesn't have and Menlo does, so it must resolve — that's the path that
+    /// keeps a TUI's frame drawn in monochrome at the grid's own width. `🔴` is a
+    /// genuine emoji that exists in *no* text font on macOS, so it must resolve
+    /// to nothing and be left to system shaping. A `Some` there would mean the
+    /// colour-table test had stopped working, which is exactly the regression that
+    /// puts cartoon dots back in the middle of shell output.
+    #[test]
+    fn the_fallback_chain_is_monochrome_and_skips_genuine_emoji() {
+        let fallback = super::SystemFonts::load().into_fallback();
+        assert_eq!(
+            fallback.family_for('\u{2570}'),
+            Some("Menlo"),
+            "the first chain family with the glyph should answer"
+        );
+        assert_eq!(
+            fallback.family_for('\u{1F534}'),
+            None,
+            "a colour-only glyph must not be answered by a colour font"
+        );
+        // Cached answers have to match the uncached ones — the cache is keyed by
+        // character and consulted before the search.
+        assert_eq!(fallback.family_for('\u{2570}'), Some("Menlo"));
+        assert_eq!(fallback.family_for('\u{1F534}'), None);
     }
 
     /// Keeps the `cmap` parse honest. If it silently returned `None` forever,

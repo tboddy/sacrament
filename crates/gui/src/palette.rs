@@ -129,10 +129,10 @@ impl Palette {
         }
     }
 
-    /// Derive iced's own theme from ours, so app chrome (the status strip now,
-    /// tab bars and splitters later) sits in the same palette as the grid
-    /// instead of defaulting to iced's light theme. This is the "chrome derives
-    /// from the 16 slots" choice — one coherent system rather than two.
+    /// Derive iced's own theme from ours, so app chrome (tab strips, the prompt
+    /// row, splitters) sits in the same palette as the grid instead of defaulting
+    /// to iced's light theme. This is the "chrome derives from the 16 slots"
+    /// choice — one coherent system rather than two.
     pub fn iced_theme(&self) -> iced::Theme {
         iced::Theme::custom(
             "sacrament".to_string(),

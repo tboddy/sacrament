@@ -153,8 +153,31 @@ fn run(
         })
         .context("openpty failed")?;
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let mut cmd = CommandBuilder::new(&shell);
+    // A **login** shell, which is what every terminal emulator starts and what
+    // `new_default_prog` gives: it resolves `$SHELL` (falling back to the password
+    // database rather than to `/bin/sh`) and sets argv0 to `-zsh`, the leading
+    // dash being how a shell knows it's a login shell.
+    //
+    // `CommandBuilder::new(shell)` was here and it's the reason `docker`, `brew`
+    // and anything else outside `/usr/bin` couldn't be found. Without the dash,
+    // zsh reads `~/.zshrc` and nothing else — no `/etc/zprofile`, so
+    // `/usr/libexec/path_helper` never runs and `/etc/paths.d` is never read, and
+    // no `~/.zprofile`, which is where `brew shellenv` and most credential
+    // helpers are set up. It went unnoticed because it isn't visible when the app
+    // is started *from* a terminal: the full PATH is inherited from the shell
+    // that launched it, so only a Dock launch — where the parent environment is
+    // launchd's `/usr/bin:/bin:/usr/sbin:/sbin` — shows what's missing. That's
+    // also why v1 never had the bug: it only ever ran inside an emulator.
+    //
+    // Measured, launched from the Dock: the non-login PATH ends
+    // `…/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin` — no `/usr/local/bin`,
+    // where Docker Desktop puts both its CLI and
+    // `docker-credential-osxkeychain`, and no `/opt/local/bin`. The login shell
+    // has all of them.
+    //
+    // Note `new_default_prog` panics if `arg` is called on it — it's the "just run
+    // the user's shell" constructor, and there are no arguments to add.
+    let mut cmd = CommandBuilder::new_default_prog();
     // A restored directory that no longer exists falls back to the process cwd,
     // rather than failing to spawn.
     let cwd = start_cwd
