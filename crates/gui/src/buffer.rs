@@ -2723,6 +2723,8 @@ mod tests {
 
     // --- editing ---------------------------------------------------------
 
+
+
     fn text_of(b: &Buffer) -> String {
         b.lines.join("\n")
     }

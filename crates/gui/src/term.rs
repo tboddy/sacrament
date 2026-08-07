@@ -53,6 +53,53 @@ pub struct Terminal {
     size: Size,
 }
 
+/// Schemes that may be handed to the system opener.
+///
+/// An allowlist, not a blocklist, and the difference matters: macOS `open` will
+/// launch whatever application has registered a scheme, so `open`ing an arbitrary
+/// one from terminal output is a way to launch arbitrary software from text a
+/// remote server produced. Web pages are what a link in a terminal means.
+const URL_SCHEMES: [&str; 2] = ["https://", "http://"];
+
+/// Trailing characters to peel off a candidate.
+///
+/// A URL at the end of a sentence, or inside brackets or quotes, is the normal
+/// case in program output — `see https://example.com/x.` should not include the
+/// full stop. Peeled from the end only: every one of these is legal *within* a
+/// URL, and several (`?`, `=`, `#`) are common in query strings.
+const URL_TRAILING: [char; 12] = ['.', ',', ';', ':', '!', '?', ')', ']', '}', '>', '"', '\''];
+
+/// Find a URL in `text` spanning character index `hit`.
+///
+/// A free function so it can be tested on plain strings, with no terminal to
+/// drive — which is the only practical way to cover the punctuation and boundary
+/// cases.
+fn url_around(text: &str, hit: usize) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if hit >= chars.len() {
+        return None;
+    }
+    // A URL can't contain whitespace, so the whitespace-delimited run containing
+    // the click is the widest thing the URL could be.
+    let start = chars[..hit]
+        .iter()
+        .rposition(|c| c.is_whitespace())
+        .map_or(0, |i| i + 1);
+    let end = chars[hit..]
+        .iter()
+        .position(|c| c.is_whitespace())
+        .map_or(chars.len(), |i| hit + i);
+
+    let token: String = chars[start..end].iter().collect();
+    // Leading punctuation too — `(https://example.com)` is as common as trailing.
+    let token = token.trim_start_matches(['(', '[', '{', '<', '"', '\'']);
+    let token = token.trim_end_matches(URL_TRAILING);
+
+    let scheme = URL_SCHEMES.iter().find(|s| token.starts_with(**s))?;
+    // Reject a bare scheme with nothing after it.
+    (token.len() > scheme.len()).then(|| token.to_string())
+}
+
 impl Terminal {
     pub fn new(rows: usize, cols: usize) -> Self {
         let size = Size {
@@ -72,10 +119,6 @@ impl Terminal {
 
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
-    }
-
-    pub fn size(&self) -> Size {
-        self.size
     }
 
     /// Returns true if the size actually changed, so the caller knows whether
@@ -131,6 +174,74 @@ impl Terminal {
     /// lines and the scrollback region.
     pub fn selected_text(&self) -> Option<String> {
         self.term.selection_to_string().filter(|s| !s.is_empty())
+    }
+
+    /// The URL under a viewport cell, if there is one.
+    ///
+    /// **Reads the whole logical line, not the screen row.** A URL long enough to
+    /// be worth clicking is exactly the kind that wraps, and a wrapped line is
+    /// several grid rows — so scanning one row would find `https://example.com/a`
+    /// and miss the `/b/c` that continued on the next. `WRAPLINE` on a row's last
+    /// cell is what joins them, so the walk follows it in both directions and
+    /// tokenizes the joined text.
+    ///
+    /// Only `http` and `https` are returned, and that's a safety boundary rather
+    /// than a limitation: terminal output is frequently attacker-influenced — any
+    /// file you `cat`, any repo you clone, any server you curl — and macOS `open`
+    /// will launch a registered handler for *any* scheme it's given. Restricting
+    /// the schemes means the worst a hostile line can do is open a web page.
+    pub fn url_at(&self, row: usize, col: usize) -> Option<String> {
+        // `grid_point` clamps the row to the last row with content, which is right
+        // for a *drag* — pulling into the blank region below a short prompt should
+        // stop at the content rather than select a screenful of nothing. It is
+        // wrong here: clicking empty space well below the output would resolve to
+        // whatever the last line happened to hold and open its link.
+        if row > self.last_content_row() {
+            return None;
+        }
+        let point = self.grid_point(row, col);
+        let grid = self.term.grid();
+        let cols = self.size.cols.max(1);
+        let topmost = grid.topmost_line().0;
+        let bottommost = grid.bottommost_line().0;
+
+        // Walk back to the first row of the logical line: a row is a continuation
+        // when the row *above* it is flagged as wrapping into it.
+        let mut first = point.line.0;
+        while first > topmost && Self::wraps(grid, Line(first - 1), cols) {
+            first -= 1;
+        }
+
+        // Collect the joined text, noting where the clicked cell lands in it.
+        let mut text = String::new();
+        let mut hit: Option<usize> = None;
+        let mut line = first;
+        loop {
+            for column in 0..cols {
+                if line == point.line.0 && column == point.column.0 {
+                    hit = Some(text.chars().count());
+                }
+                text.push(grid[Line(line)][Column(column)].c);
+            }
+            if line >= bottommost || !Self::wraps(grid, Line(line), cols) {
+                break;
+            }
+            line += 1;
+        }
+
+        url_around(&text, hit?)
+    }
+
+    /// Does this row continue onto the next one?
+    fn wraps(
+        grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+        line: Line,
+        cols: usize,
+    ) -> bool {
+        use alacritty_terminal::term::cell::Flags;
+        grid[line][Column(cols - 1)]
+            .flags
+            .contains(Flags::WRAPLINE)
     }
 
     /// Viewport row/col to a grid `Point`. The viewport's top row is grid line
@@ -324,7 +435,7 @@ mod tests {
     /// Everything the grid currently shows, one string per viewport row with
     /// trailing blanks trimmed.
     fn rows_of(t: &Terminal) -> Vec<String> {
-        let size = t.size();
+        let size = t.size;
         let mut rows = vec![String::new(); size.rows];
         for indexed in t.term.renderable_content().display_iter {
             let line = indexed.point.line.0;
@@ -526,5 +637,104 @@ mod tests {
 
         let after = nonblank(&t);
         assert_eq!(after, before, "\nbefore: {before:#?}\nafter:  {after:#?}");
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    /// Index of the first character of `needle`, for pointing `url_around` at a
+    /// spot inside the URL rather than counting by hand.
+    fn at(text: &str, needle: &str) -> usize {
+        text.chars().collect::<String>().find(needle).map(|b| text[..b].chars().count()).unwrap()
+    }
+
+    #[test]
+    fn a_bare_url_is_found_from_anywhere_inside_it() {
+        let line = "see https://example.com/a/b?q=1 for details";
+        for probe in ["https", "example", "a/b", "q=1"] {
+            assert_eq!(
+                url_around(line, at(line, probe)).as_deref(),
+                Some("https://example.com/a/b?q=1"),
+                "probing at {probe}"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_off_the_url_finds_nothing() {
+        let line = "see https://example.com/a for details";
+        assert_eq!(url_around(line, at(line, "see")), None);
+        assert_eq!(url_around(line, at(line, "details")), None);
+    }
+
+    #[test]
+    fn sentence_punctuation_is_not_part_of_the_url() {
+        // The overwhelmingly common shape in program output, and getting it wrong
+        // sends a 404 to the browser.
+        for (line, want) in [
+            ("Visit https://example.com/x.", "https://example.com/x"),
+            ("Visit https://example.com/x, then", "https://example.com/x"),
+            ("(https://example.com/x)", "https://example.com/x"),
+            ("[https://example.com/x]", "https://example.com/x"),
+            ("<https://example.com/x>", "https://example.com/x"),
+            ("\"https://example.com/x\"", "https://example.com/x"),
+        ] {
+            assert_eq!(
+                url_around(line, at(line, "example")).as_deref(),
+                Some(want),
+                "line: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_query_string_keeps_its_own_punctuation() {
+        // `?`, `=` and `#` are peeled only from the *end*, or every query string
+        // would be truncated.
+        let line = "https://example.com/s?q=a&b=c#frag";
+        assert_eq!(url_around(line, 0).as_deref(), Some(line));
+    }
+
+    #[test]
+    fn only_web_schemes_are_returned() {
+        // The safety boundary: `open` launches a registered handler for any
+        // scheme, and terminal output is often not yours.
+        for line in [
+            "file:///etc/passwd",
+            "ftp://example.com/x",
+            "javascript:alert(1)",
+            "vscode://file/tmp/x",
+            "mailto:a@b.com",
+            "https://",
+        ] {
+            assert_eq!(url_around(line, 2), None, "line: {line}");
+        }
+    }
+
+    #[test]
+    fn a_wrapped_url_is_recovered_whole() {
+        // The case that motivates reading the logical line: a long URL is exactly
+        // the kind that wraps, and one screen row holds only part of it.
+        let mut t = Terminal::new(4, 20);
+        t.feed(b"see https://example.com/a/very/long/path?x=1 here");
+        // Row 0 holds the first 20 columns; the URL continues onto rows 1 and 2.
+        let found = t.url_at(0, 8).expect("finds the url from its first row");
+        assert_eq!(found, "https://example.com/a/very/long/path?x=1");
+        // And from a continuation row.
+        assert_eq!(
+            t.url_at(1, 2).as_deref(),
+            Some("https://example.com/a/very/long/path?x=1"),
+            "must resolve the same url from a wrapped row"
+        );
+    }
+
+    #[test]
+    fn a_click_past_the_end_of_the_text_is_not_a_url() {
+        let mut t = Terminal::new(4, 40);
+        t.feed(b"https://example.com/a");
+        assert_eq!(t.url_at(0, 38), None, "trailing blanks are not the url");
+        assert_eq!(t.url_at(3, 0), None, "an empty row below has none");
     }
 }

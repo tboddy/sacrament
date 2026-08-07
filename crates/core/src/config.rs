@@ -4,6 +4,7 @@ use std::fs;
 use serde::Deserialize;
 
 use crate::font::FontConfig;
+use crate::jira::JiraConfig;
 use crate::paths::config_path;
 use crate::theme::Theme;
 
@@ -23,6 +24,12 @@ pub struct Config {
     /// Font for the v2 GUI. v1 ignores this — a TUI draws in whatever font the
     /// terminal is set to.
     pub font: FontConfig,
+    /// Jira site, account, and query for v2's Jira section. v1 ignores it.
+    ///
+    /// The API **token is deliberately not here** — `config.toml` is plaintext
+    /// and shared with v1, so secrets come from the Keychain via
+    /// [`crate::secret`]. See `docs/jira-integration.md`.
+    pub jira: JiraConfig,
 }
 
 impl Default for Config {
@@ -37,6 +44,7 @@ impl Default for Config {
             lint: LintConfig::default(),
             theme: Theme::default(),
             font: FontConfig::default(),
+            jira: JiraConfig::default(),
         }
     }
 }

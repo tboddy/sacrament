@@ -36,7 +36,9 @@ use std::os::unix::net::UnixListener;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use iced::widget::{column, container, mouse_area, pane_grid, row, rule, text, text_input};
+use iced::widget::{
+    column, container, mouse_area, pane_grid, row, rule, scrollable, text, text_input,
+};
 use iced::{Element, Font, Length, Subscription, Task};
 
 use buffer::{Buffer, BufferSource};
@@ -323,6 +325,15 @@ enum Message {
     /// the cursor doesn't. Without this, the padding band would be dead to
     /// clicks, which looks like the pane ignoring you.
     FocusPane(Focus),
+    /// Reload the Jira dashboard. From the clickable "Refresh" heading, and from
+    /// `Cmd+R` while the section is showing.
+    JiraRefresh,
+    /// Pointer entered or left the refresh control.
+    JiraRefreshHovered(bool),
+    /// A Jira fetch finished. `Err` carries a message for an alert — Jira's own
+    /// words where it gave any, since it explains a bad query far better than a
+    /// generic failure would.
+    JiraLoaded(Result<sacrament_core::jira::Page, String>),
 }
 
 /// One pane's identity. Only `Shell` exists in the spike; `Editor` is the point
@@ -434,6 +445,64 @@ struct TabLabel {
 /// actual shade.
 const DIRTY_SLOT: usize = 11;
 const UNREVIEWED_SLOT: usize = 14;
+
+/// The Jira section's refresh control: `blue` at rest, `bright_blue` under the
+/// pointer. Theme slots, not literals — `[theme]` decides the actual shades.
+///
+/// A chrome decision rather than a markdown-derived one, which is why these are
+/// slot constants here beside the tab markers rather than accessors on
+/// `core::markdown`. The control only *looks* like a heading; it isn't one.
+const REFRESH_SLOT: usize = 4;
+const REFRESH_HOVER_SLOT: usize = 12;
+
+/// Where the Jira API token is looked up. The Keychain is the real source; the
+/// environment variable is the scriptable override. Never `config.toml` — that
+/// file is plaintext and shared with v1. See `core::secret`.
+const JIRA_KEYCHAIN_SERVICE: &str = "sacrament-jira";
+const JIRA_TOKEN_ENV: &str = "SACRAMENT_JIRA_TOKEN";
+
+/// The dashboard's columns and their share of the pane's width.
+///
+/// Portions rather than fixed pixels: the pane is resizable and the summary should
+/// absorb the slack. Summary is last and much the widest — it's the only column
+/// whose length is unbounded, and the short ones are what you scan.
+const JIRA_COLUMNS: [(&str, u16); 5] = [
+    ("Key", 3),
+    ("Pri", 2),
+    ("Type", 3),
+    ("Updated", 3),
+    ("Summary", 13),
+];
+
+/// Gaps inside a dashboard table.
+const TABLE_COL_GAP: f32 = 12.0;
+const TABLE_ROW_GAP: f32 = 4.0;
+
+/// What the Jira section shows when it has nothing to connect to.
+///
+/// Rendered as the dashboard itself rather than raised as an alert: an
+/// unconfigured integration isn't an error, and setup instructions are something
+/// to read and copy from, which a dialog with an OK button is bad at.
+///
+/// No title heading — `jira_section` draws one as chrome above the grid.
+fn jira_setup_help() -> String {
+    format!(
+        "Not configured yet. Add a `[jira]` section to `config.toml`:\n\n\
+         ```toml\n\
+         [jira]\n\
+         site = \"your-company\"\n\
+         email = \"you@your-company.com\"\n\
+         query = \"assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC\"\n\
+         ```\n\n\
+         Then store an API token in the Keychain:\n\n\
+         ```\n{}\n```\n\n\
+         Create the token at `id.atlassian.net/manage-profile/security/api-tokens`.\n\n\
+         The token is kept out of `config.toml` on purpose: that file is plain \
+         text and shared with v1.\n"
+    ,
+        sacrament_core::secret::store_hint(JIRA_KEYCHAIN_SERVICE, "you@your-company.com")
+    )
+}
 
 /// A tab being dragged to a new position within its own strip.
 ///
@@ -558,6 +627,24 @@ fn alert_dialog(body: String) -> Task<Message> {
 /// turned into noise — plus the punctuation that can't be misread pass through
 /// unchanged; everything else is escaped, which is the safe default for the
 /// characters this list hasn't thought about.
+/// Hand a URL to the system browser.
+///
+/// `spawn`, not `output`: the UI thread must not wait on a browser launching, and
+/// there is nothing to read back. A failure is dropped because there is nothing
+/// useful to say — the opener reports its own problems, and an alert here would
+/// fire for a browser that merely took its time.
+///
+/// The scheme is already restricted to http/https by `Terminal::url_at`, which is
+/// where that check belongs: `open` will launch a registered handler for *any*
+/// scheme, and terminal output is frequently attacker-influenced.
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(not(target_os = "macos"))]
+    let opener = "xdg-open";
+    let _ = std::process::Command::new(opener).arg(url).spawn();
+}
+
 fn shell_escaped(path: &std::path::Path) -> String {
     let s = path.to_string_lossy();
     let mut out = String::with_capacity(s.len());
@@ -608,13 +695,104 @@ fn is_app_ctrl(mods: iced::keyboard::Modifiers) -> bool {
 /// because the tabs aren't `button`s — see `tab_strip`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabGroup {
+    /// The editor pane's *outer* strip — which `Section` is showing. The file
+    /// tabs below it are `TabGroup::Editor`, one level in.
+    Section,
     Editor,
     Shell(PaneId),
+}
+
+impl TabGroup {
+    /// Can this strip's tabs be dragged into a new order?
+    ///
+    /// Sections are a fixed set the app defines, not a collection the user
+    /// opened, so there is nothing to reorder — and a drag would have to persist
+    /// an order that means nothing on the next launch. Answered by the group
+    /// rather than by a parameter to `tab_strip`, so the fact lives in one place
+    /// instead of at every call site.
+    fn reorderable(self) -> bool {
+        !matches!(self, TabGroup::Section)
+    }
+}
+
+/// What the editor pane is showing.
+///
+/// The pane is no longer just the editor: it holds several *sections*, of which
+/// the editor is one, and the open files are subtabs of that one. Adding a
+/// section means a variant, a `label`, and an arm in `view` — `ALL` drives the
+/// strip, so nothing else has to learn that the set grew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Editor,
+    Jira,
+}
+
+impl Section {
+    /// Strip order, left to right. A tab press carries an index into this, so it
+    /// is the single definition of both the set and its order — `section_bar`
+    /// renders from it and `select_section` reads back through it.
+    const ALL: [Section; 2] = [Section::Editor, Section::Jira];
+
+    fn label(self) -> &'static str {
+        match self {
+            Section::Editor => "Editor",
+            Section::Jira => "Jira",
+        }
+    }
+}
+
+/// The Jira section's state.
+///
+/// The dashboard is built from **real widgets**, not from the markdown renderer:
+/// its tables have to be responsive, and a table drawn as text can only be sized
+/// for one pane width. `core::jira` therefore hands over structured `Issue`s and
+/// the frontend lays them out. See `docs/jira-integration.md`.
+enum JiraView {
+    /// A fetch is in flight.
+    Loading,
+    /// Issues to draw as tables.
+    Ready(sacrament_core::jira::Page),
+    /// Something to say instead: setup instructions, or why a fetch failed.
+    Note(String),
+}
+
+struct JiraPane {
+    view: JiraView,
+    /// A fetch is in flight. Gates a second one — the refresh key is easy to
+    /// lean on, and Jira rate-limits. Kept alongside `JiraView::Loading` because
+    /// it must stay true across the whole request, including while an error note
+    /// from a previous attempt is still on screen.
+    loading: bool,
+    /// Whether a fetch has ever been attempted. Drives the first-show fetch, and
+    /// keeps a failed attempt from re-firing every time the section is selected.
+    attempted: bool,
+    /// Pointer is over the refresh control.
+    ///
+    /// A plain `bool` rather than the `Option<(group, index)>` the tab strips need:
+    /// there is exactly one hoverable control here, so `on_exit` can't be clearing
+    /// a hover that a sibling's `on_enter` just set. That tree-order hazard is real
+    /// on the strips and simply absent with one control.
+    hovered: bool,
+}
+
+impl JiraPane {
+    fn new() -> Self {
+        Self {
+            view: JiraView::Loading,
+            loading: false,
+            attempted: false,
+            hovered: false,
+        }
+    }
 }
 
 /// Which pane receives keystrokes. There is exactly one, always — v1 has the
 /// same rule (`PaneFocus`), and without it every key went to the PTY while the
 /// editor drew a caret it couldn't honor.
+///
+/// `Editor` names the **pane**, not the section inside it. Since the pane gained
+/// sections, focus alone no longer says the text surface is on screen — that's
+/// `State::editing`, and every command that touches the buffer asks it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Editor,
@@ -639,14 +817,6 @@ struct Shell {
     /// Throttles the cwd syscall — output can arrive thousands of times a second
     /// during a flood, and the directory changes at human speed.
     last_cwd_check: Option<Instant>,
-    /// Whether a real, measured size has been applied yet.
-    ///
-    /// The first size must bypass the debounce. Debouncing exists to stop a
-    /// splitter drag from sending a `SIGWINCH` per frame; the initial layout isn't
-    /// a drag, and holding it back for 80ms means the PTY spawns the shell at the
-    /// placeholder size and then gets resized — exactly the startup corruption the
-    /// deferred spawn was added to prevent.
-    sized: bool,
 }
 
 impl Shell {
@@ -677,7 +847,6 @@ impl Shell {
             rows: 24,
             pid: None,
             last_cwd_check: None,
-            sized: false,
         }
     }
 }
@@ -686,6 +855,17 @@ impl Shell {
 struct ShellPane {
     shells: Vec<Shell>,
     active: usize,
+    /// The body size every shell in this pane is drawn at, once a grid has
+    /// measured it. `None` until the first frame.
+    ///
+    /// **Held per pane rather than per shell because only the active shell's grid
+    /// exists.** `view` builds a `GridView` for `active()` alone, so an inactive
+    /// tab never lays out and never reports a size — and a restored session's
+    /// inactive tabs would therefore wait out `pty::SIZE_WAIT` and spawn their
+    /// shells at the 24x80 placeholder, which is what they were still showing when
+    /// you switched to them. Every tab in a pane shares the pane's geometry, so
+    /// the size one grid measures is the right size for all of them.
+    size: Option<(usize, usize)>,
 }
 
 impl ShellPane {
@@ -718,6 +898,12 @@ struct State {
     /// Index into `buffers`. Kept valid by `close_tab`, which is the only thing
     /// that can invalidate it.
     active: usize,
+    /// Which section the editor pane is showing. Not persisted: a section has no
+    /// state of its own to restore, and landing on the editor is the right
+    /// default for a launch that was given files to open.
+    section: Section,
+    /// The Jira section's dashboard and fetch state.
+    jira: JiraPane,
     /// `None` when `syntax_highlighting = false`.
     highlighter: Option<Arc<sacrament_core::highlight::Highlighter>>,
     panes: pane_grid::State<PaneKind>,
@@ -814,7 +1000,11 @@ impl State {
                 shells.push(Shell::new(key));
             }
             let active = active.min(shells.len() - 1);
-            ShellPane { shells, active }
+            ShellPane {
+                shells,
+                active,
+                size: None,
+            }
         };
         let (bottom, right) = match &saved {
             Some(sess) => (
@@ -942,6 +1132,8 @@ impl State {
             next_shell_serial: serial,
             buffers,
             active,
+            section: Section::Editor,
+            jira: JiraPane::new(),
             highlighter,
             config,
             panes,
@@ -1005,6 +1197,101 @@ impl State {
         }
     }
 
+    /// Is the editor's text surface the thing on screen and holding the keyboard?
+    ///
+    /// `Focus::Editor` names the pane, and the pane holds sections now, so focus
+    /// alone no longer answers this: with Jira showing there is no text and no
+    /// caret, and routing a keystroke — or a `Cmd+Z`, or a comment toggle — to the
+    /// active buffer would edit a file the user cannot see. That's the same class
+    /// of hole as read mode, so it's closed the same way: at the routing layer,
+    /// once, rather than inside each command.
+    ///
+    /// Read mode is deliberately *not* folded in here. It's a different question
+    /// — the text is on screen, it just can't be typed into — and the two have
+    /// different answers for navigation keys.
+    fn editing(&self) -> bool {
+        self.focus == Focus::Editor && self.section == Section::Editor
+    }
+
+    /// Put the editor section in front of the user and give it the keyboard.
+    ///
+    /// Called by the commands whose whole purpose is to show something —
+    /// opening a file, a new buffer, a search, read mode. Those have to bring the
+    /// editor back into view, or they act on a surface that isn't being displayed.
+    /// The commands that instead act on *what is already on screen* (typing,
+    /// undo, save, close tab) stay inert while another section shows; see
+    /// `editing`.
+    fn show_editor(&mut self) {
+        self.focus = Focus::Editor;
+        self.section = Section::Editor;
+    }
+
+    /// Switch which section the editor pane shows. `index` is into `Section::ALL`.
+    fn select_section(&mut self, index: usize) -> Task<Message> {
+        let Some(&section) = Section::ALL.get(index) else {
+            return Task::none();
+        };
+        self.section = section;
+        // The strip belongs to the editor pane, so pressing it is interacting
+        // with that pane — the same reason `select_tab` takes focus.
+        self.focus = Focus::Editor;
+        // Fetch on first show rather than at startup: an app launched to edit a
+        // file shouldn't make a network request nobody asked for. `attempted`
+        // rather than "is it empty" so a failure doesn't re-fire on every visit.
+        if section == Section::Jira && !self.jira.attempted {
+            return self.jira_refresh();
+        }
+        Task::none()
+    }
+
+    /// Fetch the Jira dashboard in the background.
+    ///
+    /// `Task::perform` rather than the channel-and-subscription pattern `pty` and
+    /// `watch` use: this is one request and one response, not a stream. The
+    /// blocking call occupies a thread-pool thread for its duration, which is fine
+    /// at human pace and keeps `tokio` out of the tree.
+    fn jira_refresh(&mut self) -> Task<Message> {
+        if self.jira.loading {
+            return Task::none();
+        }
+        let config = self.config.jira.clone();
+        if !config.is_configured() {
+            // Not an error — an unconfigured integration is a normal state. Say
+            // what to add rather than reporting a failure.
+            self.jira.attempted = true;
+            self.jira.view = JiraView::Note(jira_setup_help());
+            return Task::none();
+        }
+        self.jira.loading = true;
+        self.jira.attempted = true;
+        // Show the loading state *before* the fetch starts, so a refresh looks
+        // exactly like the first visit. Without this the previous dashboard stayed
+        // on screen for the length of the request and the click read as a no-op —
+        // the control's colour doesn't change on press, so replacing the body is
+        // the only feedback there is.
+        self.jira.view = JiraView::Loading;
+        Task::perform(
+            async move {
+                let Some(token) = sacrament_core::secret::lookup(
+                    JIRA_TOKEN_ENV,
+                    JIRA_KEYCHAIN_SERVICE,
+                    &config.email,
+                ) else {
+                    return Err(format!(
+                        "No Jira API token for {}. Store one with:\n\n{}",
+                        config.email,
+                        sacrament_core::secret::store_hint(
+                            JIRA_KEYCHAIN_SERVICE,
+                            &config.email
+                        )
+                    ));
+                };
+                sacrament_core::jira::fetch(&config, &token)
+            },
+            Message::JiraLoaded,
+        )
+    }
+
     /// Ask the system where to save, then save there.
     fn save_as_dialog(&self) -> Task<Message> {
         let current = self
@@ -1017,7 +1304,7 @@ impl State {
 
     /// Fold or unfold. `shift` widens it to the whole file.
     fn fold_command(&mut self, unfold: bool, all: bool) {
-        if self.focus != Focus::Editor {
+        if !self.editing() {
             return;
         }
         let rows = self.editor_rows;
@@ -1045,7 +1332,7 @@ impl State {
 
     /// Indent or outdent the selected lines in the editor.
     fn reindent(&mut self, deeper: bool) {
-        if self.focus != Focus::Editor {
+        if !self.editing() {
             return;
         }
         let (tw, tabs) = (self.config.tab_width.max(1), self.config.indent_with_tabs);
@@ -1061,8 +1348,11 @@ impl State {
     }
 
     /// Switch the active buffer between source and rendered markdown.
+    ///
+    /// Shows the editor first: this is a command whose result is something to
+    /// look at, so it has to bring the surface it renders into view.
     fn toggle_read_mode(&mut self) {
-        self.focus = Focus::Editor;
+        self.show_editor();
         let ok = self
             .buf()
             .lock()
@@ -1079,7 +1369,7 @@ impl State {
     /// doesn't recognise has none — that's reported rather than silently doing
     /// nothing, since an unresponsive key reads as broken.
     fn toggle_comment(&mut self) {
-        if self.focus != Focus::Editor {
+        if !self.editing() {
             return;
         }
         let rows = self.editor_rows;
@@ -1443,19 +1733,21 @@ impl State {
                         pane: PaneId::Bottom,
                         serial: 0,
                     };
-                let Some(shell) = self.shell_by_key(key) else {
-                    return Task::none();
-                };
                 // Only push a size the grid actually measured. Sending the
                 // terminal's placeholder here would let the PTY spawn its shell at
                 // 24x80, and the real size arriving later would trigger the
                 // redraw this whole path exists to avoid. If nothing is measured
                 // yet, `GridResized` pushes it the moment it is.
-                if shell.sized
-                    && let Ok(t) = shell.terminal.lock()
-                {
-                    let size = t.size();
-                    handle.resize(size.rows as u16, size.cols as u16);
+                //
+                // Read from the *pane*, not this shell: a tab that has never been
+                // active has no grid and so no size of its own, but its pane's
+                // size applies to it just the same.
+                let measured = self.pane(key.pane).size;
+                let Some(shell) = self.shell_by_key(key) else {
+                    return Task::none();
+                };
+                if let Some((rows, cols)) = measured {
+                    handle.resize(rows as u16, cols as u16);
                 }
                 // SACRAMENT_SPIKE_CMD runs a command on attach so throughput can
                 // be measured without typing. Only the bottom pane, or it would
@@ -1507,23 +1799,30 @@ impl State {
                 self.alert(format!("The shell couldn't be started: {e}"));
             }
             Message::GridResized(key, rows, cols) => {
-                let Some(shell) = self.shell_by_key(key) else {
-                    return Task::none();
-                };
-                shell.rows = rows.max(1);
-                // Grid and shell are resized together, every frame — no
-                // throttling. Keeping them in lockstep is what makes a drag look
-                // right: any delay leaves the grid holding content wrapped for a
-                // width the shell no longer has, which renders as fragments of
-                // adjacent lines until the shell catches up.
-                let changed = shell
-                    .terminal
-                    .lock()
-                    .map(|mut t| t.resize(rows, cols))
-                    .unwrap_or(false);
-                shell.sized = true;
-                if changed && let Some(h) = &shell.handle {
-                    h.resize(rows as u16, cols as u16);
+                let (rows, cols) = (rows.max(1), cols.max(1));
+                // Applied to **every shell in the pane**, not just the one whose
+                // grid reported. Only the active tab has a grid, so an inactive
+                // tab would otherwise never learn its size — and on a restored
+                // session that meant its PTY waited out `SIZE_WAIT` and spawned
+                // zsh at 24x80. Tabs in a pane all share the pane's geometry, so
+                // one measurement is the right answer for all of them.
+                let pane = self.pane_mut(key.pane);
+                pane.size = Some((rows, cols));
+                for shell in &mut pane.shells {
+                    shell.rows = rows;
+                    // Grid and shell are resized together, every frame — no
+                    // throttling. Keeping them in lockstep is what makes a drag
+                    // look right: any delay leaves the grid holding content
+                    // wrapped for a width the shell no longer has, which renders
+                    // as fragments of adjacent lines until the shell catches up.
+                    let changed = shell
+                        .terminal
+                        .lock()
+                        .map(|mut t| t.resize(rows, cols))
+                        .unwrap_or(false);
+                    if changed && let Some(h) = &shell.handle {
+                        h.resize(rows as u16, cols as u16);
+                    }
                 }
             }
             Message::EditorResized(rows, cols) => {
@@ -1546,6 +1845,13 @@ impl State {
             Message::Pasted(text) => {
                 if let Some(text) = text {
                     match self.focus {
+                        // `editing()` and `reading()` are both required, and a
+                        // paste is exactly where that gets forgotten: it arrives
+                        // as its own message rather than through `keymap`, so
+                        // neither the section arm nor the read-mode arm in the key
+                        // dispatch covers it. v1 has this hole — pasting into read
+                        // mode edits the source behind the rendering.
+                        Focus::Editor if !self.editing() || self.reading() => {}
                         Focus::Editor => {
                             if let Ok(mut b) = self.buf().lock() {
                                 b.insert_str(&text);
@@ -1625,19 +1931,35 @@ impl State {
                 }
             }
             Message::TabPressed(group, i) => {
-                match group {
-                    TabGroup::Editor => self.select_tab(i),
-                    TabGroup::Shell(id) => self.select_shell(id, i),
+                let task = match group {
+                    TabGroup::Section => self.select_section(i),
+                    TabGroup::Editor => {
+                        self.select_tab(i);
+                        Task::none()
+                    }
+                    TabGroup::Shell(id) => {
+                        self.select_shell(id, i);
+                        Task::none()
+                    }
+                };
+                // A section press begins no drag — the set is fixed, so there is
+                // no order to change. Without this the drag machinery would run
+                // over a strip whose `move_tab` has nothing to move.
+                if group.reorderable() {
+                    self.tab_drag = Some(TabDrag {
+                        group,
+                        origin: i,
+                        at: i,
+                        last_x: None,
+                        dir: 0.0,
+                    });
                 }
-                self.tab_drag = Some(TabDrag {
-                    group,
-                    origin: i,
-                    at: i,
-                    last_x: None,
-                    dir: 0.0,
-                });
+                return task;
             }
             Message::TabClosed(group, i) => match group {
+                // Middle-click on a section does nothing: sections aren't things
+                // you opened, so there is nothing to close.
+                TabGroup::Section => {}
                 TabGroup::Editor => return self.close_tab(i),
                 TabGroup::Shell(id) => self.close_shell(id, i),
             },
@@ -1685,6 +2007,22 @@ impl State {
                 });
                 if let Err(e) = result {
                     self.alert(e);
+                }
+            }
+            Message::JiraRefresh => return self.jira_refresh(),
+            Message::JiraRefreshHovered(over) => self.jira.hovered = over,
+            Message::JiraLoaded(result) => {
+                self.jira.loading = false;
+                match result {
+                    Ok(page) => self.jira.view = JiraView::Ready(page),
+                    Err(e) => {
+                        // Both: the alert can't be missed, and the pane keeps the
+                        // text after the dialog is dismissed — otherwise the
+                        // failure is gone the moment it's acknowledged, and the
+                        // section is left showing a stale or empty dashboard.
+                        self.jira.view = JiraView::Note(format!("Could not load.\n\n{e}"));
+                        self.alert(e);
+                    }
                 }
             }
             Message::FileChanged(path) => self.reload_changed(&path),
@@ -1844,6 +2182,13 @@ impl State {
                             }
                         }
                     }
+                    // Another section has no caret and nothing to type into, but
+                    // it does have a scrollable surface — so navigation keys go
+                    // through `read_key`, which claims only those and drops the
+                    // rest. Same funnel read mode uses, one level up.
+                    Focus::Editor if self.section != Section::Editor => {
+                        self.read_key(&key)
+                    }
                     // Read mode takes navigation only. Gating here rather than
                     // inside `edit_key` covers every editing path at once —
                     // v1 gated its key handler and left `Event::Paste` free to
@@ -1906,7 +2251,7 @@ impl State {
                 Named::ArrowLeft | Named::ArrowRight | Named::ArrowUp | Named::ArrowDown
             )
         {
-            if self.focus == Focus::Editor {
+            if self.editing() {
                 let rows = self.editor_rows;
                 if let Ok(mut b) = self.buf().lock() {
                     match named {
@@ -1942,9 +2287,22 @@ impl State {
             "/" => self.toggle_comment(),
             // `Cmd+Shift+M`, because plain `Cmd+M` is Minimize on macOS.
             "m" | "M" if shift => self.toggle_read_mode(),
-            "s" | "S" if shift => return Some(self.save_as_dialog()),
+            // Save and save-as act on what's on screen, so they're inert while
+            // another section shows — the buffer stays dirty and saveable, and the
+            // quit prompt still catches it. `Cmd+O` is the opposite case: its
+            // whole purpose is to put a file in front of you, so it switches back
+            // (in `open_path`).
+            "s" | "S" if shift => {
+                if self.editing() {
+                    return Some(self.save_as_dialog());
+                }
+            }
             "o" | "O" => return Some(open_dialog()),
-            "s" | "S" => return Some(self.save()),
+            "s" | "S" => {
+                if self.editing() {
+                    return Some(self.save());
+                }
+            }
             "f" | "F" => return Some(self.open_prompt(PromptKind::Find)),
             // macOS find-next. Repeats the last query with no prompt in the way.
             "g" | "G" => return Some(self.find_next(shift)),
@@ -1955,21 +2313,26 @@ impl State {
             },
             "w" | "W" => return Some(self.close_focused_tab()),
             "q" | "Q" => return Some(self.request_quit()),
-            "z" | "Z" => self.history(shift),
+            "z" | "Z" => {
+                if self.editing() {
+                    self.history(shift);
+                }
+            }
             "c" | "C" => {
                 return Some(match self.focus {
+                    Focus::Editor if !self.editing() => Task::none(),
                     Focus::Editor => self.copy(false),
                     Focus::Shell(_) => self.copy_shell(),
                 });
             }
             "x" | "X" => {
-                if self.focus == Focus::Editor {
+                if self.editing() {
                     return Some(self.copy(true));
                 }
             }
             "v" | "V" => return Some(iced::clipboard::read().map(Message::Pasted)),
             "a" | "A" => {
-                if self.focus == Focus::Editor
+                if self.editing()
                     && let Ok(mut b) = self.buf().lock()
                 {
                     b.select_all();
@@ -1977,10 +2340,21 @@ impl State {
             }
             // Diagnostics only, and visible only under SACRAMENT_METRICS.
             "r" | "R" if shift => self.metrics.reset(),
+            // Refresh the section that has something to refresh. The editor's
+            // content comes from disk and is kept current by the watcher, so
+            // there's nothing for `Cmd+R` to do there.
+            "r" | "R" => {
+                if self.section == Section::Jira {
+                    return Some(self.jira_refresh());
+                }
+            }
             // Jump to a tab in the focused pane.
             d if d.len() == 1 && matches!(d.as_bytes()[0], b'1'..=b'9') => {
                 let n = (d.as_bytes()[0] - b'1') as usize;
                 match self.focus {
+                    // The file tabs aren't on screen, so there's no tab N to jump
+                    // to. Sections have their own strip and no binding yet.
+                    Focus::Editor if !self.editing() => {}
                     Focus::Editor => self.select_tab(n),
                     Focus::Shell(id) => self.select_shell(id, n),
                 }
@@ -2021,6 +2395,11 @@ impl State {
     /// release writes the result.
     fn move_tab(&mut self, group: TabGroup, from: usize, to: usize) {
         match group {
+            // Unreachable in practice — `TabPressed` starts no drag for a strip
+            // that isn't `reorderable`, and a drag is the only route here. The arm
+            // states it rather than leaving a `_` that would silently absorb a
+            // future group that *should* reorder.
+            TabGroup::Section => {}
             TabGroup::Editor => {
                 if move_item(&mut self.buffers, from, to) {
                     self.active = to;
@@ -2159,6 +2538,17 @@ impl State {
                 if let Some(n) = line {
                     buf.goto_line(n);
                     buf.ensure_cursor_visible(rows);
+                } else {
+                    // Markdown opens **rendered**, because that's what a markdown
+                    // file is for; `Cmd+Shift+M` gets to the source. `set_read_mode`
+                    // gates on the extension itself, so this needs no check of its
+                    // own — a non-markdown file is left alone.
+                    //
+                    // Only when no line was asked for. `sacrament NOTES.md:42` is a
+                    // request for a specific *source* line, and read mode has no
+                    // such thing — its rows are rendered ones, which don't
+                    // correspond. Honoring the line means showing the source.
+                    buf.set_read_mode();
                 }
                 // An untouched, untitled, unmodified buffer is the placeholder
                 // from startup — replace it rather than leaving an empty tab
@@ -2186,7 +2576,11 @@ impl State {
             }
         } else {
             self.active = index;
-            self.focus = Focus::Editor;
+            // A user-initiated open shows the editor, since a tab nobody can see
+            // isn't an answer to "open this". A *review* open deliberately does
+            // not: it's a tool writing in the background, and it doesn't take the
+            // active tab either.
+            self.show_editor();
             self.mark_active_reviewed();
         }
         self.persist();
@@ -2194,15 +2588,22 @@ impl State {
     }
 
     /// A new empty buffer, made active. `Cmd+N`.
+    ///
+    /// Shows the editor: an empty buffer exists to be typed into, so making one
+    /// while another section is up has to bring the editor back.
     fn new_buffer(&mut self) {
         self.buffers.push(Arc::new(Mutex::new(Buffer::empty())));
         self.active = self.buffers.len() - 1;
+        self.show_editor();
         self.persist();
     }
 
     /// Close the active tab of whichever pane has focus. `Cmd+W`.
     fn close_focused_tab(&mut self) -> Task<Message> {
         match self.focus {
+            // Nothing to close: the file tabs aren't on screen, and a section
+            // isn't something you opened.
+            Focus::Editor if !self.editing() => Task::none(),
             Focus::Editor => self.close_tab(self.active),
             Focus::Shell(id) => {
                 let i = self.pane(id).active;
@@ -2215,6 +2616,8 @@ impl State {
     /// Cycle tabs within the focused pane.
     fn cycle_focused_tab(&mut self, forward: bool) {
         match self.focus {
+            // No file tabs on screen to cycle through.
+            Focus::Editor if !self.editing() => {}
             Focus::Editor => self.cycle_tab(forward),
             Focus::Shell(id) => {
                 let pane = self.pane(id);
@@ -2234,11 +2637,11 @@ impl State {
 
     /// Open the bottom prompt.
     ///
-    /// Focus moves to the editor first: all three prompts act on the buffer, so
-    /// running one while a shell has focus would otherwise leave the result
-    /// invisible.
+    /// The editor is shown first: both prompts act on the buffer, so running one
+    /// while a shell has focus — or while another section is up — would otherwise
+    /// leave the result invisible.
     fn open_prompt(&mut self, kind: PromptKind) -> Task<Message> {
-        self.focus = Focus::Editor;
+        self.show_editor();
         let (origin, selection) = match self.buf().lock() {
             Ok(b) => ((b.cursor_row, b.cursor_col), b.selected_text()),
             Err(_) => ((0, 0), None),
@@ -2343,6 +2746,9 @@ impl State {
         let Some(query) = self.last_query.clone() else {
             return self.open_prompt(PromptKind::Find);
         };
+        // A match is shown by selecting it, so the editor has to be the thing on
+        // screen — otherwise `Cmd+G` silently moves a caret nobody can see.
+        self.show_editor();
         // Continue from the current match, not the caret: forward from its end,
         // backward from its start, or the same hit comes back every time.
         let from = match self.buf().lock() {
@@ -2416,11 +2822,22 @@ impl State {
         match (focus, gesture) {
             // Read mode has nothing to select or put a caret in — but it does
             // scroll, so this must not swallow the wheel.
+            //
+            // `!self.editing()` covers the Jira section, whose grid is a read-mode
+            // surface too: without it a click there would fall through and move the
+            // caret in a file that isn't on screen.
             (
                 Focus::Editor,
                 GridMouse::Press { .. } | GridMouse::Drag { .. } | GridMouse::Release,
-            ) if self.reading() => {}
-            (Focus::Editor, GridMouse::Press { row, col, count }) => {
+            ) if !self.editing() || self.reading() => {}
+            // `shift` is unread here: the editor has no link handling yet, and
+            // shift-extending a selection isn't implemented either.
+            (Focus::Editor, GridMouse::Press {
+                row,
+                col,
+                count,
+                shift: _,
+            }) => {
                 let rows = self.editor_rows;
                 if let Ok(mut b) = self.buf().lock() {
                     let pos = b.screen_to_doc(row, col, rows);
@@ -2469,7 +2886,10 @@ impl State {
                 },
             ) => {
                 let (rows, cols) = (self.editor_rows, self.editor_cols);
-                if let Ok(mut b) = self.buf().lock() {
+                // `read_target`, not `buf()`: with the Jira section showing, the
+                // wheel must move the dashboard rather than a file that isn't on
+                // screen.
+                if let Ok(mut b) = self.read_target().lock() {
                     // Both negated: a positive delta means "toward the start of
                     // the content", which is a smaller index.
                     let (dy, dx) = (-dy as isize, -dx as isize);
@@ -2492,10 +2912,24 @@ impl State {
                     t.scroll(delta);
                 }
             }
-            (Focus::Shell(id), GridMouse::Press { row, col, count }) => {
+            (Focus::Shell(id), GridMouse::Press {
+                row,
+                col,
+                count,
+                shift,
+            }) => {
                 if let Some(t) = self.pane(id).active().map(|s| s.terminal.clone())
                     && let Ok(mut t) = t.lock()
                 {
+                    // Shift+click opens a URL, the terminal convention. It falls
+                    // through to a normal selection when there isn't one under the
+                    // pointer, so the gesture is never simply dead.
+                    if shift
+                        && let Some(url) = t.url_at(row, col)
+                    {
+                        open_url(&url);
+                        return Task::none();
+                    }
                     match count {
                         1 => t.begin_selection(row, col, false),
                         2 => t.begin_selection(row, col, true),
@@ -2730,6 +3164,16 @@ impl State {
             .unwrap_or(false)
     }
 
+    /// Which buffer read-mode navigation and scrolling act on.
+    ///
+    /// The editor pane hosts more than one read-mode surface now — a markdown
+    /// file and the Jira dashboard — and they scroll independently. Deciding it
+    /// here means the key handler and the wheel handler cannot disagree about
+    /// which one moved, which is the bug they would otherwise take turns having.
+    fn read_target(&self) -> Arc<Mutex<Buffer>> {
+        self.buf().clone()
+    }
+
     /// Navigation only — read mode has nothing to type into.
     fn read_key(&mut self, key: &iced::keyboard::Key) {
         use iced::keyboard::Key;
@@ -2745,7 +3189,7 @@ impl State {
             Key::Named(Named::End) => isize::MAX / 2,
             _ => return,
         };
-        if let Ok(mut b) = self.buf().lock() {
+        if let Ok(mut b) = self.read_target().lock() {
             b.scroll_read(delta, rows, cols);
         }
     }
@@ -2849,6 +3293,73 @@ impl State {
     ) -> Element<'a, Message> {
         let strip_bg = self.palette.background;
         let divider = self.palette.dim();
+
+        // One cell of the strip, carrying its own slice of the underline.
+        //
+        // Per-cell rather than one rule across the whole strip, because only this
+        // way can the line break under the active tab. Nothing else could place
+        // that break: tab widths come from their text, so a separate strip-wide
+        // rule has no way to know where the boundaries fall.
+        //
+        // **The line is background-plus-padding, not a `rule`.** A
+        // `rule::horizontal` is `width: Fill`, so one inside each cell made every
+        // cell demand the full width and the row split itself evenly between them —
+        // all the tabs came out the same size. Painting the outer container the
+        // line colour and insetting the content by `TAB_BORDER` at the bottom
+        // leaves exactly the same 1px line, while the cell still sizes to its text.
+        // (`iced::Border` can't do this: it applies to all four sides at once.)
+        //
+        // An unlit cell paints `background` rather than dropping the inset, so every
+        // cell keeps identical geometry and nothing shifts by a pixel as the
+        // selection moves. Background rather than transparency because transparency
+        // isn't a theme colour — `theme_guard` enforces that.
+        // One cell of the strip. `lit` means the underline shows beneath it.
+        //
+        // **The line is not drawn here.** It's a single full-width `rule` behind
+        // the whole strip (see `line` below), and a cell either covers it or
+        // doesn't: the active tab is `Fill` height and paints over it, everything
+        // else stops `TAB_BORDER` short and lets it through.
+        //
+        // Painting a per-cell line as a container background instead is what
+        // introduced the subpixel blur. Tab widths come from measured text and so
+        // land on fractional positions; where two backgrounds abut at a fraction,
+        // rounding leaves a sliver of whatever is behind, and a line-coloured
+        // backdrop bled through those seams as hairlines — crisp at boundaries that
+        // happened to fall on whole pixels, blurry at the ones that didn't. A
+        // `rule` carries `snap: true`, which pins it to the physical pixel grid;
+        // container backgrounds have no equivalent. So: exactly one rule, snapped,
+        // and no cell ever painted the line colour.
+        // **Only the active cell paints.** Every other cell is transparent and lets
+        // the strip's own background through.
+        //
+        // This is a subpixel fix, not a tidy-up. The window runs at scale 1, so a
+        // logical pixel is a physical pixel and there is no supersampling to hide
+        // anything. Tab widths come from measured text, so a cell's edges land on
+        // fractional x — and a filled rect with a fractional edge is antialiased
+        // across the neighbouring column, which is exactly where the 1px separator
+        // rule sits. Each background therefore ate part of the rule beside it and
+        // it rendered as less than a full pixel. `Rule::draw` rounds its *own*
+        // position to a whole pixel, but nothing rounds a container background, so
+        // the rule was crisp and then partly painted over.
+        //
+        // With only the active tab painting, there is one fractional fill in the
+        // strip instead of one per cell.
+        // `covers`: this cell paints over the underline running beneath the strip
+        // instead of letting it through. True for the active tab and the separators
+        // flanking it; false for everything else.
+        let cell = |content: Element<'a, Message>, covers: bool| {
+            container(content)
+                .height(if covers {
+                    Length::Fill
+                } else {
+                    Length::Fixed(TAB_BAR_HEIGHT - TAB_BORDER)
+                })
+                .style(move |_theme| container::Style {
+                    background: covers.then(|| strip_bg.into()),
+                    ..container::Style::default()
+                })
+        };
+
         let mut tabs: Vec<Element<'a, Message>> = Vec::new();
 
         for (i, tab_label) in labels.into_iter().enumerate() {
@@ -2900,13 +3411,12 @@ impl State {
             if unreviewed {
                 line = line.push(self.marker(" ◇", self.palette.ansi_slot(UNREVIEWED_SLOT)));
             }
-            let tab = container(line)
-                .padding([4, 10])
-                .style(move |_theme| container::Style {
-                    background: Some(strip_bg.into()),
-                    ..container::Style::default()
-                });
-            tabs.push(
+            // No background: the strip paints one, and an extra fill here would be
+            // another fractional edge against the separator rule. See `cell`.
+            let tab = container(line).padding([4, 10]);
+            // The active tab is the cell that covers the underline; that break is
+            // what joins it to the pane below.
+            tabs.push(cell(
                 mouse_area(tab)
                     .on_press(Message::TabPressed(group, i))
                     // Middle-click closes, the usual tab-bar gesture.
@@ -2914,8 +3424,31 @@ impl State {
                     .on_enter(Message::TabHovered(Some((group, i))))
                     .on_exit(Message::TabExited(group, i))
                     .into(),
+                is_active,
+            ).into());
+            // Separators run the **full** height of the strip, always, and never go
+            // through `cell`.
+            //
+            // Full height because the separator is the tab's side border, and the
+            // bottom pixel of the strip is part of it. A separator that stopped at
+            // `TAB_BAR_HEIGHT - TAB_BORDER` left the border visibly 1px short at
+            // both bottom corners of every tab.
+            //
+            // Never covering because it doesn't need to: at a separator's column the
+            // underline and the rule are the same colour, so a full-height rule
+            // hides the line underneath it by painting over it identically. That is
+            // also what makes the active tab's break look right — it is bounded by
+            // two divider columns rather than by a stub of underline, which is the
+            // 1px artifact that started all this.
+            //
+            // Uniform, so the row's child count never changes with the selection.
+            // Removing separators near the active tab did change it, and the strip
+            // shifted every time the selection moved.
+            tabs.push(
+                container(vertical_divider(divider))
+                    .height(Length::Fill)
+                    .into(),
             );
-            tabs.push(vertical_divider(divider));
         }
 
         if let Some(msg) = plus {
@@ -2925,12 +3458,11 @@ impl State {
             // keeps one hover field rather than a second variant for it.
             let hovered =
                 self.tab_drag.is_none() && self.hovered_tab == Some((group, usize::MAX));
-            tabs.push(
+            tabs.push(cell(
                 mouse_area(
                     container(text("+").size(self.font.size).font(self.font.font))
                         .padding([4, 10])
                         .style(move |_theme| container::Style {
-                            background: Some(strip_bg.into()),
                             text_color: Some(if hovered { foreground } else { dim }),
                             ..container::Style::default()
                         }),
@@ -2939,27 +3471,37 @@ impl State {
                 .on_enter(Message::TabHovered(Some((group, usize::MAX))))
                 .on_exit(Message::TabExited(group, usize::MAX))
                 .into(),
-            );
+                false,
+            ).into());
             // No trailing divider. Separators sit *between* tabs, and the `+` is
             // the last thing in the strip — a rule after it would be dividing it
             // from empty space.
         }
 
-        let underline = rule::horizontal(TAB_BORDER).style(move |_theme| rule::Style {
-            color: divider,
-            radius: 0.0.into(),
-            fill_mode: rule::FillMode::Full,
-            snap: true,
-        });
-
         // The strip-wide `mouse_area` exists only to report the pointer's x in
         // one coordinate space. Per-tab `on_move` would give a position relative
         // to whichever tab is under the pointer, which jumps at every boundary
         // and would read as a direction reversal.
-        container(column![
-            mouse_area(container(row(tabs)).height(Length::Fill))
+        // The underline: one snapped rule spanning the strip, pinned to its
+        // bottom edge, drawn *behind* the tabs. The active tab covers its slice of
+        // it, which is what makes the line break there; the empty space past the
+        // last tab needs no filler cell, because the line already runs the full
+        // width underneath.
+        let line = column![
+            container(text("")).height(Length::Fill),
+            rule::horizontal(TAB_BORDER).style(move |_theme| rule::Style {
+                color: divider,
+                radius: 0.0.into(),
+                fill_mode: rule::FillMode::Full,
+                snap: true,
+            })
+        ]
+        .width(Length::Fill);
+
+        container(iced::widget::stack![
+            line,
+            mouse_area(row(tabs).height(Length::Fill))
                 .on_move(move |p| Message::TabPointerMoved(group, p.x)),
-            underline
         ])
         .width(Length::Fill)
         .height(Length::Fixed(TAB_BAR_HEIGHT))
@@ -2993,6 +3535,286 @@ impl State {
         self.tab_strip(TabGroup::Editor, labels, self.active, Some(Message::NewBuffer))
     }
 
+    /// The editor pane's outer strip: which section is showing.
+    ///
+    /// No `+` — the set of sections belongs to the app, not to something you add
+    /// to — and no markers, since a section has no file behind it to be dirty or
+    /// unreviewed. Otherwise it's the same control as the strips below and beside
+    /// it, deliberately: it's a tab strip, and it should read as one.
+    fn section_bar(&self) -> Element<'_, Message> {
+        let labels: Vec<TabLabel> = Section::ALL
+            .iter()
+            .map(|s| TabLabel {
+                name: s.label().to_string(),
+                dirty: false,
+                unreviewed: false,
+            })
+            .collect();
+        let active = Section::ALL
+            .iter()
+            .position(|s| *s == self.section)
+            .unwrap_or(0);
+        self.tab_strip(TabGroup::Section, labels, active, None)
+    }
+
+    /// The editor section: file tabs over the text surface.
+    ///
+    /// Everything below the section strip, so the file tabs are subtabs of this
+    /// section rather than chrome the pane always carries — switch section and
+    /// they go with it, because they describe *this* section's contents.
+    fn editor_section(&self) -> Element<'_, Message> {
+        // Read mode has no gutter — no source line numbers to show and nothing
+        // to fold — and swaps the source for the rendered one. Same widget
+        // either way.
+        let reading = self
+            .buf()
+            .lock()
+            .map(|b| b.view_mode() == buffer::ViewMode::Read)
+            .unwrap_or(false);
+        // `GridView` owns its source, so the choice is made by building the
+        // widget rather than by boxing twice.
+        let grid = if reading {
+            GridView::new(
+                read::ReadSource {
+                    buffer: self.buf().clone(),
+                },
+                &self.palette,
+                self.font,
+                Message::EditorResized,
+            )
+        } else {
+            GridView::new(
+                BufferSource {
+                    buffer: self.buf().clone(),
+                    rows: self.editor_rows,
+                    highlighter: self.highlighter.clone(),
+                    focused: self.focus == Focus::Editor,
+                },
+                &self.palette,
+                self.font,
+                Message::EditorResized,
+            )
+        }
+        .on_mouse(|g| Message::Mouse(Focus::Editor, g));
+        // `line_numbers = false` drops the gutter entirely rather than drawing
+        // an empty one.
+        let body: Element<'_, Message> = if reading {
+            grid.into()
+        } else if self.config.line_numbers {
+            row![
+                Gutter::new(self.buf().clone(), self.font, &self.palette)
+                    .on_fold(Message::ToggleFold),
+                grid
+            ]
+            .into()
+        } else {
+            grid.into()
+        };
+        // The tab strip is flush to the pane edges; only the content below it is
+        // inset. Padding the whole pane would leave the strip floating with a gap
+        // on three sides, and its underline would stop short of the pane's width
+        // instead of reading as a division of it.
+        column![self.tab_bar(), pad_content(body)].into()
+    }
+
+    /// The Jira dashboard: generated markdown through the read-mode renderer,
+    /// under a title and a clickable refresh control.
+    ///
+    /// The same `GridView` the editor and the shells use, with a third source.
+    /// No gutter and no tab strip — there are no source lines to number and
+    /// nothing to fold, and the dashboard is one view rather than a set of them.
+    ///
+    /// **The two headings are chrome, not markdown**, because a cell grid has no
+    /// hit-testing for the text inside it — `GridMouse` reports a row and a column,
+    /// not "you clicked the heading". Drawing them as `text` widgets is what makes
+    /// one of them clickable. They still look like headings: heading level in this
+    /// renderer is carried entirely by colour, so the same slot at the same size is
+    /// indistinguishable from a rendered `#`/`##`. The slots come from
+    /// `core::markdown` rather than being written out again here, so they cannot
+    /// drift from what the renderer would have produced.
+    fn jira_section(&self) -> Element<'_, Message> {
+        use sacrament_core::markdown;
+
+        let heading = |label: &'static str, slot: usize| {
+            text(label)
+                .size(self.font.size)
+                .font(self.font.font)
+                .color(self.palette.ansi_slot(slot))
+        };
+
+        // Brightening on hover *is* the affordance, and the cursor stays an arrow —
+        // the same choice the tab strips make. A hand cursor would claim this
+        // navigates somewhere, and no other control in the app shows one.
+        let slot = if self.jira.hovered {
+            REFRESH_HOVER_SLOT
+        } else {
+            REFRESH_SLOT
+        };
+        let refresh = mouse_area(heading("Refresh", slot))
+            .on_press(Message::JiraRefresh)
+            .on_enter(Message::JiraRefreshHovered(true))
+            .on_exit(Message::JiraRefreshHovered(false));
+        // Hidden while a fetch is in flight: it can't do anything then (a second
+        // press is refused by the `loading` guard), and a control that responds to
+        // nothing is worse than no control. Its absence is also a second, quieter
+        // signal that something is happening, alongside the body going to
+        // `JIRA_LOADING`.
+        //
+        // Deliberately *not* hidden on an error or when unconfigured: those are
+        // exactly the states where retrying — after fixing config.toml, or after
+        // the network came back — is the thing you want to do.
+        let loading = self.jira.loading;
+
+        let body: Element<'_, Message> = match &self.jira.view {
+            JiraView::Loading => self.jira_note("Loading..."),
+            JiraView::Note(msg) => self.jira_note(msg),
+            JiraView::Ready(page) => self.jira_tables(page),
+        };
+
+        // Spacing is one cell height, matching the gap a markdown block break used
+        // to leave. Padding is applied once around the whole column rather than to
+        // the body alone, which would leave the headings hanging outside the inset
+        // the content below them observes.
+        let mut stack = iced::widget::Column::new()
+            .spacing(self.font.cell_height())
+            .push(heading("Summary", markdown::h1_slot().index()));
+        if !loading {
+            stack = stack.push(refresh);
+        }
+
+        // The **whole** section scrolls, headings included, rather than a fixed
+        // header over a scrolling list. One scroll region reads as one document;
+        // pinning the title and the refresh control would spend two rows of a
+        // short pane on chrome that has nothing to say once you're reading.
+        //
+        // Content keeps its natural height inside — `Fill` there would clamp it to
+        // the viewport and there would be nothing to scroll.
+        // No scrollbar. The app has no other visible scroll affordance — the
+        // editor and the shells have none either — and one permanent bar down the
+        // side of a pane would be the only piece of chrome of its kind. Width and
+        // scroller both zero so it takes no space, rather than being painted
+        // `background`: a hidden bar that still reserved a column would inset the
+        // content for nothing.
+        let bar = scrollable::Scrollbar::new().width(0).scroller_width(0);
+        // Padding sits **inside** the scroll region, on the content, so it scrolls
+        // with it. Outside, the inset is a fixed frame and the first row is jammed
+        // against the top edge the moment you scroll.
+        container(
+            scrollable(container(stack.push(body)).padding(PANE_PADDING))
+                .direction(scrollable::Direction::Vertical(bar))
+                .height(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    /// Plain prose for the Jira section: loading, setup instructions, an error.
+    fn jira_note(&self, message: &str) -> Element<'_, Message> {
+        text(message.to_string())
+            .size(self.font.size)
+            .font(self.font.font)
+            .color(self.palette.foreground)
+            .into()
+    }
+
+    /// The dashboard: one real table per status group.
+    ///
+    /// Widgets rather than the markdown renderer, because a table drawn as *text*
+    /// cannot be responsive — its columns are measured in characters, so they can
+    /// only be sized for one pane width. `markdown::emit_table` scales columns
+    /// down when they don't fit but never truncates a cell, so a narrow pane
+    /// produced rows that each overflowed by a different amount and no column
+    /// lined up. Real columns size themselves to whatever width the pane has.
+    fn jira_tables(&self, page: &sacrament_core::jira::Page) -> Element<'_, Message> {
+        use sacrament_core::markdown;
+
+        let mut body = iced::widget::Column::new().spacing(self.font.cell_height());
+        for (status, issues) in sacrament_core::jira::group_by_status(&page.issues) {
+            body = body
+                .push(
+                    text(format!("{status} ({})", issues.len()))
+                        .size(self.font.size)
+                        .font(self.font.font)
+                        .color(self.palette.ansi_slot(markdown::h2_slot().index())),
+                )
+                .push(self.issue_table(&issues));
+        }
+        if page.more {
+            // The one thing that has to be said when it applies: a dashboard
+            // showing part of the result set without saying so is misleading.
+            body = body.push(
+                text("More issues matched than were fetched.")
+                    .size(self.font.size)
+                    .font(self.font.font)
+                    .color(self.palette.dim()),
+            );
+        }
+        body.into()
+    }
+
+    /// One status group's issues, as a table that fills the pane's width.
+    ///
+    /// **Every column is a `FillPortion`, and that is what keeps the rows aligned.**
+    /// Each row is its own widget, so a `Shrink` column would size independently
+    /// per row and the table would come out ragged. Portions give every row the
+    /// same proportional split at whatever width the pane happens to be.
+    ///
+    /// Summary takes the lion's share and wraps rather than truncating — the
+    /// character budget the text version needed is gone, along with the truncation
+    /// it forced.
+    fn issue_table(&self, issues: &[&sacrament_core::jira::Issue]) -> Element<'_, Message> {
+        let dim = self.palette.dim();
+        let fg = self.palette.foreground;
+        let cell = |content: String, portion: u16, color: iced::Color| {
+            text(content)
+                .size(self.font.size)
+                .font(self.font.font)
+                .color(color)
+                .width(Length::FillPortion(portion))
+        };
+
+        let mut table = iced::widget::Column::new().spacing(TABLE_ROW_GAP);
+
+        let mut header = iced::widget::Row::new().spacing(TABLE_COL_GAP);
+        for (label, portion) in JIRA_COLUMNS {
+            header = header.push(cell(label.to_string(), portion, dim));
+        }
+        table = table.push(header).push(rule::horizontal(TAB_BORDER).style(
+            move |_theme| rule::Style {
+                color: dim,
+                radius: 0.0.into(),
+                fill_mode: rule::FillMode::Full,
+                snap: true,
+            },
+        ));
+
+        for issue in issues {
+            let p = |i: usize| JIRA_COLUMNS[i].1;
+            table = table.push(
+                iced::widget::Row::new()
+                    .spacing(TABLE_COL_GAP)
+                    // Top, so a wrapped summary doesn't drag its row's other cells
+                    // down to the middle of it.
+                    .align_y(iced::Alignment::Start)
+                    .push(cell(issue.key.clone(), p(0), fg))
+                    .push(cell(
+                        issue.priority.clone().unwrap_or_else(|| "-".into()),
+                        p(1),
+                        dim,
+                    ))
+                    .push(cell(issue.kind.clone(), p(2), dim))
+                    .push(cell(
+                        issue.updated.clone().unwrap_or_else(|| "-".into()),
+                        p(3),
+                        dim,
+                    ))
+                    .push(cell(issue.summary.clone(), p(4), fg)),
+            );
+        }
+        table.into()
+    }
+
     /// Shell tabs for one pane, labelled by each shell's cwd basename.
     fn shell_tab_bar(&self, id: PaneId) -> Element<'_, Message> {
         let pane = self.pane(id);
@@ -3022,17 +3844,6 @@ impl State {
         // usually the background itself). Same source as the inactive line
         // numbers, so chrome stays one family.
         let divider = self.palette.dim();
-        // Insets a pane's *content*. Applied per child rather than to the pane, so
-        // chrome like the tab strip can sit flush while text stays off the edge.
-        fn pad_content<'a>(
-            content: impl Into<Element<'a, Message>>,
-        ) -> Element<'a, Message> {
-            container(content)
-                .padding(PANE_PADDING)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        }
 
         let grid = pane_grid(&self.panes, move |_pane, kind, _maximized| {
             let inner: Element<'_, Message> = match kind {
@@ -3062,62 +3873,15 @@ impl State {
                     };
                     column![self.shell_tab_bar(*id), body].into()
                 }
-                // The same widget, different source. This is the whole point of
-                // the abstraction — the editor pane isn't a second renderer.
+                // The pane holds several sections, of which the editor is one.
+                // The outer strip picks between them; the section decides what
+                // sits under it, including whether there are file subtabs at all.
                 PaneKind::Editor => {
-                    // Read mode has no gutter — no source line numbers to show
-                    // and nothing to fold — and swaps the source for the
-                    // rendered one. Same widget either way.
-                    let reading = self
-                        .buf()
-                        .lock()
-                        .map(|b| b.view_mode() == buffer::ViewMode::Read)
-                        .unwrap_or(false);
-                    // `GridView` owns its source, so the choice is made by
-                    // building the widget rather than by boxing twice.
-                    let grid = if reading {
-                        GridView::new(
-                            read::ReadSource {
-                                buffer: self.buf().clone(),
-                            },
-                            &self.palette,
-                            self.font,
-                            Message::EditorResized,
-                        )
-                    } else {
-                        GridView::new(
-                            BufferSource {
-                                buffer: self.buf().clone(),
-                                rows: self.editor_rows,
-                                highlighter: self.highlighter.clone(),
-                                focused: self.focus == Focus::Editor,
-                            },
-                            &self.palette,
-                            self.font,
-                            Message::EditorResized,
-                        )
-                    }
-                    .on_mouse(|g| Message::Mouse(Focus::Editor, g));
-                    // `line_numbers = false` drops the gutter entirely rather
-                    // than drawing an empty one.
-                    let body: Element<'_, Message> = if reading {
-                        grid.into()
-                    } else if self.config.line_numbers {
-                        row![
-                            Gutter::new(self.buf().clone(), self.font, &self.palette)
-                                .on_fold(Message::ToggleFold),
-                            grid
-                        ]
-                        .into()
-                    } else {
-                        grid.into()
+                    let body = match self.section {
+                        Section::Editor => self.editor_section(),
+                        Section::Jira => self.jira_section(),
                     };
-                    // The tab strip is flush to the pane edges; only the content
-                    // below it is inset. Padding the whole pane would leave the
-                    // strip floating with a gap on three sides, and its underline
-                    // would stop short of the pane's width instead of reading as a
-                    // division of it.
-                    column![self.tab_bar(), pad_content(body)].into()
+                    column![self.section_bar(), body].into()
                 }
             };
             let focus = match kind {
@@ -3339,6 +4103,16 @@ fn keymap(
     }
 }
 
+/// Insets a pane's *content*. Applied per child rather than to the pane, so
+/// chrome like the tab strips can sit flush while text stays off the edge.
+fn pad_content<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .padding(PANE_PADDING)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
 /// A 1px full-height separator in the given color.
 ///
 /// `iced::Border` applies to all four sides at once, so a single edge has to be a
@@ -3459,6 +4233,31 @@ mod key_tests {
             move_item(&mut v, from, to);
             assert_eq!(v[to], dragged, "moving {from} -> {to}");
             assert_eq!(v.len(), 4, "nothing lost or duplicated");
+        }
+    }
+
+    #[test]
+    fn only_the_strips_holding_user_opened_tabs_reorder() {
+        // The section strip is a fixed set, so a press there must start no drag —
+        // `move_tab` has nothing to move for it, and a drag would be asking to
+        // persist an order that means nothing next launch.
+        assert!(!TabGroup::Section.reorderable());
+        assert!(TabGroup::Editor.reorderable());
+        assert!(TabGroup::Shell(PaneId::Bottom).reorderable());
+    }
+
+    #[test]
+    fn every_section_is_reachable_from_its_strip_position() {
+        // `select_section` indexes `ALL` and `section_bar` finds the active one
+        // with `position`, which returns the *first* match — so a duplicate in
+        // `ALL` would leave one tab permanently unselectable.
+        for (i, section) in Section::ALL.iter().enumerate() {
+            assert_eq!(
+                Section::ALL.iter().position(|s| s == section),
+                Some(i),
+                "{} appears twice in ALL",
+                section.label()
+            );
         }
     }
 

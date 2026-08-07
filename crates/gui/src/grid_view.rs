@@ -41,8 +41,15 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// the app needs to correlate press/drag/release as a single gesture anyway.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GridMouse {
-    /// `count` is 1 for a single click, 2 for a double click.
-    Press { row: usize, col: usize, count: u8 },
+    /// `count` is 1 for a single click, 2 for a double click. `shift` is the
+    /// modifier state at press time — see `State::modifiers` for why the widget
+    /// has to remember it rather than read it off the event.
+    Press {
+        row: usize,
+        col: usize,
+        count: u8,
+        shift: bool,
+    },
     /// Cell under the cursor while the button is held. Clamped to the grid, so
     /// dragging past an edge extends to that edge rather than stopping.
     Drag { row: usize, col: usize },
@@ -67,6 +74,15 @@ struct State {
     dragging: bool,
     /// For double-click detection.
     last_press: Option<(Instant, usize, usize)>,
+    /// Modifier state, tracked because iced delivers it as its own event.
+    ///
+    /// A `mouse::Event::ButtonPressed` carries only the button — there is no
+    /// modifier field on it — so a shift-click is recognisable only by remembering
+    /// the last `keyboard::Event::ModifiersChanged`. Held per widget rather than in
+    /// the app because the app's key subscription sees modifiers *with a key
+    /// press*, which is a different question from "what was held during that
+    /// click".
+    modifiers: iced::keyboard::Modifiers,
     /// Sub-column scroll carried between events, for the same reason as
     /// `scroll_carry`: a trackpad's sideways movement is fractions of a column.
     scroll_carry_x: f32,
@@ -250,6 +266,12 @@ where
             shell.publish((self.on_resize)(rows, cols));
         }
 
+        // Tracked before the mouse-only early return, so the state is current by
+        // the time a press arrives.
+        if let Event::Keyboard(iced::keyboard::Event::ModifiersChanged(mods)) = event {
+            state.modifiers = *mods;
+        }
+
         let Some(on_mouse) = &self.on_mouse else {
             return;
         };
@@ -283,7 +305,12 @@ where
                 };
                 state.last_press = Some((now, row, col));
                 state.dragging = true;
-                shell.publish(on_mouse(GridMouse::Press { row, col, count }));
+                shell.publish(on_mouse(GridMouse::Press {
+                    row,
+                    col,
+                    count,
+                    shift: state.modifiers.shift(),
+                }));
                 // Claim it so pane_grid doesn't read the press as a splitter grab.
                 shell.capture_event();
             }

@@ -160,6 +160,26 @@ pub fn render(source: &str, width: usize) -> Vec<Line> {
 // hue already separates headings from body text far more clearly than weight
 // would. Heading level is carried entirely by color.
 const H1: Style = Style::fg(Slot::BRIGHT_MAGENTA);
+
+/// The slots a level-1 and level-2 heading render in.
+///
+/// Public because a frontend may draw headings as *chrome* rather than as
+/// markdown — the Jira section draws its title and its refresh control that way,
+/// so the latter can be clicked. Reading the colours from here is what keeps the
+/// widgets and the renderer from drifting apart, which a second hardcoded copy
+/// would eventually guarantee.
+///
+/// Heading level is carried entirely by colour here (see the palette note above),
+/// so a `text` widget in the same slot at the same size is indistinguishable from
+/// a rendered heading — there is no weight or size difference to reproduce.
+pub const fn h1_slot() -> Slot {
+    Slot::BRIGHT_MAGENTA
+}
+
+pub const fn h2_slot() -> Slot {
+    Slot::BRIGHT_YELLOW
+}
+
 const H2: Style = Style::fg(Slot::BRIGHT_YELLOW);
 const H3: Style = Style::fg(Slot::BRIGHT_CYAN);
 const H_REST: Style = Style::fg(Slot::CYAN);

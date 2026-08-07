@@ -24,7 +24,7 @@ so the frontend/model seam is a *compile error* rather than a discipline problem
 framework-independent belongs in `core`; if it needs a UI type, it doesn't.
 
 Currently in `core`: `config`, `session`, `git`, `lint`, `protocol`, `client`,
-`paths`, `theme`, `font`, `highlight`, `text`. Three sets of types moved out of v1's
+`paths`, `theme`, `font`, `highlight`, `text`, `jira`, `secret`. Three sets of types moved out of v1's
 `editor.rs`/`highlight.rs` to live with their producers — `ChangeKind` into
 `git`, `Severity`/`Diagnostic` into `lint`, and the whole highlighter into
 `core::highlight` with `Slot`/`Emphasis` replacing the ratatui color types (v1
@@ -214,6 +214,32 @@ editor buffer logic is work, not risk; it ports from a known-good v1.
   **`Ctrl+C` in a shell must stay SIGINT**, which the Cmd-only binding scheme
   gives for free: nothing in the app claims plain `Ctrl` at all, so copying is
   `Cmd+C` and every control code reaches the PTY untouched. See "Keybindings".
+
+  **`Shift+click` opens a URL** (`Terminal::url_at` → `open_url`), the terminal
+  convention, and it falls through to a normal selection when there's no URL under
+  the pointer so the gesture is never dead. Three things it gets right:
+
+  - **It reads the whole logical line, not the screen row.** A URL long enough to
+    be worth clicking is exactly the kind that wraps, so scanning one row would
+    find `https://example.com/a` and miss the `/b/c` that continued below.
+    `WRAPLINE` on a row's last cell joins them, and the walk follows it both ways.
+  - **Only `http`/`https` are ever returned, and that's a security boundary.**
+    macOS `open` launches a registered handler for *any* scheme, and terminal
+    output is routinely attacker-influenced — any file you `cat`, any repo you
+    clone. The allowlist means the worst a hostile line can do is open a web page.
+    `file://`, `vscode://` and friends are refused, with a test pinning it.
+  - **It does not use `grid_point`'s row clamping.** That clamp is right for a drag
+    (pulling below a short prompt should stop at the content) and wrong here: it
+    made a click on empty space resolve to the last line's link.
+
+  Trailing sentence punctuation and wrapping brackets are peeled off the candidate
+  — `see https://example.com/x.` must not include the full stop — but only from the
+  *end*, since `?`, `=` and `#` are ordinary inside a query string.
+
+  **Modifier state is tracked in `GridView::State`**, because iced's
+  `mouse::Event::ButtonPressed` carries no modifiers; a shift-click is only
+  recognisable by remembering the last `keyboard::Event::ModifiersChanged`. That's
+  why `GridMouse::Press` carries `shift`.
 - `pty.rs` — the non-obvious plumbing. `Subscription::run_with` takes a bare
   `fn(&D) -> S` with no captures, so the PTY must be built *inside* the stream,
   which leaves the app with no way to write to it. The stream's first item
@@ -235,6 +261,20 @@ editor buffer logic is work, not risk; it ports from a known-good v1.
 
   The bound on the wait matters too: an unconditional wait would hang forever if a
   size never came. A shell at the placeholder size beats no shell.
+
+  **The measured size is a property of the pane, not of the shell**
+  (`ShellPane::size`), and that is what makes the deferred spawn work for more
+  than one tab. `view` builds a `GridView` for `active()` only, so an *inactive*
+  tab never lays out and never reports a size — so on a restored session its PTY
+  waited out `SIZE_WAIT` and spawned zsh at 24x80, which is what the tab was still
+  showing when you switched to it. Measured on a 5-shell session: only the 2 active
+  shells were sized before spawn.
+
+  `GridResized` therefore applies the size to **every shell in the reporting
+  shell's pane**, and `Event::Attached` reads the size from the pane rather than
+  from its own terminal. Tabs in a pane all share the pane's geometry, so one
+  measurement is the correct answer for all of them. This replaced `Shell::sized`,
+  which asked a per-shell question that only the active shell could answer.
 
   **The shell is spawned as a *login* shell** —
   `CommandBuilder::new_default_prog()`, which resolves `$SHELL` (falling back to
@@ -374,11 +414,143 @@ the mapping and it fails rather than the two silently drifting on screen.
 can't live long enough to reach `draw`. This is also why `GridView` *owns* its
 source (`Box<dyn GridSource>`) rather than borrowing one.
 
-**All three panes have tab strips**, built from one `State::tab_strip` so they read
-as the same control. All carry a trailing `+`, and it means the same thing in each:
-one more of these. In a shell pane that's a new shell; in the editor a new empty
-buffer, the same as `Cmd+N`. Opening an existing file is `Cmd+O` — a `+` on a tab
-strip isn't "go find me a file".
+**Every tab strip is built from one `State::tab_strip`** so they read as the same
+control. There are four: the editor pane's *section* strip, the file strip below
+it, and one per shell pane. The three holding things the user opened carry a
+trailing `+`, and it means the same in each: one more of these. In a shell pane
+that's a new shell; in the editor a new empty buffer, the same as `Cmd+N`. Opening
+an existing file is `Cmd+O` — a `+` on a tab strip isn't "go find me a file". The
+section strip has no `+`, because the set of sections is the app's.
+
+#### Sections — the editor pane is not just the editor (`State::section`)
+
+The editor pane holds several **sections**, chosen by an outer tab strip:
+`Section::Editor` (the file tabs and the text surface, i.e. everything the pane
+used to be) and `Section::Jira` (the ticket dashboard — see "The Jira section").
+The file tabs are *subtabs of the editor section*, not chrome the pane always
+carries — switch section and they go with it, because they describe that
+section's contents.
+
+`Section::ALL` is the single definition of both the set and its left-to-right
+order: `section_bar` renders from it and `select_section` indexes back through it,
+so adding a section is a variant, a `label`, and an arm in `view`. A test pins that
+no variant appears twice in `ALL` — `section_bar` finds the active tab with
+`position`, which returns the *first* match, so a duplicate would leave one tab
+permanently unselectable.
+
+**`Focus::Editor` now names the pane, not the surface**, and that distinction is
+the whole correctness problem here. With Jira showing there is no text on screen
+and no caret, but focus is still `Editor` — so every command that reaches the
+buffer had to start asking `State::editing()` (`focus == Editor && section ==
+Editor`) instead. Without it, typing, `Cmd+Z`, `Cmd+/` and the arrow keys all edit
+a file the user cannot see. It's the same hole read mode has, closed the same way:
+**at the routing layer, once**, not inside each command.
+
+Read mode is deliberately *not* folded into `editing()`. It's a different question
+— there the text is on screen and merely can't be typed into — and the two give
+different answers for navigation keys.
+
+The rule that decides which commands survive a non-editor section:
+
+- **Commands that act on what's on screen are inert**: typing, paste, undo/redo,
+  copy/cut, select-all, comment, indent, fold, save, save-as, close tab, select
+  tab N, cycle tabs. Nothing is lost by refusing — the buffer stays dirty and
+  saveable, and the quit prompt still catches it.
+- **Commands whose purpose is to show you something switch back** (`show_editor`):
+  `Cmd+O`, a dropped file, a non-review IPC open, `Cmd+N`/`Cmd+T`, `Cmd+F`,
+  `Ctrl+G`, `Cmd+G`, `Cmd+Shift+M`. A tab nobody can see isn't an answer to "open
+  this".
+- **A `--review` open still doesn't switch**, for the reason it doesn't take the
+  active tab either: a tool writing files in the background must not yank the view.
+
+Two smaller things:
+
+- **Section tabs don't reorder.** `TabGroup::reorderable()` is false for
+  `TabGroup::Section`, so `TabPressed` starts no drag — the set is fixed, and a
+  drag would have to persist an order that means nothing next launch. Answered by
+  the group rather than by a parameter to `tab_strip`, so the fact lives in one
+  place. `move_tab`'s `Section` arm is therefore unreachable, and says so rather
+  than being a `_` that would silently absorb a future group that *should* reorder.
+- **The active section isn't persisted.** A section has no state of its own to
+  restore, and landing on the editor is right for a launch that was given files.
+
+**Fixed on the way past**: `Message::Pasted` was gated on neither read mode nor
+(now) the section. Paste arrives as its own message rather than through `keymap`,
+so the key dispatch's read-mode arm never covered it — meaning `Cmd+V` in read mode
+edited the source behind the rendering, exactly the v1 hole this file claims v2
+closed. It now requires `editing() && !reading()`.
+
+Not added, and worth knowing they're absent: no keybinding switches sections
+(clicking is the only way), and `Cmd+1..9` still means "select file tab N", not
+"select section N".
+
+#### The Jira section (`core::jira`, `core::secret`, `State::jira`)
+
+A read-only ticket dashboard. The full build plan for the Jira work — including
+the four steps after this one — is `docs/jira-integration.md`; this section covers
+only what shipped and the seams it established.
+
+**The dashboard is real widgets, not the markdown renderer** — and that was a
+reversal. It began as generated markdown fed through `read::ReadSource`, which
+cost no new drawing code, but **a table drawn as text cannot be responsive**: its
+columns are measured in characters, so they can only be sized for one pane width.
+`markdown::emit_table` scales columns down when they don't fit and *never*
+truncates a cell, so at a narrower width every row overflowed by a different
+amount and no column lined up with the one above it. A character budget on the
+summary bought alignment at one width and lost it at every other.
+
+So `core::jira` hands over structured `Issue`s and `jira_tables` lays them out.
+**Every column is a `FillPortion`** (`JIRA_COLUMNS`), which is what keeps rows
+aligned: each row is its own widget, so a `Shrink` column would size independently
+per row and the table would come out ragged. Portions give every row the same
+proportional split at whatever width the pane has, and summaries wrap instead of
+being truncated.
+
+The section still draws its two headings as chrome (see below) and still takes
+its heading colours from `core::markdown`, so it matches rendered markdown
+elsewhere. What it no longer does is render *through* it.
+
+`Buffer::markdown_view` was built for the earlier approach and removed with it. If
+a future section wants generated prose in the grid, that constructor — a path-less
+buffer forced into read mode — is the shape to bring back; it's in the history.
+
+`read_target()` is **the single decision of which buffer scrolls.** The editor pane
+hosts two read-mode surfaces now — a markdown file and the dashboard — and both the
+key handler (`read_key`) and the wheel handler ask it. Two independent answers to
+"which one moved" is the bug they would otherwise take turns having.
+
+**Secrets do not go in `config.toml`.** That file is plaintext, hand-edited, and
+*shared with v1*, so an API token in it would sit in the file users paste into
+issue reports. `core::secret::lookup` reads the environment variable first (the
+scriptable override) then the macOS Keychain via the `security` CLI — no crate
+needed, and the allow prompt is the system's own. A Dock-launched app inherits
+launchd's environment rather than a shell's, so the Keychain is the path that
+matters in practice and the env var is for development. Non-secret settings
+(`site`, `email`, `query`) stay in `[jira]` where they can be seen and edited.
+
+Three smaller decisions:
+
+- **`Task::perform`, not a subscription.** A fetch is one request and one
+  response, unlike the PTY's stream, so it needs none of the channel machinery
+  `pty`/`watch`/`ipc` share. The blocking `ureq` call holds one thread-pool thread
+  for the request; iced's executor here is `thread-pool`, so **no tokio** — which
+  `reqwest`'s async stack would have dragged in.
+- **Setup instructions are the dashboard; failures are both.** An unconfigured
+  integration is a normal state, not an error, and setup text is something to read
+  and copy from — which a dialog with an OK button is bad at. A *fetch failure*
+  raises an alert **and** leaves the text in the pane, so it survives being
+  acknowledged rather than leaving a stale dashboard behind.
+- **The first fetch is on first show, not at startup,** gated on
+  `JiraPane::attempted` so a failure doesn't re-fire on every visit. An app
+  launched to edit a file shouldn't make a network request nobody asked for.
+
+**Untested against a live instance.** `parse` is covered against captured JSON and
+tolerates missing fields throughout (Jira omits what an account can't see, so one
+thin issue must not lose the other forty-nine). `SEARCH_PATH` points at
+`/rest/api/3/search/jql`, which replaced the deprecated `/rest/api/{2,3}/search`;
+if an instance disagrees the 404 message names the older path, and the constant is
+a one-line change. Descriptions are *not* fetched here — on API v3 they arrive as
+an ADF document tree, which is why the plan has step 2 read bodies through v2.
 
 **Shell tabs made PTY identity dynamic.** `ShellKey { pane, serial }` replaced the
 fixed two-variant enum, and `subscription()` builds one `run_with(key, …)` per live
@@ -511,11 +683,85 @@ background.
 Separators sit *between* tabs, so there's none after the trailing `+` — a rule
 there would be dividing the `+` from empty space.
 
+**Separators run the full height of the strip and never go through `cell`.** The
+separator is a tab's side border, and the strip's bottom pixel is part of it — so a
+separator that stops at `TAB_BAR_HEIGHT - TAB_BORDER` leaves the border visibly 1px
+short at *both* bottom corners of *every* tab.
+
+They also don't need to cover the underline: at a separator's column the rule and
+the underline are the same colour, so a full-height rule hides the line by painting
+over it identically. That is what makes the active tab's break read correctly — it
+is bounded by two divider columns rather than by a stub of underline.
+
+Two ways of handling the separator near the active tab were tried and both were
+wrong, in ways worth remembering:
+
+- **Removing it.** The active tab loses its side borders entirely, and because the
+  row loses a child the whole strip shifts every time the selection moves. **The
+  cell count must not depend on which tab is active.**
+- **Making it cover, with its rule wrapped to the short height.** Keeps the layout
+  stable, but the covering cell is full height while the rule is one pixel shorter,
+  so the bottom pixel of the border becomes background — the missing corner above,
+  now on every tab.
+
 The strip's underline and the separators between tabs are `rule` widgets, not a
 `Border`: `iced::Border` applies to all four sides at once, so there's no way to
 ask it for "bottom only" or "right only". A 1px rule per edge is how you get a
 single side. Both use `Palette::dim()`, the same slot as the pane divider and the
 inactive line numbers, so every chrome line shares one color.
+
+**The underline breaks under the active tab**, so that tab reads as joined to the
+pane below it while every other tab and the empty space past them stay fenced off.
+
+It is still **one rule**, not one per tab: a `stack!` puts a single full-width
+`rule::horizontal` at the bottom of the strip and the tabs on top of it. A cell
+either covers its slice or doesn't — the active tab is `Length::Fill` tall and
+paints over the line, every other cell stops `TAB_BORDER` short and lets it
+through. The empty space past the last tab needs no filler, because the rule
+already spans the full width underneath.
+
+**Two per-cell approaches were tried first and both were wrong**, which is worth
+recording because each looked obviously correct:
+
+1. **A `rule` inside each cell's column.** `rule::horizontal` is `width: Fill`, so
+   every cell demanded the whole strip and the row split itself evenly between
+   them — all the tabs came out the same width.
+2. **A background-plus-padding border per cell** (outer container painted the line
+   colour, content inset 1px at the bottom). This sized correctly but introduced
+   **subpixel blur**: tab widths come from measured text and land on fractional
+   positions, so where two cell backgrounds abut, rounding leaves a sliver of
+   whatever is behind — and a line-coloured backdrop bled through those seams as
+   hairlines, crisp at boundaries that happened to fall on whole pixels and blurry
+   at the ones that didn't. It also filled the whole negative space with the line
+   colour, because the filler's content painted no background over it.
+
+**`snap: true` does nothing on this build, and that is worth knowing before
+trusting it.** `renderer::Quad::snap` is consumed *only* by `iced_wgpu` — there
+are zero references to it in `iced_tiny_skia`, `iced_graphics`, or
+`iced_renderer`, and we build with tiny-skia. iced's `crisp` feature is no help
+either: all it does is default that same dead field to `true`. The rule styles in
+this file set `snap: true` because it is correct intent and costs nothing, not
+because it protects anything.
+
+What actually keeps a rule crisp is `Rule::draw` rounding **its own** position
+(`bounds.x.round()` for a vertical, `bounds.y.round()` for a horizontal). Nothing
+rounds anything else.
+
+**Which is why cells don't paint.** This display runs at **scale 1** — a logical
+pixel is a physical pixel, with no supersampling to hide anything. Tab widths come
+from measured text, so cell edges land on fractional x, and a filled rect with a
+fractional edge is antialiased across the neighbouring column — exactly where the
+1px separator sits. Every per-cell background therefore painted over part of the
+rule next to it, and the separators rendered as less than a full pixel. Only the
+active tab paints a background now (it has to, to break the underline), so there
+is one fractional fill in the strip instead of one per cell.
+
+The general rule: **anything that must be a hairline is a `rule`, and nothing else
+gets a fill it doesn't need** — at scale 1 every extra filled rect is a chance to
+antialias over one.
+
+Because `tab_strip` is shared, this applies to all four strips at once — the
+section strip, the file strip, and both shell panes.
 
 Tab text uses `font.size` — the same size as the editor and the shells, so the
 chrome doesn't read as a different app.
@@ -645,11 +891,17 @@ none of which worked while the app was intercepting them globally.
 | `Ctrl+G` | Goto line (prompt) |
 | `Option+←` / `→` | Word left / right (`Shift` extends) |
 | `Cmd+Shift+M` | Toggle markdown read mode |
+| `Cmd+R` | Refresh the section, where it has something to refresh (Jira; the editor is kept current by the watcher) |
 | `Cmd+Shift+R` | Reset metrics counters (only visible under `SACRAMENT_METRICS`) |
 | `Ctrl+1` / `2` / `3` | Focus editor / bottom shell / right shell |
 
 `Cmd+G` is find-next, the macOS convention, so goto-line takes `Ctrl+G` —
 Sublime's binding. Both of the app's non-`Cmd` chords go through `is_app_ctrl`.
+
+**Every editor binding in this table is conditional on the editor *section* being
+the one on screen**, not merely on the pane having focus — `State::editing()`, not
+`focus == Focus::Editor`. Some are inert while another section shows and some
+switch back to the editor; which is which, and why, is under "Sections".
 
 Four things here are load-bearing:
 
@@ -847,6 +1099,21 @@ rendered one. Same widget, different `GridSource` — the editor pane isn't a
 second renderer. The gutter disappears with it: there are no source line numbers
 to show and nothing to fold.
 
+**Markdown opens rendered.** `open_path` calls `set_read_mode` on a fresh load —
+which gates on the extension itself, so nothing else needs checking — because a
+markdown file is a document first and source second. `Cmd+Shift+M` gets to the
+source.
+
+Two carve-outs, both because they mean "show me the source":
+
+- **A requested line opts out.** `sacrament NOTES.md:42` asks for source line 42,
+  and read mode has no such thing — its rows are *rendered* rows, which don't
+  correspond to source lines at all. Honoring the line means showing the source.
+- **Session restore is untouched.** It reproduces the mode you left
+  (`SessionBuffer::read_mode`), rather than reapplying the default over it. Note v1
+  writes `read_mode = false` unconditionally, so a session written by v1 restores
+  markdown in edit mode — correct, since that's what the session says.
+
 **The renderer does not wrap, and that is the whole point of the port.** v1
 wrapped inline text inside `markdown.rs` and handed finished lines to a
 `Paragraph` that did no wrapping of its own, so wrapping only happened where the
@@ -883,6 +1150,12 @@ reading is restricted to press/drag/release. Matching `_` there ate the wheel.
 gestures are swallowed, and paste is gated too. v1 gated its key handler and left
 `Event::Paste` free to edit the source behind the rendering — its own notes call
 that out, and doing it one level up covers every editing path at once.
+
+The paste gate is the one that has to be *stated separately*, and this file claimed
+it before it was true. `Message::Pasted` doesn't come through `keymap`, so the
+`reading()` key arm never covered it, and `Cmd+V` in read mode edited the source
+until the gate was added explicitly (see "Sections"). "One level up" only covers
+paths that actually pass through that level.
 
 Colors are `Slot`s, so `[theme]` drives them. Strikethrough renders as muted text:
 `Emphasis` has no strikethrough and a cell grid has nowhere to draw one.
