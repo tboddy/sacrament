@@ -17,6 +17,7 @@
 //! input, mouse forwarding, OSC handling. Those are cheap once the grid is
 //! proven; they're the reason the grid is proven first.
 
+mod blocks;
 mod buffer;
 mod grid;
 mod ipc;
@@ -831,11 +832,28 @@ impl Shell {
     /// last project or `/` depending on how it was started — unpredictable from
     /// the user's side. Restored shells go through `in_dir` with their saved
     /// directory and are unaffected.
-    fn new(key: ShellKey) -> Self {
-        Self::in_dir(key, sacrament_core::paths::home_dir())
+    fn new(key: ShellKey, size: Option<(usize, usize)>) -> Self {
+        Self::in_dir(key, sacrament_core::paths::home_dir(), size)
     }
 
-    fn in_dir(key: ShellKey, start_cwd: Option<std::path::PathBuf>) -> Self {
+    /// `size` is the pane's measured body size, or `None` before any grid has
+    /// reported one.
+    ///
+    /// **A new tab in an already-measured pane must start at that size, not at the
+    /// placeholder**, because nothing will correct it: `GridView` publishes a size
+    /// only when it *changes* (`State::reported`), and iced reuses one widget state
+    /// for the pane's grid however many tabs come and go — so a new tab in a pane
+    /// whose size is already published sees no `GridResized` at all. Its PTY is
+    /// still told the truth (`Event::Attached` reads the pane), which is precisely
+    /// what makes the mismatch visible: zsh writes `COLUMNS` cells into a grid
+    /// 80 wide, they wrap, and its partial-line marker is stranded on the row above
+    /// the prompt.
+    fn in_dir(
+        key: ShellKey,
+        start_cwd: Option<std::path::PathBuf>,
+        size: Option<(usize, usize)>,
+    ) -> Self {
+        let (rows, cols) = size.unwrap_or((24, 80));
         Self {
             key,
             label: start_cwd
@@ -847,9 +865,9 @@ impl Shell {
                         .unwrap_or_else(|_| "shell".to_string())
                 }),
             start_cwd,
-            terminal: Arc::new(Mutex::new(Terminal::new(24, 80))),
+            terminal: Arc::new(Mutex::new(Terminal::new(rows, cols))),
             handle: None,
-            rows: 24,
+            rows,
             pid: None,
             last_cwd_check: None,
             scroll_px: 0.0,
@@ -1005,13 +1023,15 @@ impl State {
                 .map(|s| {
                     let key = ShellKey { pane: id, serial };
                     serial += 1;
-                    Shell::in_dir(key, Some(s.cwd.clone()))
+                    // No grid has laid out yet at startup, so there is no size to
+                    // pass; the first `GridResized` reaches every tab in the pane.
+                    Shell::in_dir(key, Some(s.cwd.clone()), None)
                 })
                 .collect();
             if shells.is_empty() {
                 let key = ShellKey { pane: id, serial };
                 serial += 1;
-                shells.push(Shell::new(key));
+                shells.push(Shell::new(key, None));
             }
             let active = active.min(shells.len() - 1);
             ShellPane {
@@ -1609,7 +1629,8 @@ impl State {
         };
         self.next_shell_serial += 1;
         let pane = self.pane_mut(id);
-        pane.shells.push(Shell::new(key));
+        let size = pane.size;
+        pane.shells.push(Shell::new(key, size));
         pane.active = pane.shells.len() - 1;
         self.focus = Focus::Shell(id);
         self.persist();
@@ -4196,6 +4217,48 @@ fn vertical_divider(color: iced::Color) -> Element<'static, Message> {
             snap: true,
         })
         .into()
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_tab_starts_at_its_panes_measured_size() {
+        // Nothing corrects this later: `GridView` publishes a size only when it
+        // *changes*, and one widget state serves the pane's grid however many tabs
+        // come and go — so a tab added to an already-measured pane never sees a
+        // `GridResized`. Its PTY is told the pane's real size regardless
+        // (`Event::Attached`), and that gap is what put zsh's partial-line marker
+        // on the row above the prompt: `COLUMNS` cells wrapping against a grid
+        // still 80 wide.
+        let key = ShellKey {
+            pane: PaneId::Bottom,
+            serial: 7,
+        };
+        let shell = Shell::new(key, Some((40, 173)));
+        let mut term = shell.terminal.lock().unwrap();
+        assert!(
+            !term.resize(40, 173),
+            "the terminal should already be at the pane's size"
+        );
+        assert!(term.resize(40, 174), "a real change must still register");
+    }
+
+    #[test]
+    fn an_unmeasured_pane_leaves_the_placeholder_alone() {
+        // First launch: no grid has laid out, so there is no size to adopt and the
+        // placeholder stands until the first `GridResized` reaches the whole pane.
+        let shell = Shell::new(
+            ShellKey {
+                pane: PaneId::Right,
+                serial: 0,
+            },
+            None,
+        );
+        let mut term = shell.terminal.lock().unwrap();
+        assert!(!term.resize(24, 80));
+    }
 }
 
 #[cfg(test)]

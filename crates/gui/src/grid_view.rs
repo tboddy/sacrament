@@ -30,6 +30,7 @@ use iced::advanced::{Clipboard, Shell, Widget};
 use iced::alignment;
 use iced::{Color, Element, Event, Length, Point, Rectangle, Size, mouse};
 
+use crate::blocks;
 use crate::font::FontSpec;
 use crate::grid::{Cell, GridSource};
 use crate::palette::Palette;
@@ -423,10 +424,29 @@ where
         let mut grid: Vec<Vec<Cell>> = Vec::with_capacity(drawn);
         self.source.fill(self.palette, drawn, cols, &mut grid);
 
+        // Every position below comes from these two, and that is what removes the
+        // seams. Neither the advance (`size * 0.537`) nor the row pitch (`size *
+        // line_height`) is a whole number of pixels at any usable size, so a cell
+        // boundary lands mid-pixel — and two shapes meeting there each contribute
+        // partial coverage, which source-over composites sequentially rather than
+        // summing: `0.5 + 0.5(1 - 0.5)` is 0.75, so a quarter of the background
+        // shows through as a hairline. At scale 1 there's no supersampling to hide
+        // it, and it drifts across the grid in slow bands as the fractional part
+        // accumulates.
+        //
+        // Rounding a *shared* boundary fixes it by construction: cell k's right
+        // edge and cell k+1's left edge are the same expression, so they can't
+        // disagree. Cells then come out 7px or 8px wide instead of a uniform 7.5,
+        // which is invisible for a solid fill and is how every terminal that draws
+        // its own blocks does it. Glyphs get the same treatment for a second
+        // reason — at 1x a glyph on a fractional baseline is blurry.
+        let col_x = |col: usize| (bounds.x + col as f32 * cw).round();
+        let row_y = |row: usize| (bounds.y + row as f32 * ch - shift).round();
+
         // Background spans: one quad per contiguous same-color run, skipping the
         // default (already covered by the pane background above).
         for (row_idx, cells) in grid.iter().enumerate() {
-            let y = bounds.y + row_idx as f32 * ch - shift;
+            let (y, y_next) = (row_y(row_idx), row_y(row_idx + 1));
             let mut i = 0usize;
             while i < cells.len() {
                 let bg = cells[i].bg;
@@ -440,22 +460,70 @@ where
                 }
                 renderer.fill_quad(
                     cell_quad(Rectangle {
-                        x: bounds.x + start as f32 * cw,
+                        x: col_x(start),
                         y,
-                        width: (i - start) as f32 * cw,
-                        height: ch,
+                        width: col_x(i) - col_x(start),
+                        height: y_next - y,
                     }),
                     bg,
                 );
             }
         }
 
+        // Block elements (U+2580..259F) as rectangles rather than glyphs. Drawn
+        // between the backgrounds and the text because they sit on their own
+        // cell's background and replace its glyph — `blocks::rects` answering
+        // `Some` is what keeps the text pass below from drawing them twice.
+        for (row_idx, cells) in grid.iter().enumerate() {
+            let (top, bottom) = (row_y(row_idx), row_y(row_idx + 1));
+            let mut col = 0usize;
+            while col < cells.len() {
+                let cell = &cells[col];
+                let Some(rects) = blocks::rects(cell.c) else {
+                    col += 1;
+                    continue;
+                };
+                // Snapping already makes neighbours abut exactly, so merging is
+                // only about draw calls — but block-heavy output is *all* these
+                // characters, and a full-width bar is one quad instead of eighty.
+                let mut end = col + 1;
+                if let Some(span) = blocks::merges_horizontally(cell.c) {
+                    while end < cells.len()
+                        && cells[end].fg == cell.fg
+                        && blocks::merges_horizontally(cells[end].c) == Some(span)
+                    {
+                        end += 1;
+                    }
+                }
+                let (left, right) = (col_x(col), col_x(end));
+                for &(x0, y0, x1, y1) in rects {
+                    let x = blocks::edge(left, right, x0);
+                    let y = blocks::edge(top, bottom, y0);
+                    renderer.fill_quad(
+                        cell_quad(Rectangle {
+                            x,
+                            y,
+                            // A thin part of a small cell can round to nothing,
+                            // and a vanished eighth is worse than one drawn a
+                            // pixel wide.
+                            width: (blocks::edge(left, right, x1) - x).max(1.0),
+                            height: (blocks::edge(top, bottom, y1) - y).max(1.0),
+                        }),
+                        cell.fg,
+                    );
+                }
+                col = end;
+            }
+        }
+
         // Text runs, coalesced by color + emphasis.
         for (row_idx, cells) in grid.iter().enumerate() {
-            let y = bounds.y + row_idx as f32 * ch - shift;
+            let y = row_y(row_idx);
             let mut runs: Vec<Run> = Vec::new();
             for (col, cell) in cells.iter().enumerate() {
-                if cell.is_blank() {
+                // Blocks were drawn as quads above. Skipping breaks the run for
+                // free, since extending requires the columns to be contiguous.
+                if cell.is_blank() || blocks::rects(cell.c).is_some() {
                     continue;
                 }
                 // A glyph the font doesn't have would draw as nothing under
@@ -487,7 +555,14 @@ where
             for run in runs {
                 let (font, shaping) =
                     self.draw_font(run.glyphs, run.bold, run.italic);
-                let width = run.text.chars().count() as f32 * cw;
+                // The run's *natural* advance width, not the distance between its
+                // snapped ends — which can be a pixel short, and a text bounds a
+                // pixel short of its content drops the last glyph onto a second
+                // line inside the same text object, i.e. one row down the screen.
+                // A pixel of slack costs nothing: with left/top alignment and no
+                // wrapping this bounds only governs overflow, and the real
+                // clipping is `clip`.
+                let width = run.text.chars().count() as f32 * cw + 1.0;
                 renderer.fill_text(
                     text::Text {
                         content: run.text,
@@ -500,7 +575,7 @@ where
                         shaping,
                         wrapping: text::Wrapping::None,
                     },
-                    Point::new(bounds.x + run.col as f32 * cw, y),
+                    Point::new(col_x(run.col), y),
                     run.fg,
                     clip,
                 );
@@ -511,16 +586,17 @@ where
             && crow < rows
             && ccol < cols
         {
-            let x = bounds.x + ccol as f32 * cw;
-            // Same shift as the text, or the caret drifts off its own glyph while
-            // the view sits between rows.
-            let y = bounds.y + crow as f32 * ch - shift;
+            // Same snapped grid as everything else, or the caret sits half a pixel
+            // off the glyph it covers — and the same shift as the text, or it
+            // drifts off it entirely while the view sits between rows.
+            let (x, x_next) = (col_x(ccol), col_x(ccol + 1));
+            let (y, y_next) = (row_y(crow), row_y(crow + 1));
             renderer.fill_quad(
                 cell_quad(Rectangle {
                     x,
                     y,
-                    width: cw,
-                    height: ch,
+                    width: x_next - x,
+                    height: y_next - y,
                 }),
                 self.palette.cursor,
             );
@@ -535,24 +611,43 @@ where
             if let Some(cell) = grid.get(crow).and_then(|r| r.get(ccol))
                 && !cell.is_blank()
             {
-                let (font, shaping) =
-                    self.draw_font(self.glyphs_for(cell.c), cell.bold, cell.italic);
-                renderer.fill_text(
-                    text::Text {
-                        content: cell.c.to_string(),
-                        bounds: Size::new(cw, ch),
-                        size: self.font.size.into(),
-                        line_height: text::LineHeight::Relative(self.font.line_height),
-                        font: font.into(),
-                        align_x: text::Alignment::Left,
-                        align_y: alignment::Vertical::Top,
-                        shaping,
-                        wrapping: text::Wrapping::None,
-                    },
-                    Point::new(x, y),
-                    self.palette.background,
-                    clip,
-                );
+                // A block under the caret is a quad, not a glyph — reversing it
+                // means redrawing its rects, or the cell comes out solid and the
+                // shape it was showing is lost.
+                if let Some(rects) = blocks::rects(cell.c) {
+                    for &(x0, y0, x1, y1) in rects {
+                        let rx = blocks::edge(x, x_next, x0);
+                        let ry = blocks::edge(y, y_next, y0);
+                        renderer.fill_quad(
+                            cell_quad(Rectangle {
+                                x: rx,
+                                y: ry,
+                                width: (blocks::edge(x, x_next, x1) - rx).max(1.0),
+                                height: (blocks::edge(y, y_next, y1) - ry).max(1.0),
+                            }),
+                            self.palette.background,
+                        );
+                    }
+                } else {
+                    let (font, shaping) =
+                        self.draw_font(self.glyphs_for(cell.c), cell.bold, cell.italic);
+                    renderer.fill_text(
+                        text::Text {
+                            content: cell.c.to_string(),
+                            bounds: Size::new(cw + 1.0, ch),
+                            size: self.font.size.into(),
+                            line_height: text::LineHeight::Relative(self.font.line_height),
+                            font: font.into(),
+                            align_x: text::Alignment::Left,
+                            align_y: alignment::Vertical::Top,
+                            shaping,
+                            wrapping: text::Wrapping::None,
+                        },
+                        Point::new(x, y),
+                        self.palette.background,
+                        clip,
+                    );
+                }
             }
         }
     }

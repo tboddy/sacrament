@@ -189,6 +189,70 @@ editor buffer logic is work, not risk; it ports from a known-good v1.
   `Paragraph::min_bounds` over a repeated glyph, not derived from an assumed
   monospace ratio, because every position downstream (background quads, cursor,
   eventual mouse hit-testing) is computed from them.
+
+  **Every drawn position goes through `col_x` / `row_y`, which round.** Neither
+  the advance (`size * 0.537`) nor the row pitch (`size * line_height`) is a whole
+  number of pixels at any usable size, so a cell boundary lands mid-pixel — and
+  two shapes meeting there each contribute partial coverage, which source-over
+  composites *sequentially* rather than summing: `0.5 + 0.5(1 - 0.5)` is 0.75, so
+  a quarter of the background shows through as a hairline. At scale 1 there is no
+  supersampling to hide it, and because the fractional part accumulates across the
+  grid it appears in slow bands rather than uniformly, which reads as a rendering
+  glitch rather than as arithmetic.
+
+  Rounding a **shared** boundary fixes it by construction: cell `k`'s right edge
+  and cell `k+1`'s left edge are the same expression, so they cannot disagree.
+  Cells come out 7px or 8px wide instead of a uniform 7.5. That is invisible for a
+  solid fill, and for glyphs it's an improvement — a glyph on a fractional
+  baseline is blurry at 1x.
+
+  **The `bounds` handed to `fill_text` is the run's natural advance width, not the
+  distance between its snapped ends.** Snapping can leave that distance a pixel
+  short of the content, and a text bounds a pixel short **drops the last glyph
+  onto a second line inside the same text object** — which lands a row down the
+  screen. `Wrapping::None` does not prevent it. The symptom is unmistakable once
+  seen and baffling until then: `struct Foo` renders as `struc  Fo` with a stray
+  `t` on the line below, on roughly half the runs, so a syntax-highlighted screen
+  comes apart into confetti. A pixel of slack is added on top: with left/top
+  alignment and no wrapping this bounds governs only overflow, and the real
+  clipping is `clip`.
+- `blocks.rs` — **U+2580..259F are drawn as rectangles, not glyphs.** The seam
+  above is worst where it matters most: a run of `█` is *supposed* to be one
+  unbroken bar, and no font can make it one, because the gap is between the glyphs
+  rather than inside them. Envy Code R already gives its blocks a 6-unit
+  horizontal overhang for exactly this and it isn't close to enough. Every serious
+  terminal (Alacritty, kitty, WezTerm, Ghostty) draws these procedurally.
+
+  `blocks::rects(c)` is pure geometry — fractions of a cell — and `blocks::edge`
+  maps a fraction onto a pair of already-snapped boundaries, leaving the endpoints
+  untouched so an edge that *is* a cell boundary keeps the exact value its
+  neighbour will use. Four things about it:
+
+  - **Snapping is what removes the seam; merging is only an optimisation.**
+    Adjacent cells abut exactly whether or not they're coalesced, so
+    `merges_horizontally` exists to turn an 80-cell bar into one quad, not to make
+    it correct. It answers `Some` only for a single full-width rect, since that's
+    the only shape that tiles into one rectangle.
+  - **The shades `░▒▓` (U+2591..2593) stay glyphs, deliberately.** They're 25/50/75%
+    stipple, so a rect version needs either a real dot pattern or a blended
+    colour — and a blend is a colour the user's `[theme]` doesn't contain, which
+    `theme_guard` fails on. They also seam far less visibly, not being solid.
+  - **Returning `Some` is the run-breaker.** The text pass skips any cell with
+    rects, and because extending a run requires contiguous columns, skipping breaks
+    the run for free — the same mechanism blanks already rely on.
+  - **The caret redraws rects, not a glyph.** Reverse video over a block means
+    painting its shape back in `background`; drawing the glyph instead would lose
+    the shape, and drawing nothing would leave a solid cursor block.
+
+  A thin part of a small cell can round to zero, so every quad is floored at 1px —
+  a vanished eighth is worse than one drawn a pixel wide. Tests are pure geometry:
+  `▀`+`▄` tile to exactly `█`, the eighths step evenly to 1.0, no character's rects
+  overlap or leave the cell, and `right(k) == left(k+1)` for a fractional advance.
+
+  Free with it: fonts that lack these glyphs now render them correctly anyway
+  (Envy Code R covers only 48 of the 160 codepoints in U+2500..259F). **Not**
+  covered — box drawing U+2500..257F, which still seams at its joins, and braille
+  U+2800..28FF.
 - `term.rs` — `alacritty_terminal::Term` replacing v1's `vt100::Parser`. More of
   the VT spec, damage tracking, and `renderable_content()` already applies the
   scrollback display offset.
@@ -275,6 +339,21 @@ editor buffer logic is work, not risk; it ports from a known-good v1.
   from its own terminal. Tabs in a pane all share the pane's geometry, so one
   measurement is the correct answer for all of them. This replaced `Shell::sized`,
   which asked a per-shell question that only the active shell could answer.
+
+  **A new tab must be *constructed* at the pane's size too** (`Shell::in_dir`'s
+  `size`), and that is a third distinct hole rather than a restatement of the two
+  above. `GridView` publishes a size only when it **changes** (`State::reported`),
+  and iced reuses one widget state for a pane's grid however many tabs come and
+  go — so a tab added to an already-measured pane receives no `GridResized` at
+  all, ever. Its PTY is still told the truth by `Event::Attached`, and that gap is
+  exactly what's visible: zsh writes `COLUMNS` cells into a grid still 24x80, they
+  wrap, and its reverse-video partial-line marker (`%`, from `PROMPT_SP`) is
+  stranded on the row above the prompt. Reproducible by opening a shell tab in any
+  pane wider than 80 columns, which is every pane on a large display.
+
+  Note the marker is the *honest* rendering of a wrapped line, not a stray glyph —
+  which is why it looks like the spawn-ordering bug this file records under
+  `pty.rs` and isn't one. `shell_tests` pins the constructor from both directions.
 
   **The shell is spawned as a *login* shell** —
   `CommandBuilder::new_default_prog()`, which resolves `$SHELL` (falling back to
@@ -1439,8 +1518,9 @@ so v2 would restore v1's tabs and shells over its own, and both would then
 contend for one socket. `/tmp/sacrament2-$USER.sock` belonging to a binary called
 `sacrament` is the cost of not doing that.
 
-252 tests (`cargo test --workspace`): 70 in `core`, 182 in the gui — buffer
-mutation and undo, terminal reflow, the key map, fonts, and `theme_guard`. v1 has
+287 tests (`cargo test --workspace`): 82 in `core`, 205 in the gui — buffer
+mutation and undo, terminal reflow, the key map, fonts, block geometry, and
+`theme_guard`. v1 has
 none, and getting any would mean standing up a `Buffer` first. Still untested and
 worth covering next, all pure functions: `git::parse_hunks`, `lint::parse_output`,
 and `protocol::Request::{parse,encode}`.
