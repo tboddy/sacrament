@@ -108,11 +108,12 @@ editor buffer logic is work, not risk; it ports from a known-good v1.
   the visible ones, so the stop doesn't move as you scroll down.
 
   Read mode has its own (`read_scroll_col`), and it is the reason **table rows
-  don't wrap** (`markdown::Line::wrappable`). Wrapping one puts half its cells on
-  a row of their own and destroys the column alignment that makes it a table, so
-  a wide table stays one row and is reached sideways instead. Everything else in
-  a document still wraps, so a file with no table has nothing to scroll to and
-  the bound collapses to the pane width.
+  are unwrappable** (`markdown::Line::wrappable`). Breaking one at the row level
+  puts half its cells on a row of their own and destroys the column alignment
+  that makes it a table — so a table that still doesn't fit after `emit_table`
+  has budgeted its columns (see "Tables") is reached sideways instead.
+  Everything else in a document still wraps, so a file with no table has nothing
+  to scroll to and the bound collapses to the pane width.
 
   **Soft wrap.** A line occupies one screen row per wrap segment, from
   `text::wrap_line`. Two consequences run through everything:
@@ -595,12 +596,16 @@ only what shipped and the seams it established.
 
 **The dashboard is real widgets, not the markdown renderer** — and that was a
 reversal. It began as generated markdown fed through `read::ReadSource`, which
-cost no new drawing code, but **a table drawn as text cannot be responsive**: its
-columns are measured in characters, so they can only be sized for one pane width.
-`markdown::emit_table` scales columns down when they don't fit and *never*
-truncates a cell, so at a narrower width every row overflowed by a different
-amount and no column lined up with the one above it. A character budget on the
-summary bought alignment at one width and lost it at every other.
+cost no new drawing code, but at the time `markdown::emit_table` scaled its
+columns down when they didn't fit and *never* made a cell honour the result, so
+at a narrower width every row overflowed by a different amount and no column
+lined up with the one above it. A character budget on the summary bought
+alignment at one width and lost it at every other.
+
+That renderer bug has since been fixed (see "Tables"), so the original reason no
+longer holds — a markdown table now stays aligned at every width. The dashboard
+stays widgets anyway, for a reason the fix doesn't touch: its refresh control is
+a real clickable widget, which a cell grid has no way to express.
 
 So `core::jira` hands over structured `Issue`s and `jira_tables` lays them out.
 **Every column is a `FillPortion`** (`JIRA_COLUMNS`), which is what keeps rows
@@ -1278,6 +1283,44 @@ paths that actually pass through that level.
 Colors are `Slot`s, so `[theme]` drives them. Strikethrough renders as muted text:
 `Emphasis` has no strikethrough and a cell grid has nowhere to draw one.
 
+**Tables** (`emit_table`) are the one construct laid out *here* rather than by
+the frontend's wrapper, and they have to be: wrapping is per **cell**, inside a
+column, and the row-level wrap has no idea where the columns are. A row becomes
+as many `Line`s as its tallest cell, each padded to the same boundaries and each
+redrawing its ` │ ` separators — so **alignment holds by construction** rather
+than by the cells happening to be short enough.
+
+That last clause is the bug this replaced. The old version scaled the columns
+down to fit and then never made a cell honour the result: a cell wider than its
+column was emitted whole, shifting every separator after it right and pushing the
+trailing columns off the pane, where they were clipped and simply lost. Rows with
+short cells landed on the grid and rows with long ones didn't, which reads as a
+rendering fault rather than as arithmetic.
+
+Four things about the replacement:
+
+- **Columns are water-filled, not scaled.** Each gets its natural width if that's
+  under its fair share; only the columns *over* their share are squeezed, and they
+  split what the others left. A one-character `#` column therefore keeps its
+  column and the prose column absorbs the whole shortfall. One scaling factor is
+  the wrong shape — it takes width from the columns that have none to give while
+  leaving the wide one still too narrow, which is precisely how the old output
+  came apart.
+- **Squeezing stops at `MIN_COL_WIDTH`**, below which the table exceeds the pane
+  and is reached by `read_scroll_col`. Rows stay aligned because they're still a
+  grid. A table that already fits is left at its natural width — stretching a
+  two-column table across a wide pane is worse than leaving it alone.
+- **A cell is capped at `MAX_CELL_ROWS` and elided with `…`.** Without it one cell
+  holding a paragraph makes its row taller than the pane, and the rows either side
+  of it are no longer visible together — which is the whole reason to draw a table.
+- **`Tag::Table`'s alignment spec is honoured**, so `---:` right-aligns. A header
+  keeps its own left edge regardless: a title over the left edge of a column of
+  numbers reads better than one pushed right with them.
+
+`slice_spans` is what keeps a wrapped cell styled — it cuts the cell's spans by
+the char range `text::wrap_line` returned, so the second row of an emphasised cell
+is emphasised too.
+
 **Nothing the app styles for itself is bold.** Heading level is carried entirely
 by colour, which separates them far better than weight does in a 16-colour
 scheme. `**strong**` renders *italic* — with bold gone, it's the only attribute
@@ -1525,7 +1568,7 @@ so v2 would restore v1's tabs and shells over its own, and both would then
 contend for one socket. `/tmp/sacrament2-$USER.sock` belonging to a binary called
 `sacrament` is the cost of not doing that.
 
-288 tests (`cargo test --workspace`): 82 in `core`, 206 in the gui — buffer
+299 tests (`cargo test --workspace`): 93 in `core`, 206 in the gui — buffer
 mutation and undo, terminal reflow, the key map, fonts, block geometry, and
 `theme_guard`. v1 has
 none, and getting any would mean standing up a `Buffer` first. Still untested and
@@ -1593,7 +1636,7 @@ In read mode (and the diff view, which reuses the same read-only plumbing — th
 
 `markdown.rs` walks `pulldown_cmark::Parser` events with `ENABLE_STRIKETHROUGH | ENABLE_TASKLISTS | ENABLE_TABLES`. It maintains a style stack (so nested emphasis composes), open list contexts (indent + ordered counter), a blockquote depth, and an optional table accumulator that emits a column-aligned table on `TagEnd::Table`. Inline spans are wrapped to the body width via a width-aware `flush` that breaks on whitespace using `unicode-width`. Like the editor, only the 16 ANSI colors are used — though `Event::Code` does pin a `Color::Black` background, the one place the "terminal palette is the theme" rule is bent.
 
-Two deliberate-looking quirks: `Tag::Emphasis` maps to `Modifier::UNDERLINED`, not `ITALIC` (so `*emphasis*` and links render alike, and read mode disagrees with `highlight.rs`, which uses `ITALIC` for `markup.italic`). And `emit_table`'s proportional column scaling only shrinks *padding* — it never truncates cell spans, so a table whose natural width exceeds the pane still overflows and gets clipped by the `Paragraph`.
+Two deliberate-looking quirks: `Tag::Emphasis` maps to `Modifier::UNDERLINED`, not `ITALIC` (so `*emphasis*` and links render alike, and read mode disagrees with `highlight.rs`, which uses `ITALIC` for `markup.italic`). And `emit_table`'s proportional column scaling only shrinks *padding* — it never truncates cell spans, so a table whose natural width exceeds the pane still overflows and gets clipped by the `Paragraph`. Note v2 has a function of the same name that no longer works this way; this paragraph describes v1's, which is frozen with the bug in it.
 
 ### Diff/review view, change-bars & linting (crates/core/src/git.rs, crates/core/src/lint.rs)
 

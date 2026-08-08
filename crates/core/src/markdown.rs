@@ -18,18 +18,25 @@
 //!
 //! `width` is still taken, because some blocks are genuinely width-shaped: a
 //! horizontal rule spans the pane, a fenced code block is padded to it so its
-//! background is a solid slab, and table columns are scaled to fit. Those are
-//! laid out here; only *inline* wrapping moved out.
+//! background is a solid slab, and a table is laid out as a grid whose columns
+//! are budgeted to fit. Those are laid out here; only *inline* wrapping moved out.
+//!
+//! A table is the one construct that wraps here rather than in the frontend, and
+//! it has to: wrapping is per *cell*, inside a column, and the generic row-level
+//! wrap has no idea where the columns are. See [`State::emit_table`].
 //!
 //! Colors are [`Slot`]s, not RGB — same rule as the rest of the app, so the
 //! theme drives them.
 
 use std::path::Path;
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd,
+};
 use unicode_width::UnicodeWidthStr;
 
 use crate::highlight::{Emphasis, Slot};
+use crate::text;
 
 /// A run's appearance. `None` means "inherit", which is what makes the style
 /// stack compose — nested emphasis inside a link keeps the link's color.
@@ -188,6 +195,24 @@ const MARKER: Style = Style::fg(Slot::BRIGHT_YELLOW);
 const LINK: Style = Style::fg(Slot::BRIGHT_BLUE).underline();
 const CODE_TEXT: Style = Style::fg(Slot::WHITE);
 
+/// Columns each table column is separated from the next by (` │ `).
+const COL_SEP: usize = 3;
+
+/// The narrowest a column may be *squeezed* to when a table doesn't fit.
+///
+/// Not a minimum width: a column whose content is one character wide keeps its
+/// one column. This is the point at which shrinking stops helping and the table
+/// overflows into horizontal scroll instead — below about this, every cell wraps
+/// to one word a row and the table is less readable than a wide one you scroll.
+const MIN_COL_WIDTH: usize = 6;
+
+/// Most screen rows a single cell may wrap to before it's elided.
+///
+/// Without a cap, one cell holding a paragraph makes its row taller than the
+/// pane, and the rows either side of it are no longer visible together — which
+/// is the entire reason to draw a table rather than a list.
+const MAX_CELL_ROWS: usize = 10;
+
 /// One open list context. `next_num` is `None` for a bullet list.
 #[derive(Clone, Copy)]
 struct ListCtx {
@@ -199,6 +224,9 @@ struct TableState {
     rows: Vec<TableRow>,
     cur_row: Option<TableRow>,
     cur_cell: Option<Vec<Span>>,
+    /// Per-column alignment from the delimiter row (`---:` and friends). Short
+    /// or empty when the author wrote none, so it's read with `get`.
+    aligns: Vec<Alignment>,
 }
 
 struct TableRow {
@@ -388,12 +416,13 @@ impl State {
                 self.style_stack.push(Style::fg(Slot::MAGENTA));
                 self.push_span("[image: ".to_string(), Style::default());
             }
-            Tag::Table(_) => {
+            Tag::Table(aligns) => {
                 self.before_block();
                 self.table = Some(TableState {
                     rows: Vec::new(),
                     cur_row: None,
                     cur_cell: None,
+                    aligns,
                 });
             }
             Tag::TableHead => {
@@ -581,6 +610,18 @@ impl State {
         self.need_blank = true;
     }
 
+    /// Lay a table out as a fixed grid, wrapping cells inside their columns.
+    ///
+    /// **Every emitted line is padded to the same column boundaries**, so the
+    /// alignment holds by construction rather than by the cells happening to be
+    /// short enough. A row is as tall as its tallest cell, and each of its screen
+    /// rows redraws the separators — so a wrapped cell stays inside its own
+    /// column instead of pushing the ones after it right.
+    ///
+    /// This is *not* the wrapping [`Line::wrappable`] forbids. That one breaks the
+    /// concatenated row text, which drops the trailing cells to column 0 and
+    /// destroys the table; these rows are laid out per cell and stay unwrappable,
+    /// already fitted to the pane.
     fn emit_table(&mut self, table: TableState) {
         if table.rows.is_empty() {
             return;
@@ -590,58 +631,58 @@ impl State {
             return;
         }
 
-        let mut col_widths = vec![0usize; n_cols];
+        let mut natural = vec![0usize; n_cols];
         for row in &table.rows {
             for (i, cell) in row.cells.iter().enumerate() {
                 let w: usize = cell.iter().map(|s| s.text.width()).sum();
-                col_widths[i] = col_widths[i].max(w);
+                natural[i] = natural[i].max(w);
             }
         }
-
-        // Scale columns down proportionally when the natural width doesn't fit.
-        // Three cells minimum, so a single character plus a pad still lands.
-        let sep_total = if n_cols > 1 { 3 * (n_cols - 1) } else { 0 };
-        let avail = self.width.saturating_sub(sep_total);
-        let natural: usize = col_widths.iter().sum();
-        if natural > avail && natural > 0 {
-            let factor = avail as f64 / natural as f64;
-            for w in col_widths.iter_mut() {
-                *w = ((*w as f64 * factor) as usize).max(3);
-            }
-        }
+        let sep_total = COL_SEP * (n_cols - 1);
+        let widths = budget_columns(&natural, self.width.saturating_sub(sep_total));
 
         for (row_idx, row) in table.rows.iter().enumerate() {
-            let mut spans: Vec<Span> = Vec::new();
-            for (col, target) in col_widths.iter().enumerate() {
-                if col > 0 {
-                    spans.push(Span {
-                        text: " │ ".to_string(),
-                        style: MUTED,
-                    });
+            const NO_CELL: &[Span] = &[];
+            let cells: Vec<Vec<Vec<Span>>> = widths
+                .iter()
+                .enumerate()
+                .map(|(col, &w)| {
+                    let cell = row.cells.get(col).map_or(NO_CELL, |c| c.as_slice());
+                    wrap_cell(cell, w)
+                })
+                .collect();
+            let height = cells.iter().map(|c| c.len()).max().unwrap_or(1);
+
+            for sub in 0..height {
+                let mut spans: Vec<Span> = Vec::new();
+                for (col, &target) in widths.iter().enumerate() {
+                    if col > 0 {
+                        spans.push(Span {
+                            text: " │ ".to_string(),
+                            style: MUTED,
+                        });
+                    }
+                    let content = cells[col].get(sub).map_or(NO_CELL, |r| r.as_slice());
+                    // A header cell keeps its own alignment rather than the
+                    // column's: a right-aligned numeric column still reads
+                    // better with its title over the left edge of the numbers.
+                    let align = if row.is_header {
+                        Alignment::Left
+                    } else {
+                        table.aligns.get(col).copied().unwrap_or(Alignment::None)
+                    };
+                    push_cell(&mut spans, content, target, align);
                 }
-                let cell = row.cells.get(col);
-                let cell_w: usize = cell
-                    .map(|c| c.iter().map(|s| s.text.width()).sum())
-                    .unwrap_or(0);
-                if let Some(cell) = cell {
-                    spans.extend(cell.iter().cloned());
-                }
-                if cell_w < *target {
-                    spans.push(Span {
-                        text: " ".repeat(target - cell_w),
-                        style: Style::default(),
-                    });
-                }
+                self.out.push(Line {
+                    spans,
+                    indent: 0,
+                    wrappable: false,
+                });
             }
-            self.out.push(Line {
-                spans,
-                indent: 0,
-                wrappable: false,
-            });
 
             if row_idx == 0 && row.is_header {
                 let mut sep: Vec<Span> = Vec::new();
-                for (col, width) in col_widths.iter().enumerate() {
+                for (col, width) in widths.iter().enumerate() {
                     if col > 0 {
                         sep.push(Span {
                             text: "─┼─".to_string(),
@@ -667,6 +708,157 @@ impl State {
         self.flush_block();
         self.out
     }
+}
+
+/// Decide each column's width, given what each one wants and what there is.
+///
+/// **Water-filling, not proportional scaling.** Every column gets its natural
+/// width if that's under the fair share; only the columns over their share are
+/// squeezed, and they split what the others didn't use. So a narrow column (`#`,
+/// a section symbol) keeps its width and the prose column absorbs the whole
+/// shortfall — which is what you'd do by hand.
+///
+/// Scaling every column by one factor is the wrong shape and was the visible bug:
+/// it took a column off `#`, which had none to give, while leaving the one wide
+/// column still too narrow to fit.
+///
+/// Squeezing stops at [`MIN_COL_WIDTH`], so the result may exceed `avail`. That's
+/// deliberate — the frontend reaches an over-wide table by scrolling sideways
+/// (`read_scroll_col`), and the rows stay aligned because they're still a grid.
+fn budget_columns(natural: &[usize], avail: usize) -> Vec<usize> {
+    let mut out = natural.to_vec();
+    if natural.iter().sum::<usize>() <= avail {
+        return out;
+    }
+
+    // Ascending, so the columns most likely to fit inside their share are settled
+    // first and release their surplus to the ones that don't.
+    let mut order: Vec<usize> = (0..natural.len()).collect();
+    order.sort_by_key(|&i| natural[i]);
+
+    let mut remaining = avail;
+    let mut left = natural.len();
+    for (pos, &i) in order.iter().enumerate() {
+        let fair = remaining / left;
+        if natural[i] <= fair {
+            out[i] = natural[i];
+            remaining -= natural[i];
+            left -= 1;
+            continue;
+        }
+        // This column is over its share, and so is every one after it. Split what
+        // is left evenly, handing the first few an extra column so the rounding
+        // remainder is spent rather than left as a ragged right edge.
+        let extra = remaining % left;
+        for (k, &j) in order[pos..].iter().enumerate() {
+            out[j] = (fair + usize::from(k < extra)).max(MIN_COL_WIDTH);
+        }
+        break;
+    }
+    out
+}
+
+/// Break one cell into the screen rows it occupies at `width`.
+///
+/// Always at least one row, so an empty cell still holds its column open. Uses
+/// the same [`text::wrap_line`] the editor wraps source code with, so a token too
+/// long to fit hard-breaks instead of overflowing.
+fn wrap_cell(cell: &[Span], width: usize) -> Vec<Vec<Span>> {
+    let text: String = cell.iter().map(|s| s.text.as_str()).collect();
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() || width == 0 {
+        return vec![Vec::new()];
+    }
+
+    let segments = text::wrap_line(&text, width, 1, 0);
+    let elided = segments.len() > MAX_CELL_ROWS;
+    let mut rows = Vec::with_capacity(segments.len().min(MAX_CELL_ROWS));
+
+    for (i, &(start, end)) in segments.iter().take(MAX_CELL_ROWS).enumerate() {
+        // `wrap_line` breaks *after* the whitespace, so a segment carries its own
+        // trailing space. Dropping it matters for a right-aligned column, where it
+        // would otherwise show up as a gap against the separator.
+        let mut end = trim_end(&chars, start, end);
+        if elided && i + 1 == MAX_CELL_ROWS {
+            // Out of rows with text still to place. Give the ellipsis its column
+            // back before slicing, or the row runs one wide and breaks the grid.
+            while end > start && visual_width(&chars[start..end]) + 1 > width {
+                end -= 1;
+            }
+            let mut row = slice_spans(cell, start, trim_end(&chars, start, end));
+            row.push(Span {
+                text: "…".to_string(),
+                style: MUTED,
+            });
+            rows.push(row);
+            break;
+        }
+        rows.push(slice_spans(cell, start, end));
+    }
+    rows
+}
+
+/// Append a cell's content padded to `target` columns, honouring alignment.
+///
+/// The pad is what keeps the grid: every column ends where the next one begins,
+/// on every screen row, whatever the cell holds.
+fn push_cell(spans: &mut Vec<Span>, content: &[Span], target: usize, align: Alignment) {
+    let width: usize = content.iter().map(|s| s.text.width()).sum();
+    let pad = target.saturating_sub(width);
+    let (before, after) = match align {
+        Alignment::Right => (pad, 0),
+        Alignment::Center => (pad / 2, pad - pad / 2),
+        Alignment::Left | Alignment::None => (0, pad),
+    };
+    let space = |n: usize| Span {
+        text: " ".repeat(n),
+        style: Style::default(),
+    };
+    if before > 0 {
+        spans.push(space(before));
+    }
+    spans.extend(content.iter().cloned());
+    if after > 0 {
+        spans.push(space(after));
+    }
+}
+
+/// The slice of `spans` covering characters `[start, end)`, keeping each run's
+/// style — so a wrapped cell's second row is styled like its first.
+fn slice_spans(spans: &[Span], start: usize, end: usize) -> Vec<Span> {
+    let mut out = Vec::new();
+    let mut seen = 0;
+    for span in spans {
+        if seen >= end {
+            break;
+        }
+        let len = span.text.chars().count();
+        let from = seen.max(start);
+        let to = (seen + len).min(end);
+        if from < to {
+            out.push(Span {
+                text: span.text.chars().skip(from - seen).take(to - from).collect(),
+                style: span.style,
+            });
+        }
+        seen += len;
+    }
+    out
+}
+
+fn visual_width(chars: &[char]) -> usize {
+    chars
+        .iter()
+        .map(|c| unicode_width::UnicodeWidthChar::width(*c).unwrap_or(0))
+        .sum()
+}
+
+/// `end` with trailing whitespace excluded, never going past `start`.
+fn trim_end(chars: &[char], start: usize, mut end: usize) -> usize {
+    while end > start && chars[end - 1].is_whitespace() {
+        end -= 1;
+    }
+    end
 }
 
 #[cfg(test)]
@@ -776,6 +968,7 @@ mod tests {
         assert_eq!(out[0].text(), "─".repeat(12));
     }
 
+
     #[test]
     fn a_table_lays_out_its_columns() {
         let out = render("| a | b |\n|---|---|\n| 1 | 2 |", 40);
@@ -783,6 +976,160 @@ mod tests {
         assert!(rows[0].contains('a') && rows[0].contains('b'));
         assert!(rows[1].contains('┼'), "header underline: {:?}", rows[1]);
         assert!(rows[2].contains('1') && rows[2].contains('2'));
+    }
+
+    /// Rows of a rendered table, in the order they were emitted.
+    fn table_rows(out: &[Line]) -> Vec<String> {
+        out.iter()
+            .filter(|l| !l.wrappable)
+            .map(|l| l.text())
+            .collect()
+    }
+
+    /// Where each ` │ ` separator sits, in display columns.
+    fn seps(row: &str) -> Vec<usize> {
+        let mut cols = Vec::new();
+        let mut vis = 0;
+        for c in row.chars() {
+            if c == '│' {
+                cols.push(vis);
+            }
+            vis += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        }
+        cols
+    }
+
+    const RAGGED: &str = "\
+| # | Gap | Impact |
+|---|-----|--------|
+| 1 | Player shot tiers disabled; power accrual much too fast | 10 |
+| 2 | Music off | 8 |
+| 3 | Boot flow: boots straight into gameplay, no splash or title menu | 9 |";
+
+    #[test]
+    fn every_row_of_a_table_puts_its_separators_in_the_same_columns() {
+        // The bug this rewrite exists for: a cell wider than its column used to be
+        // emitted whole, shifting every separator after it right and pushing the
+        // trailing columns off the pane. Alignment now holds however long a cell is.
+        for width in [30usize, 45, 60, 80, 120] {
+            let rows = table_rows(&render(RAGGED, width));
+            let first = seps(&rows[0]);
+            assert_eq!(first.len(), 2, "two separators at width {width}");
+            for row in &rows {
+                if row.contains('┼') {
+                    continue; // the header underline joins with ┼, not │
+                }
+                assert_eq!(seps(row), first, "width {width}, row {row:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_cell_wraps_inside_its_column_instead_of_overflowing() {
+        let rows = table_rows(&render(RAGGED, 40));
+        for row in &rows {
+            let w = row.width();
+            assert!(w <= 40, "row is {w} wide at pane width 40: {row:?}");
+        }
+        // Nothing is lost to the wrap: the tail of the long cell is on a later row.
+        let all = rows.join("\n");
+        assert!(all.contains("Player shot tiers"), "{all}");
+        assert!(all.contains("too fast"), "wrapped tail survives:\n{all}");
+    }
+
+    #[test]
+    fn a_narrow_column_keeps_its_width_and_the_prose_column_gives() {
+        // Water-filling, not proportional scaling. `#` holds one character, so it
+        // must not be squeezed on behalf of a column that needs forty.
+        let rows = table_rows(&render(RAGGED, 40));
+        let first = seps(&rows[0]);
+        assert_eq!(first[0], 2, "the `#` column stays one wide: {:?}", rows[0]);
+    }
+
+    #[test]
+    fn a_table_that_fits_is_left_at_its_natural_width() {
+        let rows = table_rows(&render(RAGGED, 200));
+        assert!(rows[0].width() < 100, "no stretching to the pane: {:?}", rows[0]);
+        for row in &rows {
+            assert_eq!(row.width(), rows[0].width(), "a uniform grid: {row:?}");
+        }
+    }
+
+    #[test]
+    fn a_table_too_narrow_to_squeeze_overflows_rather_than_collapsing() {
+        // Below `MIN_COL_WIDTH` per column, shrinking stops helping — the table
+        // exceeds the pane and the frontend reaches it by scrolling sideways.
+        let rows = table_rows(&render(RAGGED, 12));
+        assert!(rows[0].width() > 12, "overflows: {:?}", rows[0]);
+        let first = seps(&rows[0]);
+        for row in &rows {
+            if !row.contains('┼') {
+                assert_eq!(seps(row), first, "still a grid: {row:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wrapped_cell_keeps_its_styling_on_every_row() {
+        let src = "| a |\n|---|\n| *one two three four five six seven* |";
+        let out = render(src, 20);
+        let wrapped: Vec<&Line> = out
+            .iter()
+            .filter(|l| !l.wrappable && l.text().contains("seven"))
+            .collect();
+        let line = wrapped.first().expect("the tail landed on its own row");
+        let at = line.text().find("seven").unwrap();
+        assert!(
+            line.style_at(at).emphasis.underline,
+            "emphasis survives the wrap"
+        );
+    }
+
+    #[test]
+    fn a_cell_longer_than_the_row_cap_is_elided() {
+        let long = "word ".repeat(200);
+        let src = format!("| a |\n|---|\n| {long} |");
+        let out = render(&src, 20);
+        let rows = table_rows(&out);
+        // One header, one underline, then at most the cap.
+        assert_eq!(rows.len(), 2 + MAX_CELL_ROWS, "capped: {}", rows.len());
+        assert!(rows.last().unwrap().contains('…'), "{:?}", rows.last());
+        for row in &rows {
+            assert!(row.width() <= 20, "the ellipsis stays inside: {row:?}");
+        }
+    }
+
+    #[test]
+    fn a_column_marked_right_aligned_is_right_aligned() {
+        let out = render("| n |\n|--:|\n| 1 |\n| 100 |", 40);
+        let rows = table_rows(&out);
+        let short = rows.iter().find(|r| r.contains('1') && !r.contains("100")).unwrap();
+        assert!(short.starts_with("  1"), "padded on the left: {short:?}");
+        let head = &rows[0];
+        assert!(head.starts_with('n'), "a header keeps its own side: {head:?}");
+    }
+
+    #[test]
+    fn budgeting_spends_the_whole_width_it_is_given() {
+        let natural = [1, 60, 6, 8];
+        let got = budget_columns(&natural, 50);
+        assert_eq!(got.iter().sum::<usize>(), 50, "{got:?}");
+        assert_eq!(got[0], 1, "a column under its share is untouched");
+        assert_eq!(got[2], 6);
+        assert_eq!(got[3], 8);
+        assert_eq!(got[1], 35, "the wide column absorbs the shortfall");
+    }
+
+    #[test]
+    fn budgeting_leaves_a_table_that_fits_alone() {
+        let natural = [1, 20, 6];
+        assert_eq!(budget_columns(&natural, 50), natural);
+    }
+
+    #[test]
+    fn budgeting_stops_squeezing_at_the_floor() {
+        let got = budget_columns(&[40, 40, 40], 6);
+        assert_eq!(got, vec![MIN_COL_WIDTH; 3], "overflow rather than collapse");
     }
 
     #[test]

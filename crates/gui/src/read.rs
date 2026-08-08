@@ -154,11 +154,18 @@ pub fn total_rows(lines: &[markdown::Line], cols: usize) -> usize {
 }
 
 /// Widest rendered row, in columns — how far right scrolling may go.
+///
+/// Measured in **display width**, not characters: a table of CJK cells occupies
+/// two columns per character, and counting characters would stop the scroll short
+/// of its own right-hand column.
 pub fn widest_row(lines: &[markdown::Line], cols: usize) -> usize {
     lines
         .iter()
         .filter(|l| !l.wrappable)
-        .map(|l| l.text().chars().count())
+        .map(|l| {
+            let t = l.text();
+            text::char_idx_to_vis_col(&t, t.chars().count(), 1)
+        })
         .max()
         .unwrap_or(0)
         .max(cols)
