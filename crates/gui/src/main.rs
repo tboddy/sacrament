@@ -4173,6 +4173,12 @@ fn keymap(
                 // unbound and would do nothing.
                 Named::Enter if mods.shift() => b"\n",
                 Named::Enter => b"\r",
+                // Back-tab (CSI Z). Without the shift arm the modifier is simply
+                // dropped and a plain tab goes down the PTY, so a TUI binding
+                // Shift+Tab sees the unshifted key — indistinguishable from Tab.
+                // `\x1b[Z` is what every terminal sends and what terminfo calls
+                // `kcbt`; readline and zsh already have it.
+                Named::Tab if mods.shift() => b"\x1b[Z",
                 Named::Tab => b"\t",
                 Named::Backspace => b"\x7f",
                 Named::Escape => b"\x1b",
@@ -4444,6 +4450,21 @@ mod key_tests {
         assert_eq!(
             keymap(&named(Named::Enter), Modifiers::empty(), None),
             Some(b"\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn shift_tab_is_a_back_tab_the_shell_can_tell_apart() {
+        use iced::keyboard::key::Named;
+        // The modifier used to be dropped, so a TUI binding Shift+Tab received a
+        // plain tab and had no way to know the difference. `cat -v` shows `^[[Z`.
+        assert_eq!(
+            keymap(&named(Named::Tab), Modifiers::SHIFT, None),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(
+            keymap(&named(Named::Tab), Modifiers::empty(), None),
+            Some(b"\t".to_vec())
         );
     }
 

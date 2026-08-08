@@ -1046,8 +1046,15 @@ the macOS terminal convention rather than anything invented here:
 | key | bytes | why |
 |---|---|---|
 | `Shift+Enter` | `\n` | A newline for a TUI composing multi-line input |
+| `Shift+Tab` | `\x1b[Z` | Back-tab, so a TUI can bind it apart from `Tab` |
 | `Option+←` / `→` | `\x1bb` / `\x1bf` | `backward-word` / `forward-word` |
 | `Option+Backspace` | `\x1b\x7f` | `backward-kill-word` |
+
+**Every one of these is a modifier that would otherwise be silently dropped.**
+The `Named` table matches the key alone, so without an explicit arm `Shift+Tab`
+sends a plain `\t` and the program at the other end cannot tell the two apart —
+`cat -v` is the check, and it should print `^[[Z`. `\x1b[Z` is terminfo's `kcbt`
+and what every terminal sends.
 
 Two details worth keeping:
 
@@ -1518,7 +1525,7 @@ so v2 would restore v1's tabs and shells over its own, and both would then
 contend for one socket. `/tmp/sacrament2-$USER.sock` belonging to a binary called
 `sacrament` is the cost of not doing that.
 
-287 tests (`cargo test --workspace`): 82 in `core`, 205 in the gui — buffer
+288 tests (`cargo test --workspace`): 82 in `core`, 206 in the gui — buffer
 mutation and undo, terminal reflow, the key map, fonts, block geometry, and
 `theme_guard`. v1 has
 none, and getting any would mean standing up a `Buffer` first. Still untested and
