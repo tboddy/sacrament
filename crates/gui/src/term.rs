@@ -232,6 +232,65 @@ impl Terminal {
         url_around(&text, hit?)
     }
 
+    /// Everything the terminal holds, scrollback included, as plain text.
+    ///
+    /// This is the record of an unattended agent run. The tab it happened in is
+    /// removed the moment the shell exits, taking its scrollback with it, so
+    /// without a snapshot the only account of what was done to a repository is the
+    /// repository itself — which is exactly what you want to read *alongside*.
+    ///
+    /// Two details:
+    ///
+    /// - **It walks the grid rather than reusing `selection_to_string`.** That
+    ///   would mean installing a selection covering everything, which clobbers the
+    ///   user's own — and this runs while the tab is still live and selectable.
+    ///   The walk is `&self` and touches no state.
+    /// - **Wrapped rows are rejoined.** A `WRAPLINE` row and its continuation are
+    ///   one logical line; breaking them would put a newline into the middle of
+    ///   every command longer than the pane, which makes the transcript useless for
+    ///   copying anything back out of.
+    ///
+    /// Trailing blanks are trimmed per line, and blank lines at the end dropped —
+    /// a terminal grid is always full height, so the tail is otherwise a screenful
+    /// of nothing.
+    pub fn transcript(&self) -> String {
+        let grid = self.term.grid();
+        let cols = self.size.cols.max(1);
+        let mut out = String::new();
+        let mut line = grid.topmost_line().0;
+        let bottommost = grid.bottommost_line().0;
+        let mut current = String::new();
+        while line <= bottommost {
+            for column in 0..cols {
+                let c = grid[Line(line)][Column(column)].c;
+                // A never-written cell reads as NUL rather than a space.
+                current.push(if c == '\0' { ' ' } else { c });
+            }
+            if Self::wraps(grid, Line(line), cols) {
+                // Same logical line: keep going without a break, and without
+                // trimming, or the join would lose a real trailing space.
+                line += 1;
+                continue;
+            }
+            out.push_str(current.trim_end());
+            out.push('\n');
+            current.clear();
+            line += 1;
+        }
+        if !current.is_empty() {
+            out.push_str(current.trim_end());
+            out.push('\n');
+        }
+        // The grid is always full height, so the unwritten tail is a screenful of
+        // empty lines. Keep one trailing newline.
+        let trimmed = out.trim_end();
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}\n")
+        }
+    }
+
     /// Does this row continue onto the next one?
     fn wraps(
         grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
@@ -496,6 +555,49 @@ mod tests {
 
     fn nonblank(t: &Terminal) -> Vec<String> {
         rows_of(t).into_iter().filter(|r| !r.is_empty()).collect()
+    }
+
+    /// The transcript is the only record of an unattended run once its tab is
+    /// gone, so it has to reach past the viewport into scrollback.
+    #[test]
+    fn a_transcript_includes_scrollback_and_stops_at_the_content() {
+        let mut t = Terminal::new(5, 20);
+        for i in 1..=12 {
+            t.feed(format!("line{i}\r\n").as_bytes());
+        }
+        let text = t.transcript();
+        // Well past the 5-row viewport: the early lines are only in scrollback.
+        assert!(text.contains("line1\n"), "lost scrollback: {text:?}");
+        assert!(text.contains("line12"), "lost the newest line: {text:?}");
+        // A grid is always full height, so without trimming this ends in a
+        // screenful of blanks.
+        assert!(!text.ends_with("\n\n"), "trailing blank rows kept: {text:?}");
+    }
+
+    /// A wrapped command must come back as one line, or nothing longer than the
+    /// pane can be copied out of the transcript intact.
+    #[test]
+    fn a_wrapped_line_is_rejoined() {
+        let mut t = Terminal::new(5, 10);
+        t.feed(b"abcdefghijklmnopqrst\r\n");
+        let text = t.transcript();
+        assert!(
+            text.contains("abcdefghijklmnopqrst"),
+            "wrapped line was broken: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_transcript_does_not_disturb_a_live_selection() {
+        // It runs while the tab is still on screen and still selectable, so
+        // installing a select-all to read the text would clobber the user's.
+        let mut t = Terminal::new(5, 20);
+        t.feed(b"hello world\r\n");
+        t.begin_selection(0, 0, false);
+        t.update_selection(0, 4);
+        let before = t.selected_text();
+        let _ = t.transcript();
+        assert_eq!(t.selected_text(), before);
     }
 
     /// Scrolling up must *reveal* scrollback at the top, not drop rows off the

@@ -24,7 +24,7 @@ so the frontend/model seam is a *compile error* rather than a discipline problem
 framework-independent belongs in `core`; if it needs a UI type, it doesn't.
 
 Currently in `core`: `config`, `session`, `git`, `lint`, `protocol`, `client`,
-`paths`, `theme`, `font`, `highlight`, `text`, `jira`, `secret`. Three sets of types moved out of v1's
+`paths`, `theme`, `font`, `highlight`, `text`, `jira`, `secret`, `work`. Three sets of types moved out of v1's
 `editor.rs`/`highlight.rs` to live with their producers — `ChangeKind` into
 `git`, `Severity`/`Diagnostic` into `lint`, and the whole highlighter into
 `core::highlight` with `Slot`/`Emphasis` replacing the ratatui color types (v1
@@ -530,10 +530,10 @@ section strip has no `+`, because the set of sections is the app's.
 
 The editor pane holds several **sections**, chosen by an outer tab strip:
 `Section::Editor` (the file tabs and the text surface, i.e. everything the pane
-used to be) and `Section::Jira` (the ticket dashboard — see "The Jira section").
-The file tabs are *subtabs of the editor section*, not chrome the pane always
-carries — switch section and they go with it, because they describe that
-section's contents.
+used to be), `Section::Jira` (the ticket dashboard — see "The Jira section") and
+`Section::Scratchpad` (one permanent plain-text document — see below). The file
+tabs are *subtabs of the editor section*, not chrome the pane always carries —
+switch section and they go with it, because they describe that section's contents.
 
 `Section::ALL` is the single definition of both the set and its left-to-right
 order: `section_bar` renders from it and `select_section` indexes back through it,
@@ -554,7 +554,27 @@ Read mode is deliberately *not* folded into `editing()`. It's a different questi
 — there the text is on screen and merely can't be typed into — and the two give
 different answers for navigation keys.
 
-The rule that decides which commands survive a non-editor section:
+**Two sections hold text, so "which buffer?" became its own question**
+(`Section::has_text`, `State::text_target`). The editor pane has two editable
+surfaces now — the active file tab and the scratchpad — so typing, undo and
+select-all have to ask *which* before they act. `text_target` answers it once, the
+way `read_target` does for scrolling, and returns `None` when nothing editable is
+showing; a command that has one is a command that can run.
+
+**`editing()` and `text_target()` are deliberately not the same question**, and
+the split is chosen for its failure modes rather than its tidiness:
+
+- `editing()` still means the **file** editor specifically. Everything belonging
+  to the tab strip keeps asking it — close, cycle, select tab N, save-as.
+- `text_target()` means **some** editable surface. Everything that acts on text
+  asks it instead.
+
+Get it wrong in one direction and a text command simply doesn't work in the
+scratchpad — visible, harmless, fixed in a line. Get it wrong in the other and a
+tab command edits or closes a file nobody can see. So the wide one is opt-in: new
+text commands must reach for `text_target` deliberately, and forgetting fails safe.
+
+The rule that decides which commands survive a section with no text:
 
 - **Commands that act on what's on screen are inert**: typing, paste, undo/redo,
   copy/cut, select-all, comment, indent, fold, save, save-as, close tab, select
@@ -578,15 +598,91 @@ Two smaller things:
 - **The active section isn't persisted.** A section has no state of its own to
   restore, and landing on the editor is right for a launch that was given files.
 
-**Fixed on the way past**: `Message::Pasted` was gated on neither read mode nor
+**Fixed on the way past, twice.** `Message::Pasted` was gated on neither read mode nor
 (now) the section. Paste arrives as its own message rather than through `keymap`,
 so the key dispatch's read-mode arm never covered it — meaning `Cmd+V` in read mode
 edited the source behind the rendering, exactly the v1 hole this file claims v2
 closed. It now requires `editing() && !reading()`.
 
+And `reading()` asked the *file* buffer rather than the surface being typed into,
+which the scratchpad turned into a real hole: with a markdown tab left in read
+mode, the key dispatch's `reading()` arm claimed every keystroke while the
+scratchpad was on screen, so typing there silently scrolled a rendered document
+nobody could see. It asks `text_target` now. The same bug in the wheel handler
+(`read_target`) scrolled the invisible file instead of the scratchpad.
+
 Not added, and worth knowing they're absent: no keybinding switches sections
 (clicking is the only way), and `Cmd+1..9` still means "select file tab N", not
 "select section N".
+
+#### The Scratchpad section (`State::scratchpad`)
+
+One permanent plain-text document — somewhere to put a note that isn't a file and
+isn't worth naming. **It is the editor**, pointed at a different buffer: the same
+`GridView` over the same `BufferSource`, so selection, undo, wrapping, the caret
+and mouse handling come for free and cannot drift from how they behave on a file.
+
+What it deliberately lacks, and why each is a refusal rather than an omission:
+
+- **No gutter.** Line numbers in a notes file say nothing. Folding goes with it —
+  `fold_command` asks `editing()`, not `text_target()`, because a fold is only
+  legible through the chevron the gutter draws. Folding here would be text that
+  vanished with nothing on screen to say why, or that it could come back.
+- **No tab strip.** One document, always this one. The `+` elsewhere means "one
+  more of these", and there is no more of this.
+- **No highlighting and no markdown.** `BufferSource` is handed `None` rather than
+  the highlighter, and `load_scratchpad` seeds no syntax — so the work isn't
+  discarded, it's never done. `Cmd+/` lands on "no syntax for this file", which is
+  the honest answer. Read mode can't reach it either: the file is `.txt` and
+  `set_read_mode` gates on the extension, which is why that extension is
+  load-bearing rather than cosmetic.
+
+**It is not in `buffers`.** That list is the file tabs — things the user opened,
+that the session restores, that `Cmd+W` closes and the quit prompt asks about. The
+scratchpad is none of those, and putting it in the list would have meant excluding
+it by index from every one of those operations: the kind of exception that gets
+missed once and then edits the wrong document.
+
+**It autosaves, and is never asked about.** There is no tab to carry a dirty dot,
+no `Cmd+W` to prompt on, and nothing about it in the quit dialog — a scratchpad you
+have to remember to save is one that eventually loses a note. `save_scratchpad`
+returns before touching the disk when the buffer is clean, which is what lets it
+hang off three cheap boundaries instead of a timer:
+
+- **Leaving the section** (`set_section`, the single place `section` changes).
+- **Focus leaving the editor pane**, compared across `handle` in `update`. Focus
+  has no single setter — a pane click, `Ctrl+2` and spawning a run all move it —
+  so one comparison in the wrapper catches every route, including later ones.
+- **Quitting** (`quit_now`).
+
+A timer was not added on purpose: idle repaints are the thing this app doesn't do,
+and `time::every` would wake it forever to write nothing.
+
+**A changed-on-disk conflict overwrites.** `Buffer::save`'s guard is for files two
+people might edit; this one is ours, at a path nothing else knows. Honouring the
+guard would give a scratchpad that silently stopped saving with no dialog anywhere
+to resolve it, so the buffer on screen wins.
+
+**A scratchpad that can't be opened says so at startup**, alongside the font
+warning and by the same reasoning — the section still works, so nothing looks
+wrong, and it would discard everything typed into it at quit. Detected by the
+buffer having no path, which is both what `load_scratchpad` falls back to and what
+`save_scratchpad` refuses to write.
+
+`set_section` also **resets `editor_scroll_px`**. It is a sub-row pixel remainder
+belonging to whichever surface was last scrolled; carried across a switch it
+offsets the next one by up to a row for no reason.
+
+The window title reads `Scratchpad` with **no dirty dot**: it autosaves, so a
+marker would report a state the user has no action to take about, blinking on and
+off as they type. The Jira section still shows the active file, because there is no
+document on screen there and the last thing edited is the most useful thing the
+title can say.
+
+Stored at `paths::scratchpad_path` — `<config>/sacrament2-scratchpad.txt`, beside
+the session file. That is state the app owns and rewrites without being asked,
+which is the session's category and the opposite of a file the user chose; a
+documents folder would imply a name they picked and a lifetime they control.
 
 #### The Jira section (`core::jira`, `core::secret`, `State::jira`)
 
@@ -617,6 +713,38 @@ being truncated.
 The section still draws its two headings as chrome (see below) and still takes
 its heading colours from `core::markdown`, so it matches rendered markdown
 elsewhere. What it no longer does is render *through* it.
+
+**The issue key opens the ticket in the browser** (`issue_key_cell` →
+`Message::JiraOpenIssue` → `core::jira::issue_url` → `open_url`), which is the
+second thing widgets buy that the grid couldn't: a cell grid reports a row and a
+column, not "you clicked TFE-954". Four things about it:
+
+- **The hot area is the text, not the column.** Every other cell is a `text`
+  filling its `FillPortion`, and doing that here would arm the whole blank
+  remainder of the Key column — a wide band of screen that launches an app when
+  clicked. So the `mouse_area` wraps a `Shrink` text and a `container` carries the
+  portion instead.
+- **The message carries the key, not a URL.** `issue_url(base, key)` derives it in
+  `update` from the configured site, so the URL's shape lives in `core` beside
+  `Issue::url` rather than being built at a call site — and a refresh that
+  reordered or dropped rows can't leave a stale URL in flight.
+- **The scheme is https by construction, and that's the security boundary.**
+  `JiraConfig::base_url` strips whatever form the site was pasted in and
+  re-prefixes it, and the key only ever reaches the path — so `open`, which
+  launches a registered handler for *any* scheme, can only ever get a web page.
+  Same rule `Terminal::url_at` enforces for a shell click, pinned here by
+  `an_issue_url_is_https_whatever_form_the_site_was_pasted_in`.
+- **Colour is the affordance and the cursor stays an arrow**, as it is for
+  "Refresh" and for shift-clicking a URL in a shell. `LINK_SLOT` / `LINK_HOVER_SLOT`
+  (blue → bright_blue) are shared by both controls, so the section has one look for
+  clickable text; bright_blue is also what `core::markdown` renders a link in.
+
+`JiraPane::hovered` went from a `bool` to `Option<JiraHover>` for this — one field
+for the section, since exactly one thing can be under the pointer. With more than
+one hoverable control the tab strips' tree-order hazard is back, so
+`Message::JiraUnhovered` carries **which** thing left and clears only that:
+widgets publish in tree order, so moving from one key to the one above it emits
+that key's `on_enter` before the departed key's `on_exit`.
 
 `Buffer::markdown_view` was built for the earlier approach and removed with it. If
 a future section wants generated prose in the grid, that constructor — a path-less
@@ -657,8 +785,140 @@ tolerates missing fields throughout (Jira omits what an account can't see, so on
 thin issue must not lose the other forty-nine). `SEARCH_PATH` points at
 `/rest/api/3/search/jql`, which replaced the deprecated `/rest/api/{2,3}/search`;
 if an instance disagrees the 404 message names the older path, and the constant is
-a one-line change. Descriptions are *not* fetched here — on API v3 they arrive as
-an ADF document tree, which is why the plan has step 2 read bodies through v2.
+a one-line change.
+
+**Issue bodies are read through API v2** (`ISSUE_PATH_V2`, `fetch_issue`), and the
+version split is the whole point: on v3 a description arrives as an ADF document
+tree — nested JSON needing a renderer — while v2 returns the same content as wiki
+markup in a plain string. The search stays on v3 because it asks for no bodies.
+One ticket is fetched when a run is about to start, never fifty on the dashboard.
+
+#### The Run button — one click does the ticket (`core::work`, `State::runs`)
+
+A `Run` link on each dashboard row starts Claude Code on that ticket in a shell
+pane: branch, do the work, commit, push, open a **draft** PR. This is step 5 of
+`docs/jira-integration.md`, and that document's load-bearing decision holds — **the
+app does not embed an agent loop, it orchestrates the one already installed.** The
+whole feature is a prepared prompt, a shell tab, and a check afterwards.
+
+The flow: `Run` → pre-flight and ticket fetch on a background thread → a confirm
+dialog showing the verified plan → a shell tab in the repo running one line →
+the shell exits → the app reads the repository → alert, and the PR opens.
+
+**The app dictates the branch name** (`jira::branch_name` — `TFE-954-kebab-summary`),
+and that is what makes the run checkable rather than merely started. Because the
+name is known before anything runs, `work::preflight` can refuse when it already
+exists and `work::verify` can find the pull request afterwards without believing
+anything the agent said. An agent choosing its own name leaves the app unable to
+tell "done" from "did nothing".
+
+**The agent's account of its own work is not evidence.** `work::verify` asks git
+whether the branch exists, how many commits are on it, and whether it was pushed,
+then asks `gh` for the PR — and `Outcome::describe` names *how far it got*, because
+that decides what the user does next. "Pushed but no PR" needs `gh pr create`;
+"branch never created" needs the whole thing again.
+
+**Everything outside the base system runs through a login shell**, and this is the
+same trap `pty.rs` records. A Dock-launched app inherits launchd's
+`/usr/bin:/bin:/usr/sbin:/sbin`, so `gh` (Homebrew) and `claude` (`~/.local/bin`)
+are simply not findable — while the identical binary run from a terminal finds
+both, which makes it invisible in development and total in production. `git` is
+called directly, as `core::git` already does: `/usr/bin/git` is on the minimal
+`PATH` regardless.
+
+**The prompt is a file the shell reads, not text on the command line**
+(`run_command` → `claude … "$(cat <path>)"; exit`). A ticket description is
+thousands of characters, and putting it on the line means zsh echoing and
+re-wrapping all of it in a tab you're watching, every shell metacharacter in the
+ticket needing correct escaping, and history expansion seeing any `!` in the text.
+Inside `$(cat …)` none of that is true, and the only thing needing quoting is a
+path this app generated (via `shell_escaped`, already there for dropped files).
+
+**`; exit` is the completion signal.** The shell ends when the agent does, which
+fires `pty::Event::Exited` — the event that already removes a dead tab — so the run
+reports itself with no polling, no timer and no new plumbing.
+
+**Unattended is a deliberate choice, and the guard rails are what pay for it.**
+`--dangerously-skip-permissions` is the point of the button: a run that stops to
+ask in a tab nobody is watching reads as a hang. What makes it acceptable is
+everything around it, and removing any one of these changes the trade:
+
+| Guard | What it prevents |
+|---|---|
+| Status not in `run_statuses` → no control at all | An agent turned loose on a ticket nobody has specified yet |
+| No repo configured for the project → no control at all | An agent working in the wrong tree |
+| `preflight` refuses a dirty tree | Someone's unrelated work in progress swept into the agent's commits |
+| `preflight` refuses an existing branch, local or remote | Building on a previous run nobody remembers |
+| `preflight` checks `gh auth status` | Ten minutes of work, then a login prompt at `gh pr create` |
+| One run per repo (`State::runs`) | Two agents editing and branching over each other |
+| `JiraPane::preparing` covers pre-flight *and* the dialog | A second dialog for the same ticket, and two agents from two answers |
+| Confirm dialog, with `Show prompt` | A push and a PR from a pointer graze — and the prompt is readable first |
+| The PR is a draft | Unreviewed agent output in a colleague's queue |
+
+**The transcript is saved on *both* ways a run ends** (`State::take_run`). The grid
+is dropped with the tab, so that is the last moment the record exists — and losing
+it when the user *closes* the tab would be backwards, since a run someone aborted
+is the one they most want to read. Only a shell that exited on its own is
+*reported*, though: `close_shell` takes the record first, so an abandoned run isn't
+verified as if it had finished.
+
+`Terminal::transcript` walks the grid rather than reusing `selection_to_string`,
+which would mean installing a select-all over the user's own live selection.
+Wrapped rows are rejoined, or every command longer than the pane comes back with a
+newline through it.
+
+Two smaller pieces this needed, both general rather than Jira-specific:
+
+- **`Shell::on_attach`** — a command typed in once the PTY is live. `Attached`
+  `take`s it, so it can't replay on a shell the user has since made their own.
+  `SACRAMENT_SPIKE_CMD` now goes through it too, rather than a branch beside it.
+- **`Shell::label_override`** — a run's tab reads `TFE-954` for its life.
+  `refresh_cwd` leaves it alone; without it every run in a repo shares one tab
+  label, the directory basename.
+
+**Only a ticket that's ready to build gets the control** (`JiraConfig::runnable`,
+`run_statuses`, defaulting to `Specified` and `New`). This is *configurable rather
+than fixed, because status names are per-project* — the same warning this file's
+JQL note gives. `statusCategory` is identical on every instance but far too coarse
+here: "To Do" covers a ticket nobody has written up as well as one ready to build,
+and the whole premise of an unattended run is a description good enough to work
+from. Only the workflow's own names can tell those apart, and two projects on one
+instance can disagree.
+
+Matched case-insensitively and trimmed, because it's a display string typed into a
+config file by hand and the failure mode is a button that silently never appears.
+An empty list runs nothing; there is deliberately no "any status" value, since
+that's the one setting that turns the check off and it should have to be spelled
+out as a list.
+
+It costs nothing to read, because **the dashboard is already grouped by status** —
+the whole `Specified` table carries the control and the whole `In Progress` one
+doesn't, so it reads as a rule rather than as rows behaving differently.
+
+Configuration, in `[jira]`. The repo map is keyed by project key because a
+dashboard built from `assignee = currentUser()` spans whatever projects you're on:
+
+```toml
+[jira]
+run_statuses = ["Specified", "New"]
+
+[jira.repos]
+TFE = "~/code/truefire"
+```
+
+`[jira.repos]` must be the **last** thing in `[jira]`: a sub-table header closes
+the table above it, so a plain key written after it lands in `repos` instead.
+
+Deliberately **not** persisted: `State::runs` describes live agents, and a restored
+record would name shells that a restart already killed. The branch and any commits
+are in the repository, which is where the state that survives belongs. A restart
+re-spawns a plain shell in the repo directory — it does not restart the agent.
+
+**Untested end to end.** Everything pure is covered — branch names against invalid
+refs, the prompt's contents, `Outcome::describe` for each failure shape, `preflight`
+against a purpose-built temp repo — but no run has been driven against a live Jira
+instance and a real remote. `RUN_BASE` is `main` and `RUN_AGENT` is a constant; both
+are one-line changes.
 
 **Shell tabs made PTY identity dynamic.** `ShellKey { pane, serial }` replaced the
 fixed two-variant enum, and `subscription()` builds one `run_with(key, …)` per live
@@ -983,7 +1243,7 @@ none of which worked while the app was intercepting them globally.
 
 | binding | action |
 |---|---|
-| `Cmd+S` | Save (asks what to do if the file changed on disk) |
+| `Cmd+S` | Save (asks what to do if the file changed on disk; the Scratchpad just writes) |
 | `Cmd+O` | Open — native panel |
 | `Cmd+N` | New buffer tab |
 | `Cmd+T` | New tab in the focused pane (shell pane → shell; editor → buffer) |
@@ -1568,7 +1828,7 @@ so v2 would restore v1's tabs and shells over its own, and both would then
 contend for one socket. `/tmp/sacrament2-$USER.sock` belonging to a binary called
 `sacrament` is the cost of not doing that.
 
-299 tests (`cargo test --workspace`): 93 in `core`, 206 in the gui — buffer
+331 tests (`cargo test --workspace`): 113 in `core`, 218 in the gui — buffer
 mutation and undo, terminal reflow, the key map, fonts, block geometry, and
 `theme_guard`. v1 has
 none, and getting any would mean standing up a `Buffer` first. Still untested and

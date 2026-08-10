@@ -265,10 +265,10 @@ first — not a button that can be grazed with the pointer.
 | Step | State | Notes |
 |---|---|---|
 | 1 — read-only dashboard | **built, untested against a live instance** | See "What step 1 landed" |
-| 2 — ticket detail + spec | not started | |
-| 3 — cheap writes | not started | |
-| 4 — branch and link | not started | |
-| 5 — the button | not started | |
+| 2 — ticket detail + spec | **half built** | `fetch_issue` reads summary + description through v2, for the prompt. No Confluence, no detail view |
+| 3 — cheap writes | not started | Still nothing writes to Jira |
+| 4 — branch and link | **partly, differently** | The app *names* the branch (`jira::branch_name`) and the agent creates it. No remote issue link |
+| 5 — the button | **built, untested end to end** | See "What step 5 landed" |
 
 ## What step 1 landed
 
@@ -366,3 +366,83 @@ What replaced it:
 Known cost: keyboard scrolling. The grid gave arrow keys and PageUp/PageDown for
 free through `read_key`; a `scrollable` takes the wheel but not those keys, and
 `read_target` no longer has a Jira buffer to point at.
+
+## What step 5 landed
+
+The button, roughly as sketched — and the sketch held up. Nothing here is an agent
+loop: it is a prepared prompt, a shell tab, and a check afterwards.
+
+| File | Contents |
+|---|---|
+| `core/src/jira.rs` | `repos` map + `repo_for`, `run_statuses` + `runnable`, `project_key`, `branch_name`, `IssueDetail` / `fetch_issue` / `parse_issue` (API **v2**), `work_prompt` |
+| `core/src/work.rs` | New. `preflight`, `verify`, `Outcome::describe`, `PullRequest` |
+| `core/src/paths.rs` | `run_dir` — `<app>-runs/<branch>/`, holding `prompt.md` and `transcript.txt` |
+| `gui/src/term.rs` | `Terminal::transcript` — the whole grid plus scrollback as text |
+| `gui/src/main.rs` | `Run` column, `RunPlan` / `JiraRun` / `RunAnswer`, `prepare_run`, `confirm_run`, `begin_run`, `take_run`, `run_finished`, `report_run`; `Shell::on_attach` and `label_override` |
+
+Settled with the user before building: repos mapped by project key, branch named
+by the app, base `main`, **draft** PR, run **unattended**, and an alert plus the
+pull request opened in the browser at the end.
+
+### Decisions taken while building
+
+- **Only a ready-to-build status offers a run** (`run_statuses`, default
+  `Specified` / `New`). Configurable rather than fixed for the same reason this
+  document already gives about JQL: status names are per-project. `statusCategory`
+  is identical everywhere but far too coarse — "To Do" holds both a ticket nobody
+  has specified and one ready to build, and an unattended run needs a description
+  good enough to work from. Free to read, because the dashboard is already grouped
+  by status: whole tables carry the control or don't.
+- **The app dictates the branch name.** This is what makes the run *checkable*:
+  the name is known before anything starts, so `preflight` can refuse when it
+  already exists and `verify` can find the PR afterwards. An agent choosing its own
+  leaves the app unable to tell "done" from "did nothing".
+- **The agent's account is not evidence.** `verify` asks git and `gh`, and
+  `Outcome::describe` names how far it got — "pushed but no PR" and "branch never
+  created" need different things from the user.
+- **`gh` and `claude` are not on our `PATH`.** Same trap as `pty.rs`: a
+  Dock-launched app has launchd's minimal environment, so anything outside the base
+  system runs through a **login shell**. `git` is called directly, as `core::git`
+  already does. This is invisible in development and total in production.
+- **The prompt is a file the shell reads**, not text on the command line. A ticket
+  description is thousands of characters — on the line it means zsh re-wrapping all
+  of it in a tab you're watching, escaping every metacharacter in the ticket, and
+  history expansion seeing any `!`. `"$(cat …)"` avoids all three.
+- **`; exit` is the completion signal.** The shell ends when the agent does, firing
+  the `Exited` event that already removes a dead tab. No polling, no timer.
+- **The transcript is saved on both ways a run ends.** The grid dies with the tab,
+  and a run the user *aborted* is the one they most want to read. Only a natural
+  exit is reported, though — `close_shell` takes the record first.
+- **`JiraPane::preparing` spans the dialog, not just the fetch.** Between the two
+  there is no run record and nothing else says a start is under way, so a second
+  press would open a second dialog and answering both would put two agents in one
+  working tree.
+
+### Against the three hard problems this document recorded
+
+- *"Nothing in step 5 is reversible by the app."* The confirm dialog shows a
+  **verified** plan — the branch doesn't exist, the tree is clean, `gh` is
+  authenticated, the ticket was fetched — and its third button opens the generated
+  prompt as an editor tab, so the specification handed to an unattended agent can be
+  read before agreeing to it.
+- *"Seven steps means six places to die."* `verify` reports the state actually
+  found rather than a pass/fail. What is **not** built is the idempotence half:
+  there is no resuming a partial run, and re-running is refused because the branch
+  exists. That refusal is deliberate — it is the safe half of the problem — but it
+  is not the same as being able to pick up where a run died.
+- *"The self-review gate must be able to fail and hold the transition."* Sidestepped
+  rather than solved: the PR is always a draft and **no Jira transition happens at
+  all**. Nothing lands in a reviewer's queue on its own, so there is no gate to
+  hold yet. Step 3's writes are still unbuilt, and the moment a run starts moving
+  tickets this problem comes back exactly as written.
+
+### Not built, and known
+
+- No Jira transition or comment when a run finishes (step 3).
+- No run record surviving a restart, and no resume.
+- No preview-environment URL — the PR page is what comes back.
+- No second run queued behind a live one; it's refused, not queued.
+- **Untested end to end.** Everything pure is covered by tests — branch names
+  against invalid refs, the prompt's contents, `Outcome::describe` for each failure
+  shape, `preflight` against a purpose-built temp repo — but no run has been driven
+  against a live Jira instance and a real remote.

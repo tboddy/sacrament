@@ -21,6 +21,7 @@ pub mod secret;
 pub mod session;
 pub mod text;
 pub mod theme;
+pub mod work;
 
 /// App ids for per-user runtime paths. v1 and v2 run side by side during the
 /// rewrite, so they must not share a socket or a session file — see

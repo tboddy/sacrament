@@ -329,12 +329,34 @@ enum Message {
     /// Reload the Jira dashboard. From the clickable "Refresh" heading, and from
     /// `Cmd+R` while the section is showing.
     JiraRefresh,
-    /// Pointer entered or left the refresh control.
-    JiraRefreshHovered(bool),
+    /// Pointer entered one of the section's clickable pieces of text.
+    JiraHovered(JiraHover),
+    /// Pointer left one, and **which one** — the same rule the tab strips need.
+    /// Widgets publish in tree order, so moving from one issue key to the one
+    /// above it emits that key's `on_enter` *before* the departed key's
+    /// `on_exit`; an unconditional clear would then wipe the hover just set.
+    JiraUnhovered(JiraHover),
+    /// Open an issue in the browser, by key. The URL is derived in `update` from
+    /// the configured site rather than baked into the message, so
+    /// `jira::Issue::url` stays the one place that knows the shape of it.
+    JiraOpenIssue(String),
     /// A Jira fetch finished. `Err` carries a message for an alert — Jira's own
     /// words where it gave any, since it explains a bad query far better than a
     /// generic failure would.
     JiraLoaded(Result<sacrament_core::jira::Page, String>),
+    /// `Run` was pressed on a row. Starts the pre-flight, not the agent.
+    JiraStartRun(String),
+    /// Pre-flight and ticket fetch finished. `Err` is why the run can't start.
+    ///
+    /// Boxed because the plan is the largest thing any message carries, and an
+    /// enum is as wide as its widest variant — every other message would
+    /// otherwise pay for this one.
+    JiraRunPrepared(Result<Box<RunPlan>, String>),
+    /// The confirm dialog closed.
+    JiraRunConfirmed(Box<RunPlan>, RunAnswer),
+    /// A run's shell exited and its repository has been read. Carries the issue
+    /// key, because by then the run record is gone.
+    JiraRunFinished(String, Box<sacrament_core::work::Outcome>),
 }
 
 /// One pane's identity. Only `Shell` exists in the spike; `Editor` is the point
@@ -447,14 +469,20 @@ struct TabLabel {
 const DIRTY_SLOT: usize = 11;
 const UNREVIEWED_SLOT: usize = 14;
 
-/// The Jira section's refresh control: `blue` at rest, `bright_blue` under the
+/// Clickable text in the Jira section: `blue` at rest, `bright_blue` under the
 /// pointer. Theme slots, not literals — `[theme]` decides the actual shades.
+///
+/// Two consumers, deliberately sharing one pair: the "Refresh" control and every
+/// issue key. Both are text you can press, and a section where two of those look
+/// different reads as two kinds of thing. `bright_blue` is also what
+/// `core::markdown` renders a link in, so an issue key that *is* a link lands on
+/// the link colour when you reach for it.
 ///
 /// A chrome decision rather than a markdown-derived one, which is why these are
 /// slot constants here beside the tab markers rather than accessors on
-/// `core::markdown`. The control only *looks* like a heading; it isn't one.
-const REFRESH_SLOT: usize = 4;
-const REFRESH_HOVER_SLOT: usize = 12;
+/// `core::markdown`. The refresh control only *looks* like a heading; it isn't one.
+const LINK_SLOT: usize = 4;
+const LINK_HOVER_SLOT: usize = 12;
 
 /// Where the Jira API token is looked up. The Keychain is the real source; the
 /// environment variable is the scriptable override. Never `config.toml` — that
@@ -467,17 +495,85 @@ const JIRA_TOKEN_ENV: &str = "SACRAMENT_JIRA_TOKEN";
 /// Portions rather than fixed pixels: the pane is resizable and the summary should
 /// absorb the slack. Summary is last and much the widest — it's the only column
 /// whose length is unbounded, and the short ones are what you scan.
-const JIRA_COLUMNS: [(&str, u16); 5] = [
+const JIRA_COLUMNS: [(&str, u16); 6] = [
     ("Key", 3),
     ("Pri", 2),
     ("Type", 3),
     ("Updated", 3),
     ("Summary", 13),
+    // Last, because it's an action rather than something you scan — and because
+    // putting it among the columns you read means passing the pointer over it on
+    // the way to everything else.
+    ("Run", 2),
 ];
 
 /// Gaps inside a dashboard table.
 const TABLE_COL_GAP: f32 = 12.0;
 const TABLE_ROW_GAP: f32 = 4.0;
+
+/// What a ticket run branches from and targets.
+///
+/// A constant rather than config: one base is what was asked for, and a key in
+/// `[jira.repos]` for it is a change of one line if a repo ever disagrees. Stating
+/// it here — rather than leaving it to the agent — is what lets `work::verify`
+/// count the run's commits against the right thing afterwards.
+const RUN_BASE: &str = "main";
+
+/// How the agent is invoked.
+///
+/// **Unattended, by explicit choice.** The whole value of the button is that one
+/// click produces a pull request, and a run that stops to ask permission halfway
+/// through — in a tab nobody is watching — reads as a hang. What makes that
+/// acceptable is everything around it: `work::preflight` refuses to start in a
+/// dirty or already-branched tree, the confirm dialog shows the plan and offers
+/// the prompt to read first, the pull request is a draft, and `work::verify`
+/// reports what actually happened rather than what the agent claimed.
+const RUN_AGENT: &str = "claude --dangerously-skip-permissions";
+
+/// A ticket run in flight: which agent shell is working on what, and where.
+struct JiraRun {
+    /// Issue key, e.g. `TFE-954`. Identifies the run everywhere the user sees it.
+    key: String,
+    repo: std::path::PathBuf,
+    branch: String,
+    /// The shell the agent is running in. Its exit is the run's completion signal.
+    shell: ShellKey,
+    /// Where this run's prompt and transcript are kept.
+    dir: std::path::PathBuf,
+}
+
+/// Everything decided before a run starts.
+///
+/// Assembled by `prepare_run` on a background thread — it does a git pre-flight and
+/// a Jira fetch — and then carried through the confirm dialog, which is why it's
+/// plain owned data rather than borrowed from `State`.
+#[derive(Debug, Clone)]
+struct RunPlan {
+    key: String,
+    summary: String,
+    repo: std::path::PathBuf,
+    branch: String,
+    /// The generated instructions, on disk. Shown on request before starting, and
+    /// read by the shell command below.
+    prompt_path: std::path::PathBuf,
+    /// The single line typed into the run's shell.
+    command: String,
+    dir: std::path::PathBuf,
+}
+
+/// What the user said to the confirm dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunAnswer {
+    Start,
+    /// Open the generated prompt as an editor tab and start nothing.
+    ///
+    /// The dialog is *not* re-shown afterwards, deliberately: it would cover the
+    /// file it just opened. Reading the prompt is a detour that ends by pressing
+    /// `Run` again, which costs one more pre-flight and is worth it for a run that
+    /// pushes code without asking anything else.
+    ShowPrompt,
+    Cancel,
+}
 
 /// What the Jira section shows when it has nothing to connect to.
 ///
@@ -620,6 +716,173 @@ fn alert_dialog(body: String) -> Task<Message> {
     )
 }
 
+/// Open the Scratchpad's document, creating it the first time.
+///
+/// **Loaded with no highlighter, on purpose.** The scratchpad is plain text — no
+/// syntax, no markdown — so there is no grammar to seed and nothing for
+/// `ensure_highlights` to compute. `BufferSource` is handed `None` for the same
+/// reason, and the two together are what make "plain text" a property of the
+/// buffer rather than a rule to remember.
+///
+/// A file that can't be created or read leaves an in-memory buffer with no path.
+/// The section still works for the session and simply can't persist, which is a
+/// better answer than refusing to show it — but the caller alerts, because a
+/// scratchpad that silently stops saving is exactly the thing you'd rely on and
+/// lose.
+fn load_scratchpad(tab_width: usize) -> Buffer {
+    let mut buf = match sacrament_core::paths::scratchpad_path(sacrament_core::APP_GUI) {
+        // `Buffer::load` reads the file, so it has to exist before the first ever
+        // launch can open it. Creating it here also means `save` has a real mtime
+        // to compare against rather than tripping its changed-on-disk guard.
+        Some(path) => {
+            if !path.exists() {
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(&path, "");
+            }
+            Buffer::load(&path, None).unwrap_or_else(|_| Buffer::empty())
+        }
+        None => Buffer::empty(),
+    };
+    buf.tab_width = tab_width;
+    buf
+}
+
+/// Names inside a run's directory.
+const PROMPT_FILE: &str = "prompt.md";
+const TRANSCRIPT_FILE: &str = "transcript.txt";
+
+/// Where one run's prompt and transcript live.
+///
+/// **Keyed by branch, not by ticket**, and in one function because two places need
+/// the answer — the run that writes the files, and the report that reads them back
+/// after the record has been dropped. A second attempt at the same ticket is a
+/// different branch, so it gets a different directory rather than overwriting the
+/// transcript of the run someone is most likely trying to understand.
+fn run_dir_for(branch: &str) -> Option<std::path::PathBuf> {
+    sacrament_core::paths::run_dir(sacrament_core::APP_GUI, branch)
+}
+
+/// Everything that has to succeed before an agent is allowed to start.
+///
+/// Blocking, and run on a thread-pool thread through `Task::perform` — it shells
+/// out to git several times and makes an HTTP request. Ordered so the cheap local
+/// checks refuse before the network is touched.
+///
+/// The error is a sentence for an alert. Each one names what to do about it,
+/// because "the run can't start" with no reason is a button that appears broken.
+fn prepare_run(
+    config: sacrament_core::jira::JiraConfig,
+    key: String,
+    summary: String,
+    repo: std::path::PathBuf,
+) -> Result<Box<RunPlan>, String> {
+    use sacrament_core::jira;
+
+    let branch = jira::branch_name(&key, &summary);
+    sacrament_core::work::preflight(&repo, &branch)?;
+
+    let Some(token) = sacrament_core::secret::lookup(
+        JIRA_TOKEN_ENV,
+        JIRA_KEYCHAIN_SERVICE,
+        &config.email,
+    ) else {
+        return Err(format!(
+            "No Jira API token for {}. Store one with:\n\n{}",
+            config.email,
+            sacrament_core::secret::store_hint(JIRA_KEYCHAIN_SERVICE, &config.email)
+        ));
+    };
+    // The dashboard's summary is enough for a branch name, but not to work from:
+    // this is the fetch that gets the description, through API v2.
+    let detail = jira::fetch_issue(&config, &token, &key)?;
+    let ticket_url = jira::issue_url(&config.base_url(), &key);
+    let prompt = jira::work_prompt(&detail, &branch, RUN_BASE, &ticket_url);
+
+    let dir = run_dir_for(&branch)
+        .ok_or_else(|| "Couldn't work out where to keep this run's files.".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let prompt_path = dir.join(PROMPT_FILE);
+    std::fs::write(&prompt_path, &prompt)
+        .map_err(|e| format!("{}: {e}", prompt_path.display()))?;
+
+    Ok(Box::new(RunPlan {
+        key,
+        summary: detail.summary,
+        repo,
+        branch,
+        command: run_command(&prompt_path),
+        prompt_path,
+        dir,
+    }))
+}
+
+/// The single line typed into a run's shell.
+///
+/// **The prompt is read from a file rather than written on the line**, and that is
+/// not tidiness. A ticket description is easily thousands of characters, and
+/// putting it on the command line means zsh echoing and re-wrapping all of it in a
+/// tab the user is watching, every shell metacharacter in the ticket needing to be
+/// escaped correctly, and history expansion seeing any `!` in the text. Inside
+/// `$(cat …)` none of that is true — the shell reads the file, and the only thing
+/// needing quoting is a path this app generated.
+///
+/// `; exit` is the completion signal. The shell ends when the agent does, which
+/// fires `pty::Event::Exited`, which is what makes the run report itself without
+/// polling anything.
+fn run_command(prompt_path: &std::path::Path) -> String {
+    format!(
+        "{RUN_AGENT} \"$(cat {})\"; exit",
+        shell_escaped(prompt_path)
+    )
+}
+
+/// Ask before doing anything outward-facing.
+///
+/// The plan is shown *after* it has been verified, so every line of it is a fact:
+/// the branch doesn't exist yet, the tree is clean, `gh` is authenticated, and the
+/// ticket was fetched. A dialog offering to do something that will then fail is
+/// worse than no dialog.
+///
+/// `Show prompt` is the third button because this run is unattended — the prompt is
+/// the entire specification, and being able to read it before agreeing is the
+/// difference between a considered decision and a leap.
+fn confirm_run(plan: Box<RunPlan>) -> Task<Message> {
+    let dialog = rfd::AsyncMessageDialog::new()
+        .set_title(format!("Start {}?", plan.key))
+        .set_description(format!(
+            "{}\n\n\
+             Repository:  {}\n\
+             Branch:      {} (from {RUN_BASE})\n\
+             Pull request: draft, targeting {RUN_BASE}\n\n\
+             Claude Code will run unattended in a shell tab and will commit, push \
+             and open the pull request without asking again.",
+            plan.summary,
+            plan.repo.display(),
+            plan.branch,
+        ))
+        .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+            "Start".into(),
+            "Show prompt".into(),
+            "Cancel".into(),
+        ));
+    Task::perform(
+        async move {
+            match dialog.show().await {
+                rfd::MessageDialogResult::Custom(l) if l == "Start" => RunAnswer::Start,
+                rfd::MessageDialogResult::Custom(l) if l == "Show prompt" => {
+                    RunAnswer::ShowPrompt
+                }
+                _ => RunAnswer::Cancel,
+            }
+        },
+        // Cloned per call because `Task::perform` wants `Fn`, not `FnOnce`. It runs
+        // once; the clone is one plan, not one per frame.
+        move |answer| Message::JiraRunConfirmed(plan.clone(), answer),
+    )
+}
+
 /// Backslash-escape a path for insertion at a shell prompt.
 ///
 /// This is what a terminal does when a file is dropped into it, and it's the
@@ -726,19 +989,31 @@ impl TabGroup {
 enum Section {
     Editor,
     Jira,
+    Scratchpad,
 }
 
 impl Section {
     /// Strip order, left to right. A tab press carries an index into this, so it
     /// is the single definition of both the set and its order — `section_bar`
     /// renders from it and `select_section` reads back through it.
-    const ALL: [Section; 2] = [Section::Editor, Section::Jira];
+    const ALL: [Section; 3] = [Section::Editor, Section::Jira, Section::Scratchpad];
 
     fn label(self) -> &'static str {
         match self {
             Section::Editor => "Editor",
             Section::Jira => "Jira",
+            Section::Scratchpad => "Scratchpad",
         }
+    }
+
+    /// Does this section put an editable text surface on screen?
+    ///
+    /// The question `State::text_target` is built on. Two sections say yes and they
+    /// are not interchangeable: `Editor` shows whichever file tab is active, and
+    /// `Scratchpad` shows one permanent document with no tabs and no gutter. What
+    /// they share is that a keystroke means "type this" in both.
+    fn has_text(self) -> bool {
+        matches!(self, Section::Editor | Section::Scratchpad)
     }
 }
 
@@ -767,13 +1042,38 @@ struct JiraPane {
     /// Whether a fetch has ever been attempted. Drives the first-show fetch, and
     /// keeps a failed attempt from re-firing every time the section is selected.
     attempted: bool,
-    /// Pointer is over the refresh control.
+    /// The issue whose run is being set up: pre-flight, ticket fetch, and the
+    /// confirm dialog on top of them.
     ///
-    /// A plain `bool` rather than the `Option<(group, index)>` the tab strips need:
-    /// there is exactly one hoverable control here, so `on_exit` can't be clearing
-    /// a hover that a sibling's `on_enter` just set. That tree-order hazard is real
-    /// on the strips and simply absent with one control.
-    hovered: bool,
+    /// Held for the *whole* of that, dialog included, rather than just the
+    /// background work. Between the two there is no run record yet and nothing else
+    /// says a start is under way, so a second press would open a second dialog for
+    /// the same ticket — and answering both would put two agents in one working
+    /// tree, which is precisely what the one-run-per-repo rule exists to prevent.
+    ///
+    /// Same shape as `loading` above, for the same reason: a control that takes a
+    /// visible moment to respond is one people press twice.
+    preparing: Option<String>,
+    /// What the pointer is over, if anything.
+    ///
+    /// **One field for the whole section**, not one per control: exactly one thing
+    /// can be under the pointer, so a second field would only make two answers to
+    /// the same question possible. It was a plain `bool` while Refresh was the
+    /// only hoverable thing here; the issue keys made it a set, and with a set the
+    /// tab strips' tree-order hazard is back — hence `JiraUnhovered` carrying an
+    /// identity to compare rather than clearing unconditionally.
+    hovered: Option<JiraHover>,
+}
+
+/// A clickable piece of text in the Jira section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JiraHover {
+    Refresh,
+    /// An issue key, e.g. `TFE-954`. The key rather than a row index, because the
+    /// index means nothing across a refresh that reordered or dropped rows.
+    Key(String),
+    /// The `Run` control on the row for this issue key.
+    Run(String),
 }
 
 impl JiraPane {
@@ -782,8 +1082,14 @@ impl JiraPane {
             view: JiraView::Loading,
             loading: false,
             attempted: false,
-            hovered: false,
+            preparing: None,
+            hovered: None,
         }
+    }
+
+    /// Is the pointer over this exact thing?
+    fn is_hovered(&self, what: &JiraHover) -> bool {
+        self.hovered.as_ref() == Some(what)
     }
 }
 
@@ -815,6 +1121,19 @@ struct Shell {
     pid: Option<u32>,
     /// Tab label: the cwd's basename, following `cd`.
     label: String,
+    /// A label that outranks the cwd, for a shell that isn't really "a directory".
+    ///
+    /// A ticket run's tab reads `TFE-954` for its whole life. Without this it would
+    /// read `truefire` like any other shell in that repo — and the one thing you
+    /// need from a tab strip holding two runs is which is which.
+    label_override: Option<String>,
+    /// A command line to type into the shell the moment its PTY is live.
+    ///
+    /// Taken (not cloned) on `Event::Attached`, so it runs exactly once. This is
+    /// how a ticket run starts `claude` without the user typing anything, and it's
+    /// the same mechanism `SACRAMENT_SPIKE_CMD` uses to run a throughput test —
+    /// one path rather than a special case beside it.
+    on_attach: Option<String>,
     /// Throttles the cwd syscall — output can arrive thousands of times a second
     /// during a flood, and the directory changes at human speed.
     last_cwd_check: Option<Instant>,
@@ -864,6 +1183,8 @@ impl Shell {
                         .map(|p| sacrament_core::proc::dir_label(&p))
                         .unwrap_or_else(|_| "shell".to_string())
                 }),
+            label_override: None,
+            on_attach: None,
             start_cwd,
             terminal: Arc::new(Mutex::new(Terminal::new(rows, cols))),
             handle: None,
@@ -872,6 +1193,11 @@ impl Shell {
             last_cwd_check: None,
             scroll_px: 0.0,
         }
+    }
+
+    /// The tab's text: a fixed label where one was set, otherwise the cwd.
+    fn tab_label(&self) -> &str {
+        self.label_override.as_deref().unwrap_or(&self.label)
     }
 }
 
@@ -928,6 +1254,28 @@ struct State {
     section: Section,
     /// The Jira section's dashboard and fetch state.
     jira: JiraPane,
+    /// The Scratchpad section's one permanent document.
+    ///
+    /// **Deliberately not in `buffers`.** That list is the *file tabs* — things the
+    /// user opened, that the session restores, that `Cmd+W` closes and the quit
+    /// prompt asks about. The scratchpad is none of those: it is always there, has
+    /// no tab, cannot be closed, and saves itself. Putting it in the list would
+    /// have meant excluding it by index from every one of those operations, which
+    /// is the kind of exception that gets missed once and then edits the wrong
+    /// document.
+    ///
+    /// An `Arc<Mutex<_>>` like the others because `GridView` owns its source and
+    /// locks inside `fill`, never in `view()`.
+    scratchpad: Arc<Mutex<Buffer>>,
+    /// Ticket runs currently in flight, one entry per live agent.
+    ///
+    /// A `Vec` rather than a map: it holds at most a handful, and both lookups
+    /// wanted here — by ticket and by shell — are scans either way.
+    ///
+    /// **Not persisted.** A restart kills the shells, so a restored record would
+    /// describe a run that is no longer happening; the branch and any commits are
+    /// still in the repository, which is where the state that matters lives.
+    runs: Vec<JiraRun>,
     /// `None` when `syntax_highlighting = false`.
     highlighter: Option<Arc<sacrament_core::highlight::Highlighter>>,
     panes: pane_grid::State<PaneKind>,
@@ -1040,7 +1388,7 @@ impl State {
                 size: None,
             }
         };
-        let (bottom, right) = match &saved {
+        let (mut bottom, right) = match &saved {
             Some(sess) => (
                 restore_pane(PaneId::Bottom, &sess.bottom_shells, sess.bottom_active),
                 restore_pane(PaneId::Right, &sess.right_shells, sess.right_active),
@@ -1050,6 +1398,15 @@ impl State {
                 restore_pane(PaneId::Right, &[], 0),
             ),
         };
+        // SACRAMENT_SPIKE_CMD runs a command on attach so throughput can be
+        // measured without typing. It goes through `on_attach` like a ticket run
+        // does — one mechanism rather than a branch in the `Attached` handler.
+        // First bottom shell only, or a restored session would run it per tab.
+        if let Ok(cmd) = std::env::var("SACRAMENT_SPIKE_CMD")
+            && let Some(first) = bottom.shells.first_mut()
+        {
+            first.on_attach = Some(cmd);
+        }
         let geometry = saved
             .as_ref()
             .map(|s| s.geometry.sanitized())
@@ -1168,6 +1525,8 @@ impl State {
             active,
             section: Section::Editor,
             jira: JiraPane::new(),
+            scratchpad: Arc::new(Mutex::new(load_scratchpad(tab_width))),
+            runs: Vec::new(),
             highlighter,
             config,
             panes,
@@ -1194,9 +1553,32 @@ impl State {
         // A font family that didn't resolve is a config error, so it's said once
         // at startup rather than queued — nothing has happened yet to queue it
         // behind.
-        let boot = match font_warning {
-            Some(w) => alert_dialog(w),
-            None => Task::none(),
+        //
+        // A scratchpad with no path is the same shape of problem and has to be said
+        // just as loudly: the section still works, so nothing on screen looks wrong,
+        // and it would silently discard everything typed into it at quit. Detected
+        // by the buffer having no path, which is what `load_scratchpad` falls back
+        // to and what `save_scratchpad` refuses to write.
+        let scratchpad_failed = state
+            .scratchpad
+            .lock()
+            .map(|b| b.path().is_none())
+            .unwrap_or(true);
+        let mut warnings: Vec<String> = font_warning.into_iter().collect();
+        if scratchpad_failed {
+            warnings.push(format!(
+                "The scratchpad couldn't be opened{}. The section still works, but \
+                 nothing typed there will be saved.",
+                match sacrament_core::paths::scratchpad_path(sacrament_core::APP_GUI) {
+                    Some(p) => format!(" at {}", p.display()),
+                    None => String::new(),
+                }
+            ));
+        }
+        let boot = if warnings.is_empty() {
+            Task::none()
+        } else {
+            alert_dialog(warnings.join("\n\n"))
         };
         (state, boot)
     }
@@ -1204,7 +1586,17 @@ impl State {
     /// Window title carries the filename and the dirty marker. That's the save
     /// feedback: there's no status bar, and a dirty dot that disappears on save
     /// tells you more, continuously, than a message that flashes once.
+    ///
+    /// **The Scratchpad names itself, with no dot.** It's a different document on
+    /// screen, so naming the file behind it would be wrong — and it autosaves, so
+    /// a dirty marker would report a state the user has no action to take about,
+    /// blinking on and off as they type. The Jira section keeps showing the active
+    /// file, because there is no document on screen there at all and the last thing
+    /// being edited is still the most useful thing the title can say.
     fn title(&self) -> String {
+        if self.section == Section::Scratchpad {
+            return "Scratchpad — sacrament".to_string();
+        }
         let (name, dirty) = self
             .buf()
             .lock()
@@ -1232,7 +1624,7 @@ impl State {
         }
     }
 
-    /// Is the editor's text surface the thing on screen and holding the keyboard?
+    /// Is the **file** editor the thing on screen and holding the keyboard?
     ///
     /// `Focus::Editor` names the pane, and the pane holds sections now, so focus
     /// alone no longer answers this: with Jira showing there is no text and no
@@ -1241,11 +1633,45 @@ impl State {
     /// of hole as read mode, so it's closed the same way: at the routing layer,
     /// once, rather than inside each command.
     ///
+    /// **Specifically the file tabs, not "any text surface".** The Scratchpad is
+    /// editable too, but nothing that belongs to the tab strip applies to it —
+    /// close, cycle, select tab N, save-as. Those keep asking this; the commands
+    /// that act on text ask `text_target` instead.
+    ///
     /// Read mode is deliberately *not* folded in here. It's a different question
     /// — the text is on screen, it just can't be typed into — and the two have
     /// different answers for navigation keys.
     fn editing(&self) -> bool {
         self.focus == Focus::Editor && self.section == Section::Editor
+    }
+
+    /// **The single decision of which buffer a text command acts on**, and whether
+    /// there is one at all.
+    ///
+    /// The editor pane now hosts two editable surfaces — the active file tab and
+    /// the Scratchpad — so "type this", "undo that" and "select all" have to ask
+    /// *which*. Answering it here rather than at each call site is the same rule
+    /// `read_target` follows for scrolling: two independent answers to one question
+    /// is the bug they would otherwise take turns having.
+    ///
+    /// **Deliberately narrower than `editing()` is wide.** `editing()` still means
+    /// the *file* editor specifically, and the commands that act on the file tabs
+    /// — close, cycle, select tab N, save-as — keep asking it. That split is
+    /// chosen so the failure modes are asymmetric: a text command that forgets to
+    /// use this one simply doesn't work in the scratchpad, which is visible and
+    /// harmless, whereas a tab command that widened to include it would edit or
+    /// close a file the user cannot see.
+    ///
+    /// Returns an owned handle, not a borrow: nearly every caller wants `&mut self`
+    /// afterwards to raise an alert or scroll the view.
+    fn text_target(&self) -> Option<Arc<Mutex<Buffer>>> {
+        if self.focus != Focus::Editor || !self.section.has_text() {
+            return None;
+        }
+        Some(match self.section {
+            Section::Scratchpad => self.scratchpad.clone(),
+            _ => self.buf().clone(),
+        })
     }
 
     /// Put the editor section in front of the user and give it the keyboard.
@@ -1258,7 +1684,62 @@ impl State {
     /// `editing`.
     fn show_editor(&mut self) {
         self.focus = Focus::Editor;
-        self.section = Section::Editor;
+        self.set_section(Section::Editor);
+    }
+
+    /// **The single place the section changes.**
+    ///
+    /// Two things have to happen on every switch, and both are silent bugs when a
+    /// route skips them — which is why `show_editor` and `select_section` both come
+    /// through here rather than assigning the field:
+    ///
+    /// - **The Scratchpad saves itself when you leave it.** It has no tab, no dirty
+    ///   marker and no close prompt, so nothing else would ever ask.
+    /// - **The sub-row scroll offset resets.** It's a pixel remainder belonging to
+    ///   whichever surface was being scrolled; carried across, it offsets the next
+    ///   one by up to a row for no reason.
+    fn set_section(&mut self, section: Section) {
+        if self.section == section {
+            return;
+        }
+        if self.section == Section::Scratchpad {
+            self.save_scratchpad();
+        }
+        self.section = section;
+        self.editor_scroll_px = 0.0;
+    }
+
+    /// Write the scratchpad out, if it has anything new to write.
+    ///
+    /// **Autosaved rather than asked about**, because it is the app's own document
+    /// rather than a file the user opened: there is no tab to carry a dirty dot, no
+    /// `Cmd+W` to prompt on, and nothing in the quit dialog about it. A scratchpad
+    /// you have to remember to save is one that eventually loses a note.
+    ///
+    /// Cheap enough to call freely — a clean buffer returns before touching the
+    /// disk, which is what lets this hang off section changes, focus changes and
+    /// quit without thought.
+    ///
+    /// **A changed-on-disk conflict overwrites.** `Buffer::save`'s guard exists for
+    /// files two people might edit; this one is ours, written to a path nothing else
+    /// knows about. Honouring the guard here would mean a scratchpad that silently
+    /// stopped saving with no dialog anywhere to resolve it — the buffer on screen
+    /// is the document, so it wins.
+    fn save_scratchpad(&mut self) {
+        let Ok(mut b) = self.scratchpad.lock() else {
+            return;
+        };
+        if !b.dirty || b.path().is_none() {
+            return;
+        }
+        let result = match b.save() {
+            Err(buffer::SaveError::ChangedOnDisk) => b.save_overwriting(),
+            other => other,
+        };
+        if let Err(e) = result {
+            drop(b);
+            self.alert(format!("Couldn't save the scratchpad: {e}"));
+        }
     }
 
     /// Switch which section the editor pane shows. `index` is into `Section::ALL`.
@@ -1266,7 +1747,7 @@ impl State {
         let Some(&section) = Section::ALL.get(index) else {
             return Task::none();
         };
-        self.section = section;
+        self.set_section(section);
         // The strip belongs to the editor pane, so pressing it is interacting
         // with that pane — the same reason `select_tab` takes focus.
         self.focus = Focus::Editor;
@@ -1327,6 +1808,185 @@ impl State {
         )
     }
 
+    /// `Run` was pressed on a dashboard row.
+    ///
+    /// Starts a *pre-flight*, not an agent. Nothing here touches the repository or
+    /// the network — the checks that can refuse cheaply run first, on this thread,
+    /// and the two that can't (git and Jira) go to a background task.
+    fn start_run(&mut self, key: String) -> Task<Message> {
+        // Already running: show it rather than starting a second agent on the same
+        // ticket. The `Run` cell says `Running` for exactly this reason, but a
+        // stale frame or a fast second click can still land here.
+        if let Some(run) = self.runs.iter().find(|r| r.key == key) {
+            let shell = run.shell;
+            if let Some(index) = self
+                .pane(shell.pane)
+                .shells
+                .iter()
+                .position(|s| s.key == shell)
+            {
+                self.select_shell(shell.pane, index);
+            }
+            return Task::none();
+        }
+        let Some(repo) = self.config.jira.repo_for(&key) else {
+            // Shouldn't be reachable — a row with no repo draws no control — but
+            // saying which key is missing beats doing nothing if it ever is.
+            self.alert(format!(
+                "No repository is configured for {}. Add it under [jira.repos] in \
+                 config.toml:\n\n[jira.repos]\n{} = \"~/code/your-repo\"",
+                sacrament_core::jira::project_key(&key),
+                sacrament_core::jira::project_key(&key)
+            ));
+            return Task::none();
+        };
+        // **One run per working tree.** Two agents in one checkout would edit,
+        // stage and branch over each other, and the damage isn't obvious until
+        // something is pushed.
+        if let Some(other) = self.runs.iter().find(|r| r.repo == repo) {
+            self.alert(format!(
+                "{} is already running in {}. Wait for it to finish, or close its \
+                 tab to stop it.",
+                other.key,
+                repo.display()
+            ));
+            return Task::none();
+        }
+        // A start already under way owns the next few seconds — see
+        // `JiraPane::preparing`. Pressing the same row again is a repeat of an
+        // instruction already being carried out, so it says nothing; pressing a
+        // different one is a real request that has to be refused out loud.
+        if let Some(preparing) = &self.jira.preparing {
+            if *preparing != key {
+                self.alert(format!(
+                    "{preparing} is still starting. Wait for it before starting \
+                     another ticket."
+                ));
+            }
+            return Task::none();
+        }
+        let Some(issue) = self.dashboard_issue(&key) else {
+            self.alert(format!("{key} is no longer in the dashboard. Refresh and try again."));
+            return Task::none();
+        };
+        // Checked here as well as in the view, for the reason the repo check is:
+        // the control is the guard rail, and a guard rail that only exists in the
+        // drawing is one a stale frame can get past.
+        if !self.config.jira.runnable(&issue.status) {
+            self.alert(format!(
+                "{key} is `{}`, and a run only starts from {}. Change the ticket's \
+                 status, or add that one to `run_statuses` under [jira] in \
+                 config.toml.",
+                issue.status,
+                self.config.jira.run_statuses.join(" or ")
+            ));
+            return Task::none();
+        }
+        let summary = issue.summary;
+
+        self.jira.preparing = Some(key.clone());
+        let config = self.config.jira.clone();
+        Task::perform(
+            async move { prepare_run(config, key, summary, repo) },
+            Message::JiraRunPrepared,
+        )
+    }
+
+    /// An issue as the dashboard currently shows it.
+    ///
+    /// Read from what's on screen rather than fetched, so the branch name and the
+    /// status check are both settled — and the pre-flight run — before any network
+    /// call. Cloned rather than borrowed because every caller then wants to raise
+    /// an alert, which needs `&mut self`.
+    fn dashboard_issue(&self, key: &str) -> Option<sacrament_core::jira::Issue> {
+        let JiraView::Ready(page) = &self.jira.view else {
+            return None;
+        };
+        page.issues.iter().find(|i| i.key == key).cloned()
+    }
+
+    /// Start the agent: a shell tab in the repository, running one command.
+    fn begin_run(&mut self, plan: RunPlan) {
+        // The bottom pane, always, rather than whichever pane has focus. A run is
+        // something to keep an eye on, and a predictable place to look for it beats
+        // one that depends on what was clicked last.
+        let shell_key = self.spawn_shell_in(PaneId::Bottom, Some(plan.repo.clone()));
+        if let Some(shell) = self.shell_by_key(shell_key) {
+            shell.on_attach = Some(plan.command.clone());
+            // The tab reads `TFE-954` for the life of the run. Every run in a repo
+            // would otherwise be labelled with the same directory basename.
+            shell.label_override = Some(plan.key.clone());
+        }
+        self.runs.push(JiraRun {
+            key: plan.key,
+            repo: plan.repo,
+            branch: plan.branch,
+            shell: shell_key,
+            dir: plan.dir,
+        });
+    }
+
+    /// End a run: take its record, and save what its shell had on screen.
+    ///
+    /// **Both ways a run ends come through here**, because both destroy the only
+    /// account of what the agent did. The grid is dropped with the tab, so this is
+    /// the last moment it exists — whether the shell exited on its own or the user
+    /// closed the tab to stop it. Losing the transcript on the second one would be
+    /// backwards: a run someone aborted is the one they most want to read.
+    ///
+    /// `None` for every shell that isn't a run, which is nearly all of them.
+    fn take_run(&mut self, shell: ShellKey) -> Option<JiraRun> {
+        let index = self.runs.iter().position(|r| r.shell == shell)?;
+        let run = self.runs.remove(index);
+        let transcript = self
+            .shell_by_key(shell)
+            .and_then(|s| s.terminal.lock().ok().map(|t| t.transcript()));
+        if let Some(text) = transcript {
+            let _ = std::fs::create_dir_all(&run.dir);
+            let _ = std::fs::write(run.dir.join(TRANSCRIPT_FILE), text);
+        }
+        Some(run)
+    }
+
+    /// A run's shell exited on its own. Go and look at what it left in the repo.
+    ///
+    /// Deliberately *not* reached when the user closed the tab: `close_shell` takes
+    /// the record first, so a run someone abandoned halfway is not reported as
+    /// though it had finished — its repository state is expected to be partial.
+    fn run_finished(&mut self, shell: ShellKey) -> Option<Task<Message>> {
+        let run = self.take_run(shell)?;
+        let (key, repo, branch) = (run.key, run.repo, run.branch);
+        Some(Task::perform(
+            async move {
+                let outcome = sacrament_core::work::verify(&repo, &branch, RUN_BASE);
+                (key, Box::new(outcome))
+            },
+            |(key, outcome)| Message::JiraRunFinished(key, outcome),
+        ))
+    }
+
+    /// Report a finished run, and put its result in front of the user.
+    ///
+    /// Success and failure both get an alert, and both then open the thing worth
+    /// looking at next — the pull request, or the transcript of what went wrong.
+    /// An alert alone would leave the user with a message and nowhere to go.
+    fn report_run(&mut self, key: &str, outcome: &sacrament_core::work::Outcome) {
+        self.alert(format!("{key}\n\n{}", outcome.describe()));
+        if let Some(pr) = &outcome.pr {
+            open_url(&pr.url);
+            return;
+        }
+        let transcript = run_dir_for(&outcome.branch).map(|d| d.join(TRANSCRIPT_FILE));
+        if let Some(path) = transcript
+            && path.is_file()
+        {
+            self.show_editor();
+            if let Err(e) = self.open_path(&path, None, None, false) {
+                self.alert(e);
+            }
+        }
+    }
+
     /// Ask the system where to save, then save there.
     fn save_as_dialog(&self) -> Task<Message> {
         let current = self
@@ -1338,6 +1998,12 @@ impl State {
     }
 
     /// Fold or unfold. `shift` widens it to the whole file.
+    ///
+    /// **`editing()`, not `text_target()`** — deliberately not offered in the
+    /// Scratchpad. Folding is only legible because the gutter draws a chevron
+    /// saying where a block is and whether it's closed, and the scratchpad has no
+    /// gutter. A fold there would be text that silently vanished with nothing on
+    /// screen to say why, or that it could be brought back.
     fn fold_command(&mut self, unfold: bool, all: bool) {
         if !self.editing() {
             return;
@@ -1365,14 +2031,17 @@ impl State {
         }
     }
 
-    /// Indent or outdent the selected lines in the editor.
+    /// Indent or outdent the selected lines.
+    ///
+    /// Works in the Scratchpad too — indentation is as useful in a list of notes
+    /// as it is in code, and unlike folding it leaves nothing hidden.
     fn reindent(&mut self, deeper: bool) {
-        if !self.editing() {
+        let Some(target) = self.text_target() else {
             return;
-        }
+        };
         let (tw, tabs) = (self.config.tab_width.max(1), self.config.indent_with_tabs);
         let rows = self.editor_rows;
-        if let Ok(mut b) = self.buf().lock() {
+        if let Ok(mut b) = target.lock() {
             if deeper {
                 b.indent_selection(tw, tabs);
             } else {
@@ -1404,11 +2073,14 @@ impl State {
     /// doesn't recognise has none — that's reported rather than silently doing
     /// nothing, since an unresponsive key reads as broken.
     fn toggle_comment(&mut self) {
-        if !self.editing() {
+        let Some(target) = self.text_target() else {
             return;
-        }
+        };
         let rows = self.editor_rows;
-        let Ok(mut b) = self.buf().lock() else { return };
+        let Ok(mut b) = target.lock() else { return };
+        // The Scratchpad reaches this and lands here, which is the right answer:
+        // it's plain text with no syntax, so there is no marker to insert, and the
+        // message says so rather than the key doing nothing.
         let Some(syntax) = b.syntax_name().map(str::to_string) else {
             drop(b);
             self.alert("No syntax for this file — nothing to comment with.");
@@ -1520,7 +2192,13 @@ impl State {
     }
 
     /// Save the session and go.
+    ///
+    /// The scratchpad goes out here too. It is never in the quit *prompt* — that
+    /// asks about files the user opened and might not want written, which this
+    /// isn't — so this is the last chance to keep whatever was typed since the
+    /// last section or focus change.
     fn quit_now(&mut self) -> Task<Message> {
+        self.save_scratchpad();
         self.save_session();
         iced::exit()
     }
@@ -1606,6 +2284,13 @@ impl State {
         let Some(pid) = shell.pid else {
             return;
         };
+        // A run's tab is named for its ticket, not its directory, so there is
+        // nothing here to update. Nothing else is lost by returning early: this
+        // function only maintains the label, and the session reads a shell's
+        // directory from its process at write time.
+        if shell.label_override.is_some() {
+            return;
+        }
         let mut moved = false;
         if let Some(cwd) = sacrament_core::proc::cwd_of(pid) {
             let label = sacrament_core::proc::dir_label(&cwd);
@@ -1623,6 +2308,16 @@ impl State {
     }
 
     fn spawn_shell(&mut self, id: PaneId) {
+        // Home, not the process cwd — see `Shell::new`.
+        self.spawn_shell_in(id, sacrament_core::paths::home_dir());
+    }
+
+    /// Spawn a shell tab in a particular directory, and return its key.
+    ///
+    /// The key is what a ticket run needs back: it has to reach into the shell it
+    /// just created to set the command and the label, and later to recognise
+    /// whose exit it is looking at.
+    fn spawn_shell_in(&mut self, id: PaneId, cwd: Option<std::path::PathBuf>) -> ShellKey {
         let key = ShellKey {
             pane: id,
             serial: self.next_shell_serial,
@@ -1630,10 +2325,11 @@ impl State {
         self.next_shell_serial += 1;
         let pane = self.pane_mut(id);
         let size = pane.size;
-        pane.shells.push(Shell::new(key, size));
+        pane.shells.push(Shell::in_dir(key, cwd, size));
         pane.active = pane.shells.len() - 1;
         self.focus = Focus::Shell(id);
         self.persist();
+        key
     }
 
     /// Close a shell tab. Dropping it removes its key from the subscription list,
@@ -1643,6 +2339,15 @@ impl State {
         if index >= pane.shells.len() {
             return;
         }
+        // Closing a run's tab *is* how you stop a run, so end the run here rather
+        // than letting the resulting `Exited` do it. Dropping the tab kills the
+        // child, which fires `Exited` exactly as a natural end does — and the app
+        // would then report on a run the user deliberately abandoned, verifying a
+        // half-finished repository and opening a transcript nobody asked for.
+        // `take_run` still saves the transcript.
+        let key = pane.shells[index].key;
+        self.take_run(key);
+        let pane = self.pane_mut(id);
         pane.shells.remove(index);
         pane.active = pane.active.min(pane.shells.len().saturating_sub(1));
         self.persist();
@@ -1731,7 +2436,17 @@ impl State {
     /// assignment instead of returning a `Task`, and it's also the only point that
     /// can guarantee a queued message is shown exactly once.
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Where the keyboard was before this message, so leaving the Scratchpad by
+        // *any* route saves it. `set_section` covers switching section, but focus
+        // can also move out to a shell without the section changing at all —
+        // clicking into a pane, `Ctrl+2`, spawning a run — and there is no single
+        // setter for focus to hang this off. One comparison here catches every
+        // route, including ones added later.
+        let was_scratching = self.focus == Focus::Editor && self.section == Section::Scratchpad;
         let task = self.handle(message);
+        if was_scratching && self.focus != Focus::Editor {
+            self.save_scratchpad();
+        }
         if self.alerts.is_empty() {
             return task;
         }
@@ -1764,11 +2479,6 @@ impl State {
 
         match message {
             Message::Pty(key, pty::Event::Attached(handle)) => {
-                let bottom_first = key
-                    == ShellKey {
-                        pane: PaneId::Bottom,
-                        serial: 0,
-                    };
                 // Only push a size the grid actually measured. Sending the
                 // terminal's placeholder here would let the PTY spawn its shell at
                 // 24x80, and the real size arriving later would trigger the
@@ -1785,12 +2495,15 @@ impl State {
                 if let Some((rows, cols)) = measured {
                     handle.resize(rows as u16, cols as u16);
                 }
-                // SACRAMENT_SPIKE_CMD runs a command on attach so throughput can
-                // be measured without typing. Only the bottom pane, or it would
-                // run twice.
-                if bottom_first
-                    && let Ok(cmd) = std::env::var("SACRAMENT_SPIKE_CMD")
-                {
+                // A shell that was created to run something types it now, after the
+                // size has been pushed — the shell is spawned only once a size is
+                // known, so anything written before this would be echoed at the
+                // placeholder width and re-wrapped underneath itself.
+                //
+                // `take`, so it can't run twice: `Attached` fires once per PTY, but
+                // a leftover value here would be a command replayed on a shell the
+                // user has since made their own.
+                if let Some(cmd) = shell.on_attach.take() {
                     handle.write(format!("{cmd}\n").into_bytes());
                 }
                 shell.handle = Some(handle);
@@ -1823,12 +2536,19 @@ impl State {
                 }
             }
             Message::Pty(key, pty::Event::Exited) => {
+                // A ticket run's shell ends with `exit`, so this is also how a run
+                // reports itself finished. Done before the tab is removed — the
+                // transcript lives in the grid that is about to be dropped.
+                let finished = self.run_finished(key);
                 // The shell's process ended (`exit`, or it was killed). Remove the
                 // tab, matching v1: a dead shell isn't something to look at.
                 let pane = self.pane_mut(key.pane);
                 if let Some(i) = pane.shells.iter().position(|s| s.key == key) {
                     pane.shells.remove(i);
                     pane.active = pane.active.min(pane.shells.len().saturating_sub(1));
+                }
+                if let Some(task) = finished {
+                    return task;
                 }
             }
             Message::Pty(_, pty::Event::Failed(e)) => {
@@ -1868,11 +2588,23 @@ impl State {
                 // `word_wrap = false` becomes width 0, which `text::wrap_line`
                 // treats as "one segment" — no second code path.
                 let width = if self.config.word_wrap { cols.max(1) } else { 0 };
-                if let Ok(mut b) = self.buf().lock()
-                    && b.wrap_width != width
-                {
-                    b.wrap_width = width;
-                    b.ensure_cursor_visible(self.editor_rows);
+                // Applied to **every** surface the pane can show, not just the one
+                // reporting — the same rule `GridResized` follows for a shell
+                // pane's tabs, and for the same reason. `GridView` publishes a size
+                // only when it *changes*, and the editor and scratchpad grids sit at
+                // the same position in the widget tree, so iced hands the second one
+                // the first one's state: switching sections at an unchanged size
+                // produces no `EditorResized` at all. Whichever buffer had been left
+                // out would then wrap to a stale width.
+                let rows = self.editor_rows;
+                let surfaces = [self.buf().clone(), self.scratchpad.clone()];
+                for surface in surfaces {
+                    if let Ok(mut b) = surface.lock()
+                        && b.wrap_width != width
+                    {
+                        b.wrap_width = width;
+                        b.ensure_cursor_visible(rows);
+                    }
                 }
             }
             Message::FocusPane(focus) => self.focus = focus,
@@ -1881,15 +2613,18 @@ impl State {
             Message::Pasted(text) => {
                 if let Some(text) = text {
                     match self.focus {
-                        // `editing()` and `reading()` are both required, and a
-                        // paste is exactly where that gets forgotten: it arrives
-                        // as its own message rather than through `keymap`, so
-                        // neither the section arm nor the read-mode arm in the key
-                        // dispatch covers it. v1 has this hole — pasting into read
-                        // mode edits the source behind the rendering.
-                        Focus::Editor if !self.editing() || self.reading() => {}
+                        // A paste is exactly where the section and read-mode gates
+                        // get forgotten: it arrives as its own message rather than
+                        // through `keymap`, so neither arm in the key dispatch
+                        // covers it. v1 has this hole — pasting into read mode
+                        // edits the source behind the rendering. `text_target`
+                        // answers the section half; `reading()` still has to be
+                        // asked separately.
+                        Focus::Editor if self.reading() => {}
                         Focus::Editor => {
-                            if let Ok(mut b) = self.buf().lock() {
+                            if let Some(target) = self.text_target()
+                                && let Ok(mut b) = target.lock()
+                            {
                                 b.insert_str(&text);
                                 b.ensure_cursor_visible(self.editor_rows);
                             }
@@ -2046,7 +2781,47 @@ impl State {
                 }
             }
             Message::JiraRefresh => return self.jira_refresh(),
-            Message::JiraRefreshHovered(over) => self.jira.hovered = over,
+            Message::JiraHovered(what) => self.jira.hovered = Some(what),
+            // Only clear the hover this message owns — see `JiraUnhovered`.
+            Message::JiraUnhovered(what) => {
+                if self.jira.is_hovered(&what) {
+                    self.jira.hovered = None;
+                }
+            }
+            // The scheme can't be anything but `https`: `base_url` strips whatever
+            // form the site was pasted in and re-prefixes it, and the key only ever
+            // reaches the path. That matters because `open` launches a registered
+            // handler for *any* scheme — the same reason `Terminal::url_at`
+            // allowlists http/https before a shell click gets here.
+            Message::JiraOpenIssue(key) => {
+                let url =
+                    sacrament_core::jira::issue_url(&self.config.jira.base_url(), &key);
+                open_url(&url);
+            }
+            Message::JiraStartRun(key) => return self.start_run(key),
+            // `preparing` deliberately stays set across the dialog — it's cleared
+            // when the dialog is answered, not when it opens.
+            Message::JiraRunPrepared(Ok(plan)) => return confirm_run(plan),
+            Message::JiraRunPrepared(Err(e)) => {
+                self.jira.preparing = None;
+                self.alert(e);
+            }
+            Message::JiraRunConfirmed(plan, answer) => {
+                self.jira.preparing = None;
+                match answer {
+                    RunAnswer::Start => self.begin_run(*plan),
+                    RunAnswer::ShowPrompt => {
+                        // Reading the prompt starts nothing — see
+                        // `RunAnswer::ShowPrompt`.
+                        self.show_editor();
+                        if let Err(e) = self.open_path(&plan.prompt_path, None, None, false) {
+                            self.alert(e);
+                        }
+                    }
+                    RunAnswer::Cancel => {}
+                }
+            }
+            Message::JiraRunFinished(key, outcome) => self.report_run(&key, &outcome),
             Message::JiraLoaded(result) => {
                 self.jira.loading = false;
                 match result {
@@ -2218,13 +2993,15 @@ impl State {
                             }
                         }
                     }
-                    // Another section has no caret and nothing to type into, but
-                    // it does have a scrollable surface — so navigation keys go
-                    // through `read_key`, which claims only those and drops the
-                    // rest. Same funnel read mode uses, one level up.
-                    Focus::Editor if self.section != Section::Editor => {
-                        self.read_key(&key)
-                    }
+                    // A section with no text surface has no caret and nothing to
+                    // type into, but it does have something scrollable — so
+                    // navigation keys go through `read_key`, which claims only
+                    // those and drops the rest. Same funnel read mode uses, one
+                    // level up.
+                    //
+                    // `has_text`, not `== Editor`: the Scratchpad is a text
+                    // surface too, and must fall through to `edit_key`.
+                    Focus::Editor if !self.section.has_text() => self.read_key(&key),
                     // Read mode takes navigation only. Gating here rather than
                     // inside `edit_key` covers every editing path at once —
                     // v1 gated its key handler and left `Event::Paste` free to
@@ -2287,9 +3064,9 @@ impl State {
                 Named::ArrowLeft | Named::ArrowRight | Named::ArrowUp | Named::ArrowDown
             )
         {
-            if self.editing() {
+            if let Some(target) = self.text_target() {
                 let rows = self.editor_rows;
-                if let Ok(mut b) = self.buf().lock() {
+                if let Ok(mut b) = target.lock() {
                     match named {
                         Named::ArrowLeft => b.move_home(shift),
                         Named::ArrowRight => b.move_end(shift),
@@ -2323,22 +3100,32 @@ impl State {
             "/" => self.toggle_comment(),
             // `Cmd+Shift+M`, because plain `Cmd+M` is Minimize on macOS.
             "m" | "M" if shift => self.toggle_read_mode(),
-            // Save and save-as act on what's on screen, so they're inert while
-            // another section shows — the buffer stays dirty and saveable, and the
-            // quit prompt still catches it. `Cmd+O` is the opposite case: its
-            // whole purpose is to put a file in front of you, so it switches back
-            // (in `open_path`).
+            // Save-as is a **file tab** command, not a text one, so it asks
+            // `editing()`. Offering it for the scratchpad would repoint that
+            // buffer's path at whatever was picked — the section would go on
+            // editing the chosen file and the config copy would quietly stop being
+            // written, which is a way to lose a permanent document rather than a
+            // way to export it.
             "s" | "S" if shift => {
                 if self.editing() {
                     return Some(self.save_as_dialog());
                 }
             }
+            // `Cmd+O`'s whole purpose is to put a file in front of you, so it
+            // switches back to the editor section (in `open_path`).
             "o" | "O" => return Some(open_dialog()),
-            "s" | "S" => {
-                if self.editing() {
-                    return Some(self.save());
-                }
-            }
+            // Save works on either surface, but they are different operations and
+            // deliberately don't share a path. The scratchpad takes the simple one:
+            // it always has a path, so there's no save panel, and a disk conflict
+            // resolves by overwriting rather than raising a dialog about a file the
+            // user never chose. `save()` keeps its `ConflictAnswer` machinery for
+            // real files. Inert while a section with no text shows — the buffer
+            // stays dirty and saveable, and the quit prompt still catches it.
+            "s" | "S" => match self.section {
+                Section::Scratchpad if self.focus == Focus::Editor => self.save_scratchpad(),
+                _ if self.editing() => return Some(self.save()),
+                _ => {}
+            },
             "f" | "F" => return Some(self.open_prompt(PromptKind::Find)),
             // macOS find-next. Repeats the last query with no prompt in the way.
             "g" | "G" => return Some(self.find_next(shift)),
@@ -2350,26 +3137,26 @@ impl State {
             "w" | "W" => return Some(self.close_focused_tab()),
             "q" | "Q" => return Some(self.request_quit()),
             "z" | "Z" => {
-                if self.editing() {
+                if self.text_target().is_some() {
                     self.history(shift);
                 }
             }
             "c" | "C" => {
                 return Some(match self.focus {
-                    Focus::Editor if !self.editing() => Task::none(),
+                    Focus::Editor if self.text_target().is_none() => Task::none(),
                     Focus::Editor => self.copy(false),
                     Focus::Shell(_) => self.copy_shell(),
                 });
             }
             "x" | "X" => {
-                if self.editing() {
+                if self.text_target().is_some() {
                     return Some(self.copy(true));
                 }
             }
             "v" | "V" => return Some(iced::clipboard::read().map(Message::Pasted)),
             "a" | "A" => {
-                if self.editing()
-                    && let Ok(mut b) = self.buf().lock()
+                if let Some(target) = self.text_target()
+                    && let Ok(mut b) = target.lock()
                 {
                     b.select_all();
                 }
@@ -2673,15 +3460,23 @@ impl State {
 
     /// Open the bottom prompt.
     ///
-    /// The editor is shown first: both prompts act on the buffer, so running one
-    /// while a shell has focus — or while another section is up — would otherwise
-    /// leave the result invisible.
+    /// Both prompts act on a text surface, so one has to be showing — otherwise
+    /// the result is invisible. But only *switch* when there isn't one already:
+    /// searching from the Scratchpad should search the scratchpad, not throw you
+    /// into the editor section first. `text_target` is the same question the
+    /// search itself then asks, so the two cannot disagree about what was searched.
     fn open_prompt(&mut self, kind: PromptKind) -> Task<Message> {
-        self.show_editor();
-        let (origin, selection) = match self.buf().lock() {
-            Ok(b) => ((b.cursor_row, b.cursor_col), b.selected_text()),
-            Err(_) => ((0, 0), None),
-        };
+        if self.text_target().is_none() {
+            self.show_editor();
+        }
+        let (origin, selection) = self
+            .text_target()
+            .and_then(|t| {
+                t.lock()
+                    .ok()
+                    .map(|b| ((b.cursor_row, b.cursor_col), b.selected_text()))
+            })
+            .unwrap_or_default();
         let input = match kind {
             // Prefill from the selection, the way every find bar does. Multi-line
             // selections are skipped since `find` only matches within a line.
@@ -2744,21 +3539,26 @@ impl State {
                 // Search on from the current match rather than the origin, or
                 // Enter would return the same hit forever. Forward continues from
                 // the match's end, backward from its start.
-                let from = match self.buf().lock() {
-                    Ok(b) => {
-                        let (start, end) = b
-                            .selection_range()
-                            .unwrap_or(((b.cursor_row, b.cursor_col), (b.cursor_row, b.cursor_col)));
+                let from = match self.text_target().and_then(|t| {
+                    t.lock().ok().map(|b| {
+                        let (start, end) = b.selection_range().unwrap_or((
+                            (b.cursor_row, b.cursor_col),
+                            (b.cursor_row, b.cursor_col),
+                        ));
                         if reverse { start } else { end }
-                    }
-                    Err(_) => prompt.origin,
+                    })
+                }) {
+                    Some(from) => from,
+                    None => prompt.origin,
                 };
                 self.search(&prompt.input, from, !reverse);
             }
             PromptKind::GotoLine => match prompt.input.trim().parse::<usize>() {
                 Ok(line) => {
                     let rows = self.editor_rows;
-                    if let Ok(mut b) = self.buf().lock() {
+                    if let Some(target) = self.text_target()
+                        && let Ok(mut b) = target.lock()
+                    {
                         b.goto_line(line);
                         b.ensure_cursor_visible(rows);
                     }
@@ -2782,19 +3582,25 @@ impl State {
         let Some(query) = self.last_query.clone() else {
             return self.open_prompt(PromptKind::Find);
         };
-        // A match is shown by selecting it, so the editor has to be the thing on
-        // screen — otherwise `Cmd+G` silently moves a caret nobody can see.
-        self.show_editor();
+        // A match is shown by selecting it, so *a* text surface has to be on
+        // screen — otherwise `Cmd+G` silently moves a caret nobody can see. Only
+        // switch when there isn't one, so repeating a search in the Scratchpad
+        // stays in the scratchpad.
+        if self.text_target().is_none() {
+            self.show_editor();
+        }
         // Continue from the current match, not the caret: forward from its end,
         // backward from its start, or the same hit comes back every time.
-        let from = match self.buf().lock() {
-            Ok(b) => {
-                let here = (b.cursor_row, b.cursor_col);
-                let (start, end) = b.selection_range().unwrap_or((here, here));
-                if reverse { start } else { end }
-            }
-            Err(_) => (0, 0),
-        };
+        let from = self
+            .text_target()
+            .and_then(|t| {
+                t.lock().ok().map(|b| {
+                    let here = (b.cursor_row, b.cursor_col);
+                    let (start, end) = b.selection_range().unwrap_or((here, here));
+                    if reverse { start } else { end }
+                })
+            })
+            .unwrap_or((0, 0));
         self.search(&query, from, !reverse);
         Task::none()
     }
@@ -2811,17 +3617,19 @@ impl State {
         // search — typing, Enter, Cmd+G — keeps `Cmd+G` working afterwards.
         self.last_query = Some(query.to_string());
         let rows = self.editor_rows;
-        let found = match self.buf().lock() {
-            Ok(mut b) => match b.find(query, from, forward) {
-                Some((start, end)) => {
-                    b.select_range(start, end);
-                    b.ensure_cursor_visible(rows);
-                    true
-                }
-                None => false,
-            },
-            Err(_) => false,
-        };
+        let found = self
+            .text_target()
+            .and_then(|t| {
+                t.lock().ok().map(|mut b| match b.find(query, from, forward) {
+                    Some((start, end)) => {
+                        b.select_range(start, end);
+                        b.ensure_cursor_visible(rows);
+                        true
+                    }
+                    None => false,
+                })
+            })
+            .unwrap_or(false);
         match &mut self.prompt {
             // With the prompt open the note belongs next to the query: it's the
             // one message that arrives *while typing*, so it can't be a dialog —
@@ -2839,7 +3647,10 @@ impl State {
     /// since an undo can land far from where you're looking.
     fn history(&mut self, forward: bool) {
         let rows = self.editor_rows;
-        if let Ok(mut b) = self.buf().lock() {
+        let Some(target) = self.text_target() else {
+            return;
+        };
+        if let Ok(mut b) = target.lock() {
             if forward { b.redo() } else { b.undo() };
             b.ensure_cursor_visible(rows);
         }
@@ -2859,13 +3670,15 @@ impl State {
             // Read mode has nothing to select or put a caret in — but it does
             // scroll, so this must not swallow the wheel.
             //
-            // `!self.editing()` covers the Jira section, whose grid is a read-mode
-            // surface too: without it a click there would fall through and move the
-            // caret in a file that isn't on screen.
+            // `text_target().is_none()` covers the Jira section, whose grid is a
+            // read-mode surface too: without it a click there would fall through
+            // and move the caret in a file that isn't on screen. The Scratchpad
+            // *is* a text surface, so it deliberately falls through to the arms
+            // below and gets a caret and selection like any other.
             (
                 Focus::Editor,
                 GridMouse::Press { .. } | GridMouse::Drag { .. } | GridMouse::Release,
-            ) if !self.editing() || self.reading() => {}
+            ) if self.text_target().is_none() || self.reading() => {}
             // `shift` is unread here: the editor has no link handling yet, and
             // shift-extending a selection isn't implemented either.
             (Focus::Editor, GridMouse::Press {
@@ -2875,7 +3688,9 @@ impl State {
                 shift: _,
             }) => {
                 let rows = self.editor_rows;
-                if let Ok(mut b) = self.buf().lock() {
+                if let Some(target) = self.text_target()
+                    && let Ok(mut b) = target.lock()
+                {
                     let pos = b.screen_to_doc(row, col, rows);
                     if count >= 2 {
                         // Double click selects a word; falling back to a plain
@@ -2898,7 +3713,9 @@ impl State {
             }
             (Focus::Editor, GridMouse::Drag { row, col }) => {
                 let rows = self.editor_rows;
-                if let Ok(mut b) = self.buf().lock() {
+                if let Some(target) = self.text_target()
+                    && let Ok(mut b) = target.lock()
+                {
                     let (r, c) = b.screen_to_doc(row, col, rows);
                     b.cursor_row = r;
                     b.cursor_col = c;
@@ -2908,7 +3725,8 @@ impl State {
             (Focus::Editor, GridMouse::Release) => {
                 // A click with no movement leaves a collapsed selection; drop the
                 // anchor so it isn't reported as a selection.
-                if let Ok(mut b) = self.buf().lock()
+                if let Some(target) = self.text_target()
+                    && let Ok(mut b) = target.lock()
                     && !b.has_selection()
                 {
                     b.clear_selection();
@@ -3033,10 +3851,15 @@ impl State {
     /// background tab would reappear the moment you switched to it, which is the
     /// same surprise arriving later.
     fn clear_selections_except(&mut self, keep: Focus) {
-        if keep != Focus::Editor
-            && let Ok(mut b) = self.buf().lock()
-        {
-            b.clear_selection();
+        // Both editable surfaces, not just the active file: a selection left in
+        // the Scratchpad would reappear on switching back to it, which is the same
+        // surprise arriving later.
+        if keep != Focus::Editor {
+            for surface in [self.buf().clone(), self.scratchpad.clone()] {
+                if let Ok(mut b) = surface.lock() {
+                    b.clear_selection();
+                }
+            }
         }
         for id in PaneId::ALL {
             let active = self.pane(id).active;
@@ -3068,7 +3891,10 @@ impl State {
 
     fn copy(&mut self, cut: bool) -> Task<Message> {
         let text = {
-            let Ok(mut b) = self.buf().lock() else {
+            let Some(target) = self.text_target() else {
+                return Task::none();
+            };
+            let Ok(mut b) = target.lock() else {
                 return Task::none();
             };
             let text = b.selected_text();
@@ -3225,22 +4051,36 @@ impl State {
         Task::none()
     }
 
-    /// Is the active buffer showing rendered markdown?
+    /// Is the surface that would be typed into showing rendered markdown?
+    ///
+    /// Asks `text_target`, not `buf()`, and the difference is load-bearing since
+    /// the Scratchpad arrived. Reading the *file* buffer here meant that with a
+    /// markdown tab left in read mode, the key dispatch's `reading()` arm claimed
+    /// the keystroke while the Scratchpad was on screen — so typing into the
+    /// scratchpad silently scrolled a rendered document nobody could see.
+    ///
+    /// The scratchpad itself is always `false`: it's `.txt`, and read mode gates on
+    /// the extension.
     fn reading(&self) -> bool {
-        self.buf()
-            .lock()
-            .map(|b| b.view_mode() == buffer::ViewMode::Read)
+        self.text_target()
+            .and_then(|b| b.lock().ok().map(|b| b.view_mode() == buffer::ViewMode::Read))
             .unwrap_or(false)
     }
 
-    /// Which buffer read-mode navigation and scrolling act on.
+    /// Which buffer navigation and the scroll wheel act on.
     ///
-    /// The editor pane hosts more than one read-mode surface now — a markdown
-    /// file and the Jira dashboard — and they scroll independently. Deciding it
-    /// here means the key handler and the wheel handler cannot disagree about
-    /// which one moved, which is the bug they would otherwise take turns having.
+    /// The editor pane hosts several surfaces now, and they scroll independently.
+    /// Deciding it here means the key handler and the wheel handler cannot
+    /// disagree about which one moved, which is the bug they would otherwise take
+    /// turns having.
+    ///
+    /// Built on `text_target` so the Scratchpad is included: without that, turning
+    /// the wheel over the scratchpad scrolled the active *file* instead — nothing
+    /// visible moved, and the file you couldn't see quietly changed position.
+    /// Falling back to the active file covers the sections with no text surface at
+    /// all, where nothing on screen scrolls either way.
     fn read_target(&self) -> Arc<Mutex<Buffer>> {
-        self.buf().clone()
+        self.text_target().unwrap_or_else(|| self.buf().clone())
     }
 
     /// Navigation only — read mode has nothing to type into.
@@ -3276,7 +4116,12 @@ impl State {
         use iced::keyboard::key::Named;
 
         let extend = mods.shift();
-        let Ok(mut b) = self.buf().lock() else {
+        // `text_target`, not `buf()` — the pane has two editable surfaces and this
+        // is the one on screen. See `State::text_target`.
+        let Some(target) = self.text_target() else {
+            return;
+        };
+        let Ok(mut b) = target.lock() else {
             return;
         };
         match key {
@@ -3707,6 +4552,40 @@ impl State {
         column![self.tab_bar(), pad_content(body)].into()
     }
 
+    /// The Scratchpad: one permanent plain-text document.
+    ///
+    /// **The same `GridView` and the same `BufferSource` the editor uses.** That is
+    /// the whole design — it is the editor, pointed at a different buffer, so
+    /// selection, undo, wrapping, the caret and mouse handling all come for free
+    /// and cannot drift from how they behave on a file.
+    ///
+    /// Three things it deliberately doesn't have:
+    ///
+    /// - **No gutter.** There are no line numbers worth showing in a notes file,
+    ///   and nothing to fold. `fold_command` refuses here for the same reason —
+    ///   a fold with no chevron is text that vanished with nothing to say why.
+    /// - **No tab strip.** One document, always this one. The `+` on the editor's
+    ///   strip means "one more of these", and there is no more of this.
+    /// - **No highlighter** (`None`, not `self.highlighter`). Plain text was the
+    ///   requirement, and passing `None` means the work isn't merely discarded —
+    ///   it's never done. `load_scratchpad` seeds no syntax for the same reason.
+    fn scratchpad_section(&self) -> Element<'_, Message> {
+        let grid = GridView::new(
+            BufferSource {
+                buffer: self.scratchpad.clone(),
+                rows: self.editor_rows,
+                highlighter: None,
+                focused: self.focus == Focus::Editor,
+            },
+            &self.palette,
+            self.font,
+            Message::EditorResized,
+        )
+        .offset(self.editor_scroll_px)
+        .on_mouse(|g| Message::Mouse(Focus::Editor, g));
+        pad_content(grid)
+    }
+
     /// The Jira dashboard: generated markdown through the read-mode renderer,
     /// under a title and a clickable refresh control.
     ///
@@ -3735,15 +4614,15 @@ impl State {
         // Brightening on hover *is* the affordance, and the cursor stays an arrow —
         // the same choice the tab strips make. A hand cursor would claim this
         // navigates somewhere, and no other control in the app shows one.
-        let slot = if self.jira.hovered {
-            REFRESH_HOVER_SLOT
+        let slot = if self.jira.is_hovered(&JiraHover::Refresh) {
+            LINK_HOVER_SLOT
         } else {
-            REFRESH_SLOT
+            LINK_SLOT
         };
         let refresh = mouse_area(heading("Refresh", slot))
             .on_press(Message::JiraRefresh)
-            .on_enter(Message::JiraRefreshHovered(true))
-            .on_exit(Message::JiraRefreshHovered(false));
+            .on_enter(Message::JiraHovered(JiraHover::Refresh))
+            .on_exit(Message::JiraUnhovered(JiraHover::Refresh));
         // Hidden while a fetch is in flight: it can't do anything then (a second
         // press is refused by the `loading` guard), and a control that responds to
         // nothing is worse than no control. Its absence is also a second, quieter
@@ -3853,6 +4732,9 @@ impl State {
     /// Summary takes the lion's share and wraps rather than truncating — the
     /// character budget the text version needed is gone, along with the truncation
     /// it forced.
+    ///
+    /// **The key opens the ticket in the browser.** See [`State::issue_key_cell`]
+    /// for why it's the only cell that isn't plain text.
     fn issue_table(&self, issues: &[&sacrament_core::jira::Issue]) -> Element<'_, Message> {
         let dim = self.palette.dim();
         let fg = self.palette.foreground;
@@ -3887,7 +4769,7 @@ impl State {
                     // Top, so a wrapped summary doesn't drag its row's other cells
                     // down to the middle of it.
                     .align_y(iced::Alignment::Start)
-                    .push(cell(issue.key.clone(), p(0), fg))
+                    .push(self.issue_key_cell(&issue.key, p(0)))
                     .push(cell(
                         issue.priority.clone().unwrap_or_else(|| "-".into()),
                         p(1),
@@ -3899,10 +4781,120 @@ impl State {
                         p(3),
                         dim,
                     ))
-                    .push(cell(issue.summary.clone(), p(4), fg)),
+                    .push(cell(issue.summary.clone(), p(4), fg))
+                    .push(self.issue_run_cell(issue, p(5))),
             );
         }
         table.into()
+    }
+
+    /// The `Run` control: start an unattended agent on this ticket.
+    ///
+    /// Five states, and which one a row gets is the guard rail:
+    ///
+    /// - **A live run** shows `Running` in `dim` and goes to its tab. It isn't a
+    ///   second start, and it isn't nothing either — the tab it names may be behind
+    ///   several others.
+    /// - **A start under way** shows `Starting...`, dead to clicks. Pre-flight and
+    ///   the ticket fetch take a visible moment, and a control that looks
+    ///   untouched for a second is one people press twice.
+    /// - **A status that isn't ready to build** draws an empty cell. An unattended
+    ///   run needs a description good enough to work from, which is what the
+    ///   workflow's own status says — see `JiraConfig::run_statuses`.
+    /// - **No repository configured** for the project draws an empty cell too. A
+    ///   project this app was never told about has no run to offer.
+    /// - **Otherwise** it's a link, same idiom as the issue key.
+    ///
+    /// The two empty cases are deliberately silent rather than disabled controls:
+    /// a greyed-out button invites clicking to find out why. Status needs no
+    /// explaining anyway, because the dashboard is *grouped* by status — the whole
+    /// `Specified` table carries the control and the whole `In Progress` one
+    /// doesn't, which reads as a rule rather than as rows behaving differently.
+    fn issue_run_cell(
+        &self,
+        issue: &sacrament_core::jira::Issue,
+        portion: u16,
+    ) -> Element<'_, Message> {
+        let key = issue.key.as_str();
+        let width = Length::FillPortion(portion);
+        let muted = |label: &'static str| {
+            text(label)
+                .size(self.font.size)
+                .font(self.font.font)
+                .color(self.palette.dim())
+        };
+        if self.runs.iter().any(|r| r.key == key) {
+            return container(
+                mouse_area(muted("Running")).on_press(Message::JiraStartRun(key.to_string())),
+            )
+            .width(width)
+            .into();
+        }
+        if self.jira.preparing.as_deref() == Some(key) {
+            return container(muted("Starting...")).width(width).into();
+        }
+        if !self.config.jira.runnable(&issue.status)
+            || self.config.jira.repo_for(key).is_none()
+        {
+            return container(text("")).width(width).into();
+        }
+        let hover = JiraHover::Run(key.to_string());
+        let slot = if self.jira.is_hovered(&hover) {
+            LINK_HOVER_SLOT
+        } else {
+            LINK_SLOT
+        };
+        container(
+            mouse_area(
+                text("Run")
+                    .size(self.font.size)
+                    .font(self.font.font)
+                    .color(self.palette.ansi_slot(slot)),
+            )
+            .on_press(Message::JiraStartRun(key.to_string()))
+            .on_enter(Message::JiraHovered(hover.clone()))
+            .on_exit(Message::JiraUnhovered(hover)),
+        )
+        .width(width)
+        .into()
+    }
+
+    /// One issue key, as a link that opens the ticket in the default browser.
+    ///
+    /// Three things here are deliberate:
+    ///
+    /// **The hot area is the text, not the column.** Every other cell is a `text`
+    /// widget filling its portion of the row, and doing that here would make the
+    /// whole blank remainder of the Key column open a browser — a wide margin of
+    /// screen that launches an app when clicked. So the `mouse_area` wraps a
+    /// `Shrink` text and a `container` carries the column's width instead.
+    ///
+    /// **The cursor stays an arrow.** Colour is the affordance, exactly as it is
+    /// for "Refresh" and for a shift-click on a URL in a shell. Nothing in this
+    /// app shows a hand cursor, and one control that did would read as belonging
+    /// to a web page rather than to the editor.
+    ///
+    /// **It presses, rather than releasing.** Same as the refresh control; there
+    /// is no drag gesture here for a press to be the start of.
+    fn issue_key_cell(&self, key: &str, portion: u16) -> Element<'_, Message> {
+        let hover = JiraHover::Key(key.to_string());
+        let slot = if self.jira.is_hovered(&hover) {
+            LINK_HOVER_SLOT
+        } else {
+            LINK_SLOT
+        };
+        let label = text(key.to_string())
+            .size(self.font.size)
+            .font(self.font.font)
+            .color(self.palette.ansi_slot(slot));
+        container(
+            mouse_area(label)
+                .on_press(Message::JiraOpenIssue(key.to_string()))
+                .on_enter(Message::JiraHovered(hover.clone()))
+                .on_exit(Message::JiraUnhovered(hover)),
+        )
+        .width(Length::FillPortion(portion))
+        .into()
     }
 
     /// Shell tabs for one pane, labelled by each shell's cwd basename.
@@ -3912,7 +4904,7 @@ impl State {
             .shells
             .iter()
             .map(|s| TabLabel {
-                name: s.label.clone(),
+                name: s.tab_label().to_string(),
                 dirty: false,
                 unreviewed: false,
             })
@@ -3971,6 +4963,7 @@ impl State {
                     let body = match self.section {
                         Section::Editor => self.editor_section(),
                         Section::Jira => self.jira_section(),
+                        Section::Scratchpad => self.scratchpad_section(),
                     };
                     column![self.section_bar(), body].into()
                 }
@@ -4264,6 +5257,137 @@ mod shell_tests {
         );
         let mut term = shell.terminal.lock().unwrap();
         assert!(!term.resize(24, 80));
+    }
+
+    #[test]
+    fn a_run_tab_is_named_for_its_ticket() {
+        // Two runs in the same repository would otherwise share a tab label — the
+        // directory basename — which is the one thing a tab strip has to tell apart.
+        let mut shell = Shell::new(
+            ShellKey {
+                pane: PaneId::Bottom,
+                serial: 1,
+            },
+            None,
+        );
+        let cwd_label = shell.tab_label().to_string();
+        shell.label_override = Some("TFE-954".to_string());
+        assert_eq!(shell.tab_label(), "TFE-954");
+        assert_ne!(shell.tab_label(), cwd_label);
+    }
+}
+
+#[cfg(test)]
+mod scratchpad_tests {
+    use super::*;
+
+    #[test]
+    fn every_section_is_listed_once_and_only_two_hold_text() {
+        // `section_bar` finds the active tab with `position`, which returns the
+        // *first* match — a duplicate would leave one tab permanently unselectable.
+        for section in Section::ALL {
+            assert_eq!(
+                Section::ALL.iter().filter(|s| **s == section).count(),
+                1,
+                "{:?} appears more than once in ALL",
+                section
+            );
+        }
+        assert_eq!(Section::ALL.len(), 3);
+        // The Scratchpad after the Editor and Jira, as asked for.
+        assert_eq!(Section::ALL[2], Section::Scratchpad);
+        assert!(Section::Editor.has_text());
+        assert!(Section::Scratchpad.has_text());
+        // Jira must not: `has_text` is what routes a keystroke to `edit_key`
+        // rather than to the read-only navigation funnel.
+        assert!(!Section::Jira.has_text());
+    }
+
+    #[test]
+    fn the_scratchpad_is_plain_text_with_a_path_of_its_own() {
+        // `.txt` is load-bearing: read mode gates on the extension, so this is
+        // what keeps `Cmd+Shift+M` from rendering the scratchpad as markdown.
+        let path =
+            sacrament_core::paths::scratchpad_path(sacrament_core::APP_GUI).expect("a config dir");
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("txt"));
+        // Namespaced like the session file, so v1 and v2 can't share one.
+        assert!(path.to_string_lossy().contains("sacrament2"));
+        assert_ne!(
+            path,
+            sacrament_core::paths::scratchpad_path(sacrament_core::APP_TUI).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_scratchpad_buffer_carries_no_syntax() {
+        // Loaded with no highlighter, so the work isn't merely discarded — it is
+        // never done. `toggle_comment` relies on this to report that there's
+        // nothing to comment with rather than inserting a marker.
+        let buf = load_scratchpad(4);
+        assert!(buf.syntax_name().is_none());
+        assert_eq!(buf.tab_width, 4);
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    #[test]
+    fn the_prompt_is_read_from_a_file_rather_than_typed() {
+        // A ticket description is thousands of characters. On the command line
+        // that means zsh echoing and re-wrapping all of it in a tab you're
+        // watching, every shell metacharacter in the ticket needing to be escaped,
+        // and history expansion seeing any `!` in the text. Inside `$(cat …)` the
+        // shell reads the file and none of that applies.
+        let command = run_command(std::path::Path::new("/tmp/runs/TFE-954-fix/prompt.md"));
+        assert!(command.contains("$(cat "), "got: {command}");
+        assert!(command.contains("prompt.md"), "got: {command}");
+        // The completion signal: the shell ends when the agent does, which is what
+        // fires `Event::Exited` and makes the run report itself with no polling.
+        assert!(command.trim_end().ends_with("; exit"), "got: {command}");
+        assert!(command.contains("--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn a_path_with_a_space_survives_the_command_line() {
+        // Home directories with spaces in them are ordinary, and an unescaped one
+        // would make `cat` read two paths and the agent receive a truncated prompt.
+        let command = run_command(std::path::Path::new("/Users/a b/runs/TFE-1/prompt.md"));
+        assert!(command.contains("a\\ b"), "got: {command}");
+    }
+
+    #[test]
+    fn a_run_directory_is_per_branch_so_a_retry_keeps_the_first_transcript() {
+        let first = run_dir_for("TFE-954-first-attempt").expect("a config dir");
+        let second = run_dir_for("TFE-954-second-attempt").expect("a config dir");
+        assert_ne!(first, second);
+        // Namespaced like everything else the app owns, so v1 can't collide.
+        assert!(first.to_string_lossy().contains("sacrament2"));
+    }
+
+    #[test]
+    fn hovering_run_is_not_hovering_the_key() {
+        // Both controls sit on the same row and carry the same issue key, so if
+        // these compared equal, pointing at one would light up the other.
+        let mut jira = JiraPane::new();
+        jira.hovered = Some(JiraHover::Run("TFE-954".to_string()));
+        assert!(jira.is_hovered(&JiraHover::Run("TFE-954".to_string())));
+        assert!(!jira.is_hovered(&JiraHover::Key("TFE-954".to_string())));
+        assert!(!jira.is_hovered(&JiraHover::Run("TFE-955".to_string())));
+    }
+
+    #[test]
+    fn every_dashboard_column_has_a_cell() {
+        // A tripwire, not a proof: `issue_table` pushes one widget per column by
+        // hand while the header row iterates this array, so adding an entry here
+        // without adding a cell there shifts every header one column left of the
+        // data it labels. Nothing else would fail.
+        assert_eq!(
+            JIRA_COLUMNS.len(),
+            6,
+            "add or remove the matching cell in `issue_table` as well"
+        );
     }
 }
 

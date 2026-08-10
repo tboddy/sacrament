@@ -34,6 +34,37 @@ pub fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("config.toml"))
 }
 
+/// `$XDG_CONFIG_HOME/sacrament/<app>-runs/<name>/` — one ticket run's artifacts:
+/// the prompt it was given and the transcript of what it did.
+///
+/// Under the config directory because that's already where this app keeps state it
+/// owns and rewrites (`<app>-session.toml`), so there's one place to look rather
+/// than two. Namespaced by app id for the same reason everything else here is,
+/// even though only v2 has runs — the rule is cheaper to keep than to remember the
+/// exception to.
+///
+/// **Not cleaned up.** A run's transcript is the only record of what an unattended
+/// agent did to a repository, and deleting it on a timer would remove exactly the
+/// evidence someone comes looking for a week later.
+pub fn run_dir(app: &str, name: &str) -> Option<PathBuf> {
+    Some(config_dir()?.join(format!("{app}-runs")).join(name))
+}
+
+/// `$XDG_CONFIG_HOME/sacrament/<app>-scratchpad.txt` — the Scratchpad section's
+/// one permanent document.
+///
+/// Beside the session file rather than somewhere like `~/Documents`: it is state
+/// this app owns and rewrites without being asked, which is the same category as
+/// `<app>-session.toml` and the opposite of a file the user chose to open. Putting
+/// it in a documents folder would imply a file they manage, with a name they
+/// picked and a lifetime they control — none of which is true.
+///
+/// `.txt` deliberately, and the extension is load-bearing: it's what keeps the
+/// buffer out of markdown read mode, which gates on the extension itself.
+pub fn scratchpad_path(app: &str) -> Option<PathBuf> {
+    Some(config_dir()?.join(format!("{app}-scratchpad.txt")))
+}
+
 /// The user's home directory, where a fresh shell starts.
 ///
 /// A new shell deliberately does *not* inherit the editor's own working
