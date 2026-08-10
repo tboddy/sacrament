@@ -717,6 +717,37 @@ fn alert_dialog(body: String) -> Task<Message> {
     )
 }
 
+/// Which changed settings a reload cannot apply to the running app.
+///
+/// A free function so it can be tested, because this is the part that rots: add a
+/// config field and it silently defaults to "applies live", which is the wrong way
+/// round — a setting that looks applied but isn't is worse than one that says it
+/// needs a restart. The test names every field, so a new one has to be classified
+/// deliberately.
+///
+/// Only two qualify today, and both for structural reasons rather than effort:
+///
+/// - **`[font]`** resolves the family against `fontdb` and leaks both the name and
+///   its coverage table to obtain `&'static str`, and the fallback chain is
+///   consumed into a static during startup. Re-resolving on every save would leak
+///   each time.
+/// - **`syntax_highlighting`** decides whether a `Highlighter` is *built at all* —
+///   which is the startup cost the option exists to avoid — and every open buffer
+///   seeded its parse state under whichever answer applied when it loaded.
+fn restart_required(
+    old: &sacrament_core::config::Config,
+    new: &sacrament_core::config::Config,
+) -> Vec<&'static str> {
+    let mut stale = Vec::new();
+    if old.font != new.font {
+        stale.push("[font]");
+    }
+    if old.syntax_highlighting != new.syntax_highlighting {
+        stale.push("syntax_highlighting");
+    }
+    stale
+}
+
 /// A new untitled buffer carrying the settings a buffer can't work out for itself.
 ///
 /// **The single producer of an untitled buffer in this crate**, and it exists
@@ -1453,7 +1484,17 @@ impl State {
         if let Some(split) = split_horizontal {
             panes.resize(split, geometry.horizontal_split);
         }
-        let config = sacrament_core::config::load();
+        // `load_result` rather than `load`, so a typo in config.toml is *said*
+        // rather than silently answered with built-in defaults. It's the same
+        // reason the reload path needs it: a config that quietly isn't being used
+        // looks exactly like one whose settings don't work.
+        let (config, config_error) = match sacrament_core::config::load_result() {
+            Ok(config) => (config, None),
+            Err(e) => (
+                sacrament_core::config::Config::default(),
+                Some(format!("config.toml couldn't be read, so defaults are in use — {e}")),
+            ),
+        };
         let tab_width = config.tab_width.max(1);
         let syntax_on = config.syntax_highlighting;
         // Validate the requested family against what iced can actually load, so
@@ -1599,7 +1640,8 @@ impl State {
             .lock()
             .map(|b| b.path().is_none())
             .unwrap_or(true);
-        let mut warnings: Vec<String> = font_warning.into_iter().collect();
+        let mut warnings: Vec<String> = config_error.into_iter().collect();
+        warnings.extend(font_warning);
         if scratchpad_failed {
             warnings.push(format!(
                 "The scratchpad couldn't be opened{}. The section still works, but \
@@ -2886,7 +2928,7 @@ impl State {
                     }
                 }
             }
-            Message::FileChanged(path) => self.reload_changed(&path),
+            Message::FileChanged(path) => self.file_changed(&path),
             Message::FileDropped(path) => self.drop_file(path),
             Message::AlertDismissed => self.showing_alerts.clear(),
             Message::SaveAsPicked(None, _) => {}
@@ -3293,6 +3335,97 @@ impl State {
     /// check inside `Buffer::reload` is what makes those a no-op, and it's also
     /// why no debouncing is needed: once reloaded, the buffer's mtime matches
     /// disk and the duplicate events notify emits for a single write do nothing.
+    /// A watched file changed on disk.
+    ///
+    /// Both things this can mean are handled, and **not as alternatives**: the
+    /// config is reloaded when it's the config, and the buffer list is checked
+    /// regardless. `config.toml` opened as a tab is a file like any other — it has
+    /// to refresh on screen *and* take effect — and an either/or here would drop
+    /// one of the two depending on which branch was written first.
+    fn file_changed(&mut self, path: &std::path::Path) {
+        if sacrament_core::paths::config_path().as_deref() == Some(path) {
+            self.reload_config();
+        }
+        self.reload_changed(path);
+    }
+
+    /// Re-read `config.toml` and push what can be pushed into the running app.
+    ///
+    /// **A parse failure keeps the old config**, which is the whole reason
+    /// `config::load_result` exists: `load` collapses "broken" into "defaults",
+    /// and reloading a half-typed file would silently reset the theme, the font
+    /// and every editor setting mid-session with nothing connecting that to the
+    /// save that caused it.
+    ///
+    /// What lands immediately, and why each is free:
+    ///
+    /// - **`tab_width` and `word_wrap`** are per-buffer, so they're written to
+    ///   every open buffer *and* the scratchpad here. This is the reason the
+    ///   feature exists — they were previously read only when a buffer was built,
+    ///   so an open file kept the old width until it was closed and reopened.
+    /// - **`indent_with_tabs`, `line_numbers`, `[jira]`** are read from
+    ///   `self.config` at the moment they're used, so they need nothing.
+    /// - **`[theme]`** rebuilds `Palette`. The widgets are handed `&self.palette`
+    ///   each frame rather than caching a copy, so the next redraw has it.
+    ///
+    /// What can't, and is reported rather than silently ignored — a setting that
+    /// looks applied but isn't is worse than one that says it needs a restart:
+    ///
+    /// - **`[font]`** resolves a family against `fontdb` and leaks the name and
+    ///   its coverage table to get `&'static str`, and the fallback chain is
+    ///   consumed into a static at startup. Re-resolving per save would leak on
+    ///   every keystroke-triggered write.
+    /// - **`syntax_highlighting`** decides whether a `Highlighter` was *built* —
+    ///   that's the cost the option exists to avoid — and every buffer's parse
+    ///   state was seeded under that decision when it loaded.
+    fn reload_config(&mut self) {
+        let updated = match sacrament_core::config::load_result() {
+            Ok(config) => config,
+            Err(e) => {
+                self.alert(format!("config.toml wasn't reloaded — {e}"));
+                return;
+            }
+        };
+
+        let restart_needed = restart_required(&self.config, &updated);
+        self.config = updated;
+        self.palette = Palette::from_theme(&self.config.theme);
+
+        let tab_width = self.config.tab_width.max(1);
+        let wrap_width = self.wrap_width();
+        let rows = self.editor_rows;
+        // Every editable surface, the scratchpad included — it is a buffer the
+        // user types into, and leaving it on the old width would make the setting
+        // look half-applied.
+        let surfaces: Vec<_> = self
+            .buffers
+            .iter()
+            .cloned()
+            .chain(std::iter::once(self.scratchpad.clone()))
+            .collect();
+        for surface in surfaces {
+            let Ok(mut b) = surface.lock() else { continue };
+            b.tab_width = tab_width;
+            b.wrap_width = wrap_width;
+            // Wrapping changes how many screen rows the text above the caret
+            // occupies, so the view has to be re-settled or the caret can end up
+            // off-screen without anything having moved it.
+            b.ensure_cursor_visible(rows);
+        }
+
+        if !restart_needed.is_empty() {
+            self.alert(format!(
+                "config.toml reloaded. {} {} only on a restart.",
+                restart_needed.join(" and "),
+                if restart_needed.len() == 1 {
+                    "takes effect"
+                } else {
+                    "take effect"
+                }
+            ));
+        }
+    }
+
     fn reload_changed(&mut self, path: &std::path::Path) {
         let rows = self.editor_rows;
         let hl = self.highlighter.clone();
@@ -3361,11 +3494,22 @@ impl State {
     /// Declared as a whole set rather than added and removed one at a time, so
     /// a path can't be left watched after its tab closes.
     fn sync_watches(&self) {
-        let paths: Vec<std::path::PathBuf> = self
+        let mut paths: Vec<std::path::PathBuf> = self
             .buffers
             .iter()
             .filter_map(|b| b.lock().ok().and_then(|b| b.path().map(|p| p.to_path_buf())))
             .collect();
+        // `config.toml` is watched like an open file, so editing it takes effect
+        // without a relaunch. It rides on the same declared set rather than a
+        // watcher of its own: one mechanism, and it can't be forgotten on a path
+        // that re-syncs.
+        //
+        // Known limit: a config that doesn't exist yet can't be watched — notify
+        // fails on the path and the watcher records it as handled either way — so
+        // creating one for the first time still needs a restart.
+        if let Some(path) = sacrament_core::paths::config_path() {
+            paths.push(path);
+        }
         watch::sync(paths);
     }
 
@@ -5372,6 +5516,63 @@ mod scratchpad_tests {
         assert_ne!(
             path,
             sacrament_core::paths::scratchpad_path(sacrament_core::APP_TUI).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_settings_a_reload_can_apply_are_not_reported_as_needing_a_restart() {
+        use sacrament_core::config::Config;
+        let base = Config::default();
+        assert!(restart_required(&base, &base).is_empty());
+
+        // The whole point of the reload: these reach open buffers now, so
+        // classifying either as restart-only would be a lie the alert tells.
+        let mut narrower = base.clone();
+        narrower.tab_width = 2;
+        assert!(restart_required(&base, &narrower).is_empty());
+
+        let mut unwrapped = base.clone();
+        unwrapped.word_wrap = false;
+        assert!(restart_required(&base, &unwrapped).is_empty());
+
+        // Read from `self.config` where they're used, so they cost nothing.
+        let mut tabs = base.clone();
+        tabs.indent_with_tabs = true;
+        assert!(restart_required(&base, &tabs).is_empty());
+
+        let mut gutterless = base.clone();
+        gutterless.line_numbers = false;
+        assert!(restart_required(&base, &gutterless).is_empty());
+
+        // Rebuilds `Palette`, which the widgets are handed by reference each
+        // frame rather than caching.
+        let mut themed = base.clone();
+        themed.theme.background = sacrament_core::theme::Rgb { r: 1, g: 2, b: 3 };
+        assert!(restart_required(&base, &themed).is_empty());
+    }
+
+    #[test]
+    fn font_and_syntax_changes_say_they_need_a_restart() {
+        use sacrament_core::config::Config;
+        let base = Config::default();
+
+        // The family name and its coverage table are leaked to get `&'static str`,
+        // so re-resolving on every save would leak on every save.
+        let mut bigger = base.clone();
+        bigger.font.size += 1.0;
+        assert_eq!(restart_required(&base, &bigger), ["[font]"]);
+
+        // Decides whether a Highlighter is built at all, and every open buffer
+        // seeded its parse state under the old answer.
+        let mut plain = base.clone();
+        plain.syntax_highlighting = !base.syntax_highlighting;
+        assert_eq!(restart_required(&base, &plain), ["syntax_highlighting"]);
+
+        let mut both = plain.clone();
+        both.font.size += 1.0;
+        assert_eq!(
+            restart_required(&base, &both),
+            ["[font]", "syntax_highlighting"]
         );
     }
 

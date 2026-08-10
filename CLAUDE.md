@@ -1145,6 +1145,58 @@ chrome doesn't read as a different app.
 `close_tab` refuses to discard a dirty buffer and says so, and closing the last tab
 leaves an empty untitled one — so `buf()` never has to handle an empty list.
 
+#### Live config reload (`State::reload_config`, `config::load_result`)
+
+**`config.toml` is watched like an open file, so editing it takes effect without a
+relaunch.** It rides on the same declared watch set (`sync_watches`) rather than a
+watcher of its own — one mechanism, and it can't be forgotten on a path that
+re-syncs.
+
+**A parse failure keeps the config already in use.** This is why
+`config::load_result` exists beside `load`: `load` answers a broken file with
+`Config::default()`, which is right at startup — there's nothing yet to lose — and
+actively harmful on reload, where saving a half-typed line would reset the theme,
+the font and every editor setting mid-session with nothing on screen connecting
+that to the save. The error names the file, line and column, since `toml`'s own
+message beats anything invented here. Startup reports it too now, rather than
+running on defaults in silence.
+
+**`FileChanged` does both jobs, not one or the other.** `config.toml` open as a tab
+is a file like any other: it has to refresh on screen *and* take effect. An
+either/or would drop whichever branch wasn't written first.
+
+What lands immediately:
+
+- **`tab_width` and `word_wrap`** are per-buffer, so they're written to every open
+  buffer *and* the scratchpad. This is the reason the feature exists — they were
+  read only when a buffer was built, so an open file kept the old width until it
+  was closed and reopened. Each surface is re-settled with `ensure_cursor_visible`
+  afterwards, because a wrap change alters how many screen rows sit above the
+  caret.
+- **`indent_with_tabs`, `line_numbers`, `[jira]`** are read from `self.config`
+  where they're used, so they need nothing at all.
+- **`[theme]`** rebuilds `Palette`. The widgets take `&self.palette` each frame
+  rather than caching a copy, so the next redraw has it.
+
+What can't, and is **reported rather than silently ignored** — a setting that looks
+applied but isn't is worse than one that says it needs a restart:
+
+- **`[font]`** resolves the family against `fontdb` and leaks both the name and its
+  coverage table to obtain `&'static str`, and the fallback chain is consumed into
+  a static at startup. Re-resolving per save would leak per save.
+- **`syntax_highlighting`** decides whether a `Highlighter` is built *at all* —
+  the startup cost the option exists to avoid — and every open buffer seeded its
+  parse state under whichever answer applied when it loaded.
+
+`restart_required` is a free function so it can be tested, because this is the part
+that rots: add a config field and it silently classifies as "applies live", which
+is the wrong way round. A test names every field, so a new one has to be
+classified deliberately.
+
+Known limit: a `config.toml` that doesn't exist yet can't be watched — notify fails
+on the path and the watcher records it as handled either way — so creating one for
+the first time still needs a restart.
+
 **Config options v2 honors** (`tab_width` and `word_wrap` reach a buffer through
 `empty_buffer` — see "Conventions"): `tab_width`, `indent_with_tabs`, `line_numbers`,
 `syntax_highlighting`, `word_wrap`, plus `[theme]` and `[font]`.
@@ -1829,7 +1881,7 @@ so v2 would restore v1's tabs and shells over its own, and both would then
 contend for one socket. `/tmp/sacrament2-$USER.sock` belonging to a binary called
 `sacrament` is the cost of not doing that.
 
-334 tests (`cargo test --workspace`): 113 in `core`, 221 in the gui — buffer
+339 tests (`cargo test --workspace`): 116 in `core`, 223 in the gui — buffer
 mutation and undo, terminal reflow, the key map, fonts, block geometry, and
 `theme_guard`. v1 has
 none, and getting any would mean standing up a `Buffer` first. Still untested and
@@ -2283,7 +2335,7 @@ ligate.
 
 ### Config (crates/core/src/config.rs)
 
-TOML at `$XDG_CONFIG_HOME/sacrament/config.toml`. All fields have defaults (`Config::default`), so a missing file is fine and an unparseable file silently falls back to defaults. The `[lint.linters]` table maps a language name (as `syntect` reports it, e.g. `Rust`) or a file extension to a `LinterSpec { command }` template (`{file}` is substituted); it defaults to empty, so `Alt+L` reports "no linter configured" until one is set.
+TOML at `$XDG_CONFIG_HOME/sacrament/config.toml`. All fields have defaults (`Config::default`), so a missing file is fine. `load` still answers an unparseable file with defaults, but `load_result` keeps the error apart from it — v2 uses that one everywhere (see "Live config reload"), because collapsing "broken" into "defaults" makes a typo indistinguishable from settings that don't work. The `[lint.linters]` table maps a language name (as `syntect` reports it, e.g. `Rust`) or a file extension to a `LinterSpec { command }` template (`{file}` is substituted); it defaults to empty, so `Alt+L` reports "no linter configured" until one is set.
 
 ## Dead ends and sharp edges
 
