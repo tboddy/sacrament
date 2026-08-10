@@ -1145,7 +1145,8 @@ chrome doesn't read as a different app.
 `close_tab` refuses to discard a dirty buffer and says so, and closing the last tab
 leaves an empty untitled one — so `buf()` never has to handle an empty list.
 
-**Config options v2 honors**: `tab_width`, `indent_with_tabs`, `line_numbers`,
+**Config options v2 honors** (`tab_width` and `word_wrap` reach a buffer through
+`empty_buffer` — see "Conventions"): `tab_width`, `indent_with_tabs`, `line_numbers`,
 `syntax_highlighting`, `word_wrap`, plus `[theme]` and `[font]`.
 `syntax_highlighting = false` skips *building* the `Highlighter`, not just its
 output — loading syntect's syntax set is the cost the option exists to avoid.
@@ -1828,7 +1829,7 @@ so v2 would restore v1's tabs and shells over its own, and both would then
 contend for one socket. `/tmp/sacrament2-$USER.sock` belonging to a binary called
 `sacrament` is the cost of not doing that.
 
-331 tests (`cargo test --workspace`): 113 in `core`, 218 in the gui — buffer
+334 tests (`cargo test --workspace`): 113 in `core`, 221 in the gui — buffer
 mutation and undo, terminal reflow, the key map, fonts, block geometry, and
 `theme_guard`. v1 has
 none, and getting any would mean standing up a `Buffer` first. Still untested and
@@ -2322,6 +2323,22 @@ State that exists but doesn't do what its name suggests. Don't build on it witho
   the crate's own sources at test time and fails on the offending patterns, with
   `palette.rs` exempt. If you need a color that `Palette` can't give you, the fix
   is a new named accessor on `Palette` derived from the theme — not an exemption.
+- **v2: a `Buffer` shown to the user is built by `empty_buffer`, never by
+  `Buffer::empty()` directly.** `buffer.rs` is the model and knows nothing about
+  the config, so the bare constructor defaults `tab_width` to 4 and `wrap_width`
+  to 0 — anything constructing one has to supply both, and "everyone remembers"
+  failed twice. `tab_width` was set at five sites and missed at `new_buffer`, so
+  `Cmd+N` drew four-column tabs whatever the config said. `wrap_width` was set at
+  *none*: it arrived only from `Message::EditorResized`, which fires on a size
+  **change**, so any buffer created after the first layout didn't wrap until the
+  window was next dragged — while files opened at startup were fine, which is what
+  made it look intermittent. Neither reads as a fault on screen; the file opens,
+  typing works, and only the layout disagrees with the config. `State::wrap_width`
+  is the single definition of the width, and **this is enforced**:
+  `crates/gui/src/buffer_guard.rs` fails the suite if the bare constructor appears
+  outside `empty_buffer` (`buffer.rs`'s own tests are exempt — they want the raw
+  defaults). Same shape as `theme_guard`, for the same reason: a convention nobody
+  can check is one that decays.
 - Any code that mutates `Buffer::text` line count must also update `highlights`, `line_state_before`, and `change_bars` in the same step, then call `invalidate_highlights_from` and `adjust_folds_for_edit` (the latter also clears `diagnostics`).
 - The gutter has three consumers that must agree: `render_gutter` and `gutter_width` (which both derive `digits` from the line count and ask `gutter_overlays` which of the lint / change-bar columns are present), and the gutter-click hit-test in `handle_mouse` (which locates the fold chevron at `digits + 1`). The chevron sits before the overlay columns, so its position depends only on the line count — but if you change the column order or `gutter_overlays`, revisit all three. Same lockstep rule as the tab-bar helpers below.
 - Shell tab hit-testing and rendering share their width math — if you change one of `render_tab_bar` / `render_shell_tabs` or their helpers (`buffer_tab_width`, `shell_tabs_total_width`, `shell_tab_hit_at`), update the others in the same pass or clicks will miss the drawn tabs.

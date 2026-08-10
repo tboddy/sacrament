@@ -19,6 +19,7 @@
 
 mod blocks;
 mod buffer;
+mod buffer_guard;
 mod grid;
 mod ipc;
 mod macos;
@@ -716,6 +717,40 @@ fn alert_dialog(body: String) -> Task<Message> {
     )
 }
 
+/// A new untitled buffer carrying the settings a buffer can't work out for itself.
+///
+/// **The single producer of an untitled buffer in this crate**, and it exists
+/// because the alternative had already failed twice. `buffer.rs` has no idea a
+/// config exists, so `Buffer::empty()` defaults `tab_width` to 4 and `wrap_width`
+/// to 0, and every construction site had to remember to overwrite both afterwards.
+///
+/// Both were missed, in the way that kind of rule always is — not everywhere, just
+/// in one place each:
+///
+/// - **`tab_width`**: five sites set it and `new_buffer` didn't, so `Cmd+N` gave a
+///   buffer that drew every tab four columns wide however `tab_width` was set.
+/// - **`wrap_width`**: *no* construction site set it. It arrived only from
+///   `Message::EditorResized`, and `GridView` publishes a size only when it
+///   *changes* — so a buffer made after the first layout (`Cmd+N`, `Cmd+O`, a
+///   dropped file, a `--review` open, the replacement after closing the last tab)
+///   had 0, which means wrapping off, until the window or a splitter was next
+///   dragged. Files opened *at startup* were fine, because the first layout is a
+///   change from nothing, which is exactly what made it look intermittent.
+///
+/// Neither looks wrong on screen: the file opens, typing works, and only the
+/// layout quietly disagrees with the config.
+///
+/// A free function rather than a method on `State` because `State::new` builds
+/// buffers before `self` exists — those pass `wrap_width` 0 deliberately, since no
+/// grid has laid out yet and the first `EditorResized` is still to come.
+/// `buffer_guard` fails the test suite if a new site goes around this one.
+fn empty_buffer(tab_width: usize, wrap_width: usize) -> Buffer {
+    let mut buf = Buffer::empty();
+    buf.tab_width = tab_width.max(1);
+    buf.wrap_width = wrap_width;
+    buf
+}
+
 /// Open the Scratchpad's document, creating it the first time.
 ///
 /// **Loaded with no highlighter, on purpose.** The scratchpad is plain text — no
@@ -741,11 +776,11 @@ fn load_scratchpad(tab_width: usize) -> Buffer {
                 }
                 let _ = std::fs::write(&path, "");
             }
-            Buffer::load(&path, None).unwrap_or_else(|_| Buffer::empty())
+            Buffer::load(&path, None).unwrap_or_else(|_| empty_buffer(tab_width, 0))
         }
-        None => Buffer::empty(),
+        None => empty_buffer(tab_width, 0),
     };
-    buf.tab_width = tab_width;
+    buf.tab_width = tab_width.max(1);
     buf
 }
 
@@ -1513,9 +1548,9 @@ impl State {
             active = saved.active.min(buffers.len().saturating_sub(1));
         }
         if buffers.is_empty() {
-            let mut b = Buffer::empty();
-            b.tab_width = tab_width;
-            buffers.push(Arc::new(Mutex::new(b)));
+            // Wrap width 0 here on purpose: nothing has laid out yet, and the
+            // first `EditorResized` supplies it.
+            buffers.push(Arc::new(Mutex::new(empty_buffer(tab_width, 0))));
         }
         let state = Self {
             bottom,
@@ -1613,6 +1648,24 @@ impl State {
     /// operation that can shrink `buffers`, and it clamps.
     fn buf(&self) -> &Arc<Mutex<Buffer>> {
         &self.buffers[self.active]
+    }
+
+    /// The width buffers should wrap at, in columns.
+    ///
+    /// One definition, because two things need the answer and a buffer that
+    /// disagreed with the grid would wrap in the wrong place: the resize handler
+    /// pushes it to the surfaces on screen, and `empty_buffer` gives it to one
+    /// being made now — which the resize handler will not do, since it only fires
+    /// when the size *changes*.
+    ///
+    /// `word_wrap = false` is width 0, which `text::wrap_line` treats as one
+    /// segment — one code path, not two.
+    fn wrap_width(&self) -> usize {
+        if self.config.word_wrap {
+            self.editor_cols.max(1)
+        } else {
+            0
+        }
     }
 
     fn select_tab(&mut self, index: usize) {
@@ -2159,8 +2212,7 @@ impl State {
         }
         self.buffers.remove(index);
         if self.buffers.is_empty() {
-            let mut b = Buffer::empty();
-            b.tab_width = self.config.tab_width.max(1);
+            let b = empty_buffer(self.config.tab_width, self.wrap_width());
             self.buffers.push(Arc::new(Mutex::new(b)));
         }
         self.active = self.active.min(self.buffers.len() - 1);
@@ -2585,9 +2637,7 @@ impl State {
                 self.editor_rows = rows.max(1);
                 self.editor_cols = cols.max(1);
                 // The buffer needs the viewport width to derive wrap segments.
-                // `word_wrap = false` becomes width 0, which `text::wrap_line`
-                // treats as "one segment" — no second code path.
-                let width = if self.config.word_wrap { cols.max(1) } else { 0 };
+                let width = self.wrap_width();
                 // Applied to **every** surface the pane can show, not just the one
                 // reporting — the same rule `GridResized` follows for a shell
                 // pane's tabs, and for the same reason. `GridView` publishes a size
@@ -3353,6 +3403,10 @@ impl State {
                 let mut buf = Buffer::load(path, self.highlighter.as_deref())
                     .map_err(|e| format!("{}: {e}", path.display()))?;
                 buf.tab_width = self.config.tab_width.max(1);
+                // Same reason `empty_buffer` takes one: `EditorResized` fires only
+                // on a size *change*, so a file opened now would not wrap until the
+                // window was next resized.
+                buf.wrap_width = self.wrap_width();
                 if let Some(name) = syntax
                     && let Some(hl) = self.highlighter.as_deref()
                 {
@@ -3415,7 +3469,10 @@ impl State {
     /// Shows the editor: an empty buffer exists to be typed into, so making one
     /// while another section is up has to bring the editor back.
     fn new_buffer(&mut self) {
-        self.buffers.push(Arc::new(Mutex::new(Buffer::empty())));
+        self.buffers.push(Arc::new(Mutex::new(empty_buffer(
+            self.config.tab_width,
+            self.wrap_width(),
+        ))));
         self.active = self.buffers.len() - 1;
         self.show_editor();
         self.persist();
@@ -5316,6 +5373,34 @@ mod scratchpad_tests {
             path,
             sacrament_core::paths::scratchpad_path(sacrament_core::APP_TUI).unwrap()
         );
+    }
+
+    #[test]
+    fn a_new_buffer_takes_its_width_from_the_config() {
+        // The reported bug: `Cmd+N` then Tab drew four columns with
+        // `tab_width = 2` set, because `new_buffer` was the one construction site
+        // that never overwrote `Buffer::empty()`'s default.
+        let buf = empty_buffer(2, 0);
+        assert_eq!(buf.tab_width, 2);
+        // A tab is one character but `tab_width` columns, and it's the columns
+        // that were wrong — so measure the thing that was actually visible.
+        assert_eq!(
+            sacrament_core::text::char_display_width('\t', 0, buf.tab_width),
+            2
+        );
+        // Zero would divide by zero deriving grid positions; every caller clamps.
+        assert_eq!(empty_buffer(0, 0).tab_width, 1);
+    }
+
+    #[test]
+    fn a_new_buffer_wraps_at_the_width_it_was_given() {
+        // The neighbouring bug, found while fixing the first: no construction site
+        // set `wrap_width` at all. It came only from `EditorResized`, which fires
+        // on a size *change* — so a buffer made after the first layout didn't wrap
+        // until the window was next resized.
+        assert_eq!(empty_buffer(4, 80).wrap_width, 80);
+        // Wrapping off is width 0, which `text::wrap_line` reads as one segment.
+        assert_eq!(empty_buffer(4, 0).wrap_width, 0);
     }
 
     #[test]
