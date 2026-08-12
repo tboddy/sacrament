@@ -38,11 +38,16 @@
 //! run from a terminal finds both. It is invisible in development and total in
 //! production.
 //!
-//! So anything outside the base system runs through a **login shell**, which reads
-//! `/etc/zprofile` (and therefore `path_helper`) and `~/.zprofile` (and therefore
-//! `brew shellenv`) — exactly what the PTY does. `git` is called directly, as
-//! [`crate::git`] already does: `/usr/bin/git` ships with the Xcode command line
-//! tools and is on the minimal `PATH` regardless.
+//! So anything outside the base system runs through a **login, interactive** shell —
+//! exactly what a PTY gets, which is the standard to match, because the run itself
+//! happens in a shell tab. Login gets `/etc/zprofile` (and therefore `path_helper`)
+//! and `~/.zprofile` (and therefore `brew shellenv`); interactive gets `~/.zshrc`,
+//! which is where a great many people actually keep their `PATH` — see
+//! [`login_shell`], where leaving `-i` out made the pre-flight report `claude` as
+//! missing while `claude` ran fine in the pane beside it.
+//!
+//! `git` is called directly, as [`crate::git`] already does: `/usr/bin/git` ships
+//! with the Xcode command line tools and is on the minimal `PATH` regardless.
 
 use std::path::Path;
 use std::process::Command;
@@ -208,11 +213,17 @@ pub fn preflight(repo: &Path, branch: &str, worktree: &Path, base: &str) -> Resu
     .unwrap_or_else(|| "no-shell".to_string());
     match tools.trim() {
         "ok" => Ok(()),
-        "no-claude" => Err("`claude` isn't installed, or isn't on the PATH a login \
-                            shell sees."
+        // Both of these name the check, because the fix is nearly always to the
+        // `PATH` rather than to the installation — and a shell tab is right there to
+        // run it in.
+        "no-claude" => Err("`claude` isn't on the PATH your shell sees. Check it in a \
+                            shell tab with `command -v claude`; if that finds it, the \
+                            line that sets the PATH is somewhere this app's shell \
+                            doesn't read."
             .to_string()),
-        "no-gh" => Err("`gh` isn't installed, or isn't on the PATH a login shell \
-                        sees. The run needs it to open the pull request."
+        "no-gh" => Err("`gh` isn't on the PATH your shell sees, and the run needs it \
+                        to open the pull request. Check it in a shell tab with \
+                        `command -v gh`."
             .to_string()),
         "no-auth" => {
             Err("`gh` isn't authenticated. Run `gh auth login` first, or the run \
@@ -403,21 +414,70 @@ fn git_checked(repo: &Path, args: &[&str]) -> Result<String, String> {
     })
 }
 
-/// Run a script through a **login** shell, so it sees the `PATH` a terminal would.
+/// Printed by [`login_shell`] before the script it was given, so a `.zshrc` that
+/// writes to stdout can't be read as the script's answer.
 ///
-/// See the module docs: without the login shell this finds neither `gh` nor
-/// `claude` when the app was started from the Dock.
+/// Needed because the shell is now interactive (see below) and therefore sources a
+/// file most people have put something chatty in. Without it, one `echo` in a
+/// startup file makes every check here report "couldn't run a login shell", and one
+/// in front of `gh`'s JSON makes a real pull request invisible.
+const OUTPUT_MARKER: &str = "--- sacrament ---";
+
+/// Run a script through a **login, interactive** shell, so it sees the `PATH` the
+/// run's own shell will.
+///
+/// See the module docs for why it's a login shell. **Interactive is the other half,
+/// and it is not optional**: `zsh -l -c` sources `/etc/zprofile`, `~/.zprofile` and
+/// `~/.zlogin` — but *not* `~/.zshrc`, which zsh reads only for interactive shells.
+/// Plenty of people, including this app's author, keep their whole `PATH` in
+/// `.zshrc`, so a login-but-not-interactive shell finds neither `claude`
+/// (`~/.local/bin`) nor `gh` (`/opt/homebrew/bin`), and the pre-flight refuses to
+/// start a run that would have worked perfectly.
+///
+/// That failure is worth recognising, because it accuses the wrong thing: it says
+/// `claude` isn't installed while `claude` runs fine in the shell pane beside it —
+/// and that pane is the proof, because a PTY shell is login *and* interactive. The
+/// check was stricter than the thing it was checking. Reproduce it without a Dock
+/// launch by emptying the environment:
+///
+/// ```text
+/// env -i HOME=$HOME PATH=/usr/bin:/bin /bin/zsh -l    -c 'command -v claude'  # nothing
+/// env -i HOME=$HOME PATH=/usr/bin:/bin /bin/zsh -l -i -c 'command -v claude'  # found
+/// ```
+///
+/// Measured at ~0.3s on this machine, with no tty and no `TERM` — which is what a
+/// Dock-launched app has. Every caller is already on a background thread.
 fn login_shell(repo: &Path, script: &str) -> Option<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let output = Command::new(shell)
-        .args(["-l", "-c", script])
+        .args([
+            "-l",
+            "-i",
+            "-c",
+            &format!("printf '%s\\n' '{OUTPUT_MARKER}'; {script}"),
+        ])
         .current_dir(repo)
         .output()
         .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+    if !output.status.success() {
+        return None;
+    }
+    let out = String::from_utf8_lossy(&output.stdout);
+    after_marker(&out).map(str::to_string)
+}
+
+/// The part of a shell's stdout that belongs to the script rather than to whatever
+/// its startup files printed.
+///
+/// Split out to be testable: the interesting case is noise *before* the marker, and
+/// arranging for a real shell to produce some would mean writing dotfiles into a
+/// fake `HOME` and setting `SHELL` process-wide, which is both fiddly and flaky
+/// under a threaded test runner.
+///
+/// `rsplit_once`, so the later occurrence wins if a startup file somehow prints the
+/// marker itself.
+fn after_marker(stdout: &str) -> Option<&str> {
+    Some(stdout.rsplit_once(OUTPUT_MARKER)?.1)
 }
 
 #[cfg(test)]
@@ -467,6 +527,26 @@ mod tests {
         assert!(pushed.contains("gh pr create"), "got: {pushed}");
         // Singular, because "1 commits" in an alert reads as a bug in the app.
         assert!(pushed.contains("1 commit "), "got: {pushed}");
+    }
+
+    #[test]
+    fn a_chatty_startup_file_is_not_mistaken_for_the_answer() {
+        // The shell is interactive, so it sources `.zshrc` — and a `.zshrc` that
+        // prints something is ordinary. Without the marker that `echo` *is* the
+        // output: the tool check would read "nvm loaded" and report that a login
+        // shell couldn't be run, and `gh`'s JSON would fail to parse, hiding a real
+        // pull request behind "no PR was opened".
+        let noisy = format!("nvm loaded\nplugins ready\n{OUTPUT_MARKER}\nok\n");
+        assert_eq!(after_marker(&noisy).map(str::trim), Some("ok"));
+
+        // Multi-line output survives whole — `gh --json` is one line today, but the
+        // marker must not turn into a line-picking rule that breaks if it stops being.
+        let json = format!("{OUTPUT_MARKER}\n[\n  {{\"number\": 7}}\n]\n");
+        assert_eq!(after_marker(&json).map(str::trim), Some("[\n  {\"number\": 7}\n]"));
+
+        // No marker means the shell died before our script ran, which is not the
+        // same as an empty answer — and must not be reported as one.
+        assert_eq!(after_marker("command not found\n"), None);
     }
 
     #[test]

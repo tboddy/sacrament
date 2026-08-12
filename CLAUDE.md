@@ -874,13 +874,38 @@ then asks `gh` for the PR — and `Outcome::describe` names *how far it got*, be
 that decides what the user does next. "Pushed but no PR" needs `gh pr create`;
 "branch never created" needs the whole thing again.
 
-**Everything outside the base system runs through a login shell**, and this is the
-same trap `pty.rs` records. A Dock-launched app inherits launchd's
+**Everything outside the base system runs through a login *and interactive* shell**,
+and this is the same trap `pty.rs` records. A Dock-launched app inherits launchd's
 `/usr/bin:/bin:/usr/sbin:/sbin`, so `gh` (Homebrew) and `claude` (`~/.local/bin`)
 are simply not findable — while the identical binary run from a terminal finds
 both, which makes it invisible in development and total in production. `git` is
 called directly, as `core::git` already does: `/usr/bin/git` is on the minimal
 `PATH` regardless.
+
+**`-i` is half the fix, and leaving it out fails in a way that accuses the wrong
+thing.** `zsh -l -c` reads `/etc/zprofile` and `~/.zprofile` but **not `~/.zshrc`**,
+which zsh sources only for interactive shells — and `.zshrc` is where a great many
+people, including this repo's author, actually set `PATH`. So a login-but-not-
+interactive shell found neither `claude` nor `gh`, and the pre-flight refused with
+"`claude` isn't installed" while `claude` ran perfectly in the shell pane two inches
+below the dialog. That pane is the proof rather than a contradiction: a PTY shell is
+login *and* interactive, so the check was stricter than the thing it was checking.
+
+Reproducing it needs no Dock launch, just an empty environment:
+
+```text
+env -i HOME=$HOME PATH=/usr/bin:/bin /bin/zsh -l    -c 'command -v claude'   # nothing
+env -i HOME=$HOME PATH=/usr/bin:/bin /bin/zsh -l -i -c 'command -v claude'   # found
+```
+
+Interactive brings one cost with it: `.zshrc` files print things, and that output
+would be read as the script's answer — a startup `echo` would make every tool check
+report "couldn't run a login shell", and one in front of `gh`'s JSON would make a
+real pull request parse as none. So `login_shell` prints `OUTPUT_MARKER` first and
+keeps only what follows it. `after_marker` is split out to be tested, because
+arranging for a real shell to be chatty means writing dotfiles into a fake `HOME`
+and setting `SHELL` process-wide, which is flaky under a threaded test runner.
+Measured at ~0.3s with no tty and no `TERM`, which is what a Dock launch has.
 
 **The prompt is a file the shell reads, not text on the command line**
 (`run_command` → `claude … "$(cat <path>)"; exit`). A ticket description is
@@ -1943,7 +1968,7 @@ so v2 would restore v1's tabs and shells over its own, and both would then
 contend for one socket. `/tmp/sacrament2-$USER.sock` belonging to a binary called
 `sacrament` is the cost of not doing that.
 
-346 tests (`cargo test --workspace`): 122 in `core`, 224 in the gui — buffer
+347 tests (`cargo test --workspace`): 123 in `core`, 224 in the gui — buffer
 mutation and undo, terminal reflow, the key map, fonts, block geometry,
 `work`'s worktrees against real git repositories, and
 `theme_guard`. v1 has

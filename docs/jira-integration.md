@@ -421,8 +421,17 @@ pull request opened in the browser at the end.
   created" need different things from the user.
 - **`gh` and `claude` are not on our `PATH`.** Same trap as `pty.rs`: a
   Dock-launched app has launchd's minimal environment, so anything outside the base
-  system runs through a **login shell**. `git` is called directly, as `core::git`
-  already does. This is invisible in development and total in production.
+  system runs through a **login and interactive** shell. `git` is called directly, as
+  `core::git` already does. This is invisible in development and total in production.
+  - **Interactive is not decoration.** With `-l` alone, zsh reads `~/.zprofile` but
+    not `~/.zshrc` — and `.zshrc` is where many people set `PATH`. The first real
+    press of the button refused with "`claude` isn't installed" while `claude` ran
+    fine in the shell pane below the dialog; that pane is the proof, since a PTY
+    shell is login *and* interactive. Reproduce with
+    `env -i HOME=$HOME PATH=/usr/bin:/bin /bin/zsh -l -c 'command -v claude'`.
+  - The cost is that `.zshrc` output now lands on stdout, so `login_shell` prints a
+    marker first and keeps only what follows — otherwise one startup `echo` reads as
+    the answer, and in front of `gh`'s JSON it hides a real pull request.
 - **The prompt is a file the shell reads**, not text on the command line. A ticket
   description is thousands of characters — on the line it means zsh re-wrapping all
   of it in a tab you're watching, escaping every metacharacter in the ticket, and
