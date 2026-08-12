@@ -6,10 +6,28 @@
 //!
 //! - **Is it safe to start?** ([`preflight`]) — because the run that follows pushes
 //!   a branch and opens a pull request, and none of that is reversible by the app.
+//! - **Where does it work?** ([`add_worktree`] / [`remove_worktree`]) — a run gets a
+//!   git worktree of its own, so it is independent of the checkout the user is
+//!   working in.
 //! - **What actually happened?** ([`verify`]) — because the agent's own account of
 //!   its work is not evidence. A run that says "done" having committed nothing is
 //!   indistinguishable, from the app's side, from one that succeeded — unless the
 //!   app looks.
+//!
+//! ## The agent never works in the user's checkout
+//!
+//! An unattended agent and a person editing the same working tree cannot both have
+//! it. The first version of this ran the agent *in* the configured repository, and
+//! so [`preflight`] had to refuse whenever that tree was dirty — which is most of
+//! the time, because the whole appeal of the button is starting a ticket as an
+//! aside from whatever you are already doing. A run you have to stash your own work
+//! for is a run you don't press.
+//!
+//! So each run gets its own worktree ([`add_worktree`]), branched from an
+//! up-to-date base, and the agent's shell opens there. `git worktree` shares the
+//! repository's object store and refs, which is what makes this cheap and what
+//! keeps the rest of this module unchanged: [`verify`] still asks the *main*
+//! repository about the branch, because there is only one set of refs.
 //!
 //! ## `gh` is not necessarily on our `PATH`
 //!
@@ -117,15 +135,21 @@ fn commits(n: usize) -> String {
 ///
 /// Each check is here because of what happens without it:
 ///
-/// - **A dirty tree** would be swept into the agent's commits. Someone's unrelated
-///   work in progress ends up in a pull request under a ticket number, which is
-///   both confusing and genuinely hard to unpick once pushed.
 /// - **An existing branch** means a previous run — finished or abandoned. Running
-///   again would either fail at `git switch -c` or, worse, build on a state nobody
-///   remembers.
+///   again would either fail at `git worktree add -b` or, worse, build on a state
+///   nobody remembers.
+/// - **A leftover worktree** is that same previous run's checkout, kept because it
+///   still held uncommitted work. Reusing it would put a second agent in it.
+/// - **An unresolvable base** means the branch would be cut from nothing. Better to
+///   say `main` can't be found than to fail inside the agent's shell.
 /// - **`gh` unauthenticated** fails at the *last* step, after the work is done and
 ///   pushed. Ten minutes of agent time to discover a login prompt.
-pub fn preflight(repo: &Path, branch: &str) -> Result<(), String> {
+///
+/// **There is deliberately no dirty-tree check.** There was, and dropping it is the
+/// reason the worktree exists: the agent works in a checkout of its own, so
+/// whatever is uncommitted in the user's tree is untouched and irrelevant. See the
+/// module docs.
+pub fn preflight(repo: &Path, branch: &str, worktree: &Path, base: &str) -> Result<(), String> {
     if !repo.is_dir() {
         return Err(format!(
             "{} isn't a directory. Check the path in [jira.repos].",
@@ -134,20 +158,6 @@ pub fn preflight(repo: &Path, branch: &str) -> Result<(), String> {
     }
     if git(repo, &["rev-parse", "--is-inside-work-tree"]).is_none() {
         return Err(format!("{} isn't a git repository.", repo.display()));
-    }
-    match git(repo, &["status", "--porcelain"]) {
-        Some(status) if !status.trim().is_empty() => {
-            let count = status.lines().count();
-            return Err(format!(
-                "{} has {} uncommitted change{}. Commit or stash first — an agent \
-                 working here would sweep them into its own commits.",
-                repo.display(),
-                count,
-                if count == 1 { "" } else { "s" }
-            ));
-        }
-        None => return Err(format!("Couldn't read git status in {}.", repo.display())),
-        _ => {}
     }
     // `--verify --quiet` exits non-zero when the ref is absent, which is the
     // answer we want, so `is_some` here means "it already exists".
@@ -167,6 +177,23 @@ pub fn preflight(repo: &Path, branch: &str) -> Result<(), String> {
         return Err(format!(
             "The branch `{branch}` already exists on the remote — a previous run \
              pushed it. Check whether its pull request is still open."
+        ));
+    }
+    if worktree.exists() {
+        return Err(format!(
+            "A previous run's worktree is still at {}. It was kept because it had \
+             uncommitted changes in it. Look at it, then remove it with:\n\n\
+             git -C {} worktree remove {}",
+            worktree.display(),
+            repo.display(),
+            worktree.display()
+        ));
+    }
+    if base_ref(repo, base).is_none() {
+        return Err(format!(
+            "Can't find `{base}` or `origin/{base}` in {}. A run branches from it, \
+             so there's nothing to start from.",
+            repo.display()
         ));
     }
     // One login shell for all three, rather than three shell startups. See the
@@ -194,6 +221,94 @@ pub fn preflight(repo: &Path, branch: &str) -> Result<(), String> {
         }
         _ => Err("Couldn't run a login shell to check for `claude` and `gh`.".to_string()),
     }
+}
+
+/// Create the run's own checkout: a git worktree at `worktree`, on a new `branch`
+/// cut from an up-to-date `base`.
+///
+/// **Called after the confirm dialog, never before it.** A worktree is a branch and
+/// a directory, so making one during [`preflight`] would leave both behind every
+/// time the user pressed Cancel.
+///
+/// Blocking, and slow enough to matter: a fetch plus a checkout of a large
+/// repository is seconds, so callers run it off the UI thread.
+///
+/// The fetch is only attempted when the base *is* a remote-tracking ref — a
+/// repository with no `origin` would otherwise fail on `git fetch` and never get to
+/// the part that would have worked. Where there is a remote the fetch is fatal on
+/// purpose: branching from a stale `origin/main` produces a pull request full of
+/// conflicts, which is a worse outcome than a run that refuses to start.
+pub fn add_worktree(
+    repo: &Path,
+    branch: &str,
+    worktree: &Path,
+    base: &str,
+) -> Result<(), String> {
+    let base = base_ref(repo, base).ok_or_else(|| {
+        format!("Can't find `{base}` or `origin/{base}` in {}.", repo.display())
+    })?;
+    if base.starts_with("origin/") {
+        git_checked(repo, &["fetch", "origin"])
+            .map_err(|e| format!("Couldn't fetch from origin, so `{base}` may be stale:\n\n{e}"))?;
+    }
+    // Clears records for worktrees whose directories someone deleted by hand. Those
+    // stay registered otherwise, and `worktree add` refuses a path that is still
+    // registered even when nothing is there. Best-effort: a repository with none to
+    // prune reports nothing, and a failure here is not a reason to refuse the run.
+    let _ = git(repo, &["worktree", "prune"]);
+    if let Some(parent) = worktree.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    git_checked(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            &worktree.to_string_lossy(),
+            &base,
+        ],
+    )
+    .map_err(|e| format!("Couldn't create a worktree at {}:\n\n{e}", worktree.display()))?;
+    Ok(())
+}
+
+/// Tidy a finished run's worktree away, and report whether it's gone.
+///
+/// **Never `--force`, and that single choice is the whole policy.** Plain
+/// `git worktree remove` deletes the directory only when there is nothing in it to
+/// lose, and refuses when the tree holds modified or untracked files — which is
+/// exactly the split we want. A run that committed and pushed everything leaves a
+/// clean tree and is swept up; a run that died holding uncommitted work keeps its
+/// checkout, and the caller says where it is.
+///
+/// Verified rather than assumed: ignored files do **not** block it, so the `target/`
+/// or `node_modules/` the agent's own test run built doesn't strand every worktree.
+///
+/// Removing the worktree never loses the commits — those are on the branch, in the
+/// repository's shared object store, and the branch is left in place.
+pub fn remove_worktree(repo: &Path, worktree: &Path) -> bool {
+    if !worktree.exists() {
+        return true;
+    }
+    let _ = git(repo, &["worktree", "remove", &worktree.to_string_lossy()]);
+    let _ = git(repo, &["worktree", "prune"]);
+    !worktree.exists()
+}
+
+/// The ref a run's branch is cut from: `origin/<base>` when the remote has it,
+/// otherwise the local `<base>`.
+///
+/// Preferring the remote is what stops a run inheriting however far behind the
+/// user's local `main` happens to be. The local fallback is for a repository with
+/// no remote at all, where refusing would be pedantic.
+fn base_ref(repo: &Path, base: &str) -> Option<String> {
+    let remote = format!("origin/{base}");
+    if git(repo, &["rev-parse", "--verify", "--quiet", &remote]).is_some() {
+        return Some(remote);
+    }
+    git(repo, &["rev-parse", "--verify", "--quiet", base]).map(|_| base.to_string())
 }
 
 /// Read what the run left in the repository.
@@ -263,6 +378,29 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Run a git command for its effect, keeping git's own words when it fails.
+///
+/// The counterpart to [`git`], which answers questions and treats every failure as
+/// "no". These commands *do* something, and when one doesn't the reason is the whole
+/// message the user gets — "couldn't create a worktree" alone is not actionable,
+/// while git's `fatal:` line usually is.
+fn git_checked(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .map_err(|e| format!("couldn't run git: {e}"))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        format!("git {} failed", args.join(" "))
+    } else {
+        stderr
+    })
 }
 
 /// Run a script through a **login** shell, so it sees the `PATH` a terminal would.
@@ -345,10 +483,12 @@ mod tests {
 
     #[test]
     fn preflight_refuses_a_path_that_is_not_a_repository() {
-        let error = preflight(Path::new("/"), "TFE-1-x").expect_err("/ is not a repo");
+        let tree = Path::new("/no/such/worktree");
+        let error =
+            preflight(Path::new("/"), "TFE-1-x", tree, "main").expect_err("/ is not a repo");
         assert!(error.contains("git repository"), "got: {error}");
 
-        let error = preflight(Path::new("/no/such/place"), "TFE-1-x")
+        let error = preflight(Path::new("/no/such/place"), "TFE-1-x", tree, "main")
             .expect_err("a missing directory is not a repo");
         assert!(error.contains("isn't a directory"), "got: {error}");
     }
@@ -357,18 +497,143 @@ mod tests {
     fn preflight_refuses_a_branch_that_already_exists() {
         let repo = TempRepo::new("branch-exists");
         // `main` stands in for a previous run's branch — the check is the same.
-        let error = preflight(repo.path(), "main").expect_err("main already exists");
+        let error = preflight(repo.path(), "main", &repo.worktree("main"), "main")
+            .expect_err("main already exists");
         assert!(error.contains("already exists"), "got: {error}");
     }
 
     #[test]
-    fn preflight_refuses_a_dirty_tree() {
-        // The expensive mistake this prevents: someone's unrelated work in
-        // progress swept into an agent's commits, under a ticket number.
-        let repo = TempRepo::new("dirty");
+    fn preflight_allows_a_dirty_tree() {
+        // The check that used to be here is gone, and its absence is the feature:
+        // the agent works in a worktree of its own, so uncommitted work in the
+        // user's checkout is untouched — and having to stash before starting a
+        // ticket as an aside is what made the button not worth pressing.
+        let repo = TempRepo::new("dirty-is-fine");
         std::fs::write(repo.path().join("scratch.txt"), "work in progress").unwrap();
-        let error = preflight(repo.path(), "TFE-1-new").expect_err("the tree is dirty");
-        assert!(error.contains("uncommitted"), "got: {error}");
+        let tree = repo.worktree("TFE-1-new");
+        // Everything before the tool check has to pass; whether `claude` and `gh`
+        // are installed is not this test's business, so a failure here must not be
+        // about the tree.
+        if let Err(error) = preflight(repo.path(), "TFE-1-new", &tree, "main") {
+            assert!(
+                !error.contains("uncommitted"),
+                "a dirty tree must not refuse a run: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_refuses_a_leftover_worktree_and_says_how_to_remove_it() {
+        // Reachable whenever a previous run kept its checkout because it held
+        // uncommitted work, and then someone deleted the branch by hand. The
+        // message has to carry the path and the command — a refusal naming neither
+        // reads as the button being broken.
+        let repo = TempRepo::new("leftover");
+        let tree = repo.worktree("TFE-1-again");
+        std::fs::create_dir_all(&tree).unwrap();
+        let error = preflight(repo.path(), "TFE-1-again", &tree, "main")
+            .expect_err("the worktree is still there");
+        assert!(error.contains("worktree remove"), "got: {error}");
+        assert!(error.contains(&tree.display().to_string()), "got: {error}");
+    }
+
+    #[test]
+    fn preflight_refuses_a_base_it_cannot_find() {
+        let repo = TempRepo::new("no-base");
+        let error = preflight(
+            repo.path(),
+            "TFE-1-x",
+            &repo.worktree("TFE-1-x"),
+            "no-such-base",
+        )
+        .expect_err("there is no such base");
+        assert!(error.contains("no-such-base"), "got: {error}");
+    }
+
+    #[test]
+    fn a_worktree_is_independent_of_a_dirty_main_checkout() {
+        // The whole point of the change, asserted end to end against real git: the
+        // run gets its own checkout on its own branch, and the edit in progress in
+        // the user's tree is neither swept up nor disturbed.
+        let repo = TempRepo::new("independent");
+        std::fs::write(repo.path().join("README"), "hello\nedited by the user\n").unwrap();
+
+        let tree = repo.worktree("TFE-1-aside");
+        add_worktree(repo.path(), "TFE-1-aside", &tree, "main").expect("worktree is created");
+
+        assert!(tree.join("README").is_file(), "the worktree is a real checkout");
+        assert_eq!(
+            std::fs::read_to_string(tree.join("README")).unwrap(),
+            "hello",
+            "the worktree holds the committed content, not the user's edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("README")).unwrap(),
+            "hello\nedited by the user\n",
+            "the user's uncommitted edit survives untouched"
+        );
+        // Two checkouts, one repository — and the user is still on `main`.
+        assert_eq!(repo.head_branch(repo.path()), "main");
+        assert_eq!(repo.head_branch(&tree), "TFE-1-aside");
+    }
+
+    #[test]
+    fn a_clean_worktree_is_swept_up_and_a_dirty_one_keeps_itself() {
+        // One rule, expressed by never passing `--force`: git refuses to remove a
+        // tree with anything in it to lose. A run that pushed everything leaves
+        // nothing behind; a run that died holding work keeps its checkout so
+        // someone can look at it.
+        let repo = TempRepo::new("sweep");
+
+        let clean = repo.worktree("TFE-1-clean");
+        add_worktree(repo.path(), "TFE-1-clean", &clean, "main").expect("created");
+        assert!(remove_worktree(repo.path(), &clean), "a clean tree is removed");
+        assert!(!clean.exists());
+        // The commits live on the branch, so removing the checkout never loses work.
+        assert!(
+            git(repo.path(), &["rev-parse", "--verify", "--quiet", "TFE-1-clean"]).is_some(),
+            "the branch outlives its worktree"
+        );
+
+        let dirty = repo.worktree("TFE-2-dirty");
+        add_worktree(repo.path(), "TFE-2-dirty", &dirty, "main").expect("created");
+        std::fs::write(dirty.join("half-done.txt"), "the agent was mid-thought").unwrap();
+        assert!(!remove_worktree(repo.path(), &dirty), "a dirty tree is kept");
+        assert!(dirty.join("half-done.txt").is_file(), "and keeps its contents");
+
+        // Ignored build output must not count as work worth keeping, or a Rust
+        // repository strands a worktree on every single run.
+        let built = repo.worktree("TFE-3-built");
+        add_worktree(repo.path(), "TFE-3-built", &built, "main").expect("created");
+        std::fs::create_dir_all(built.join("target")).unwrap();
+        std::fs::write(built.join("target/artifact"), "compiled").unwrap();
+        assert!(
+            remove_worktree(repo.path(), &built),
+            "ignored files are not uncommitted work"
+        );
+
+        // Removing something already gone is a success, not an error — the caller
+        // asks for the tree to be absent, not for a removal to have happened.
+        assert!(remove_worktree(repo.path(), &built));
+    }
+
+    #[test]
+    fn a_worktree_wiped_by_hand_does_not_block_the_next_run() {
+        // Deleting the directory leaves git's record of it behind, and git refuses
+        // to add at a path that is "a missing but already registered worktree" —
+        // its own message names `prune` as the fix. `add_worktree` prunes first for
+        // exactly this, and without it a hand-deleted worktree poisons that path
+        // for good.
+        let repo = TempRepo::new("pruned");
+        let tree = repo.worktree("TFE-1-x");
+        add_worktree(repo.path(), "TFE-1-x", &tree, "main").expect("created");
+        std::fs::remove_dir_all(&tree).unwrap();
+
+        // A second attempt at the same ticket is a different branch at the same
+        // path, which is the shape this actually has in the app.
+        add_worktree(repo.path(), "TFE-1-x-again", &tree, "main")
+            .expect("the stale record was pruned");
+        assert!(tree.join("README").is_file());
     }
 
     #[test]
@@ -396,40 +661,66 @@ mod tests {
         assert!(nothing.describe().contains("never created"));
     }
 
-    /// A throwaway git repository with one commit on `main`.
+    /// A throwaway git repository with one commit on `main`, plus somewhere beside
+    /// it to put worktrees.
     ///
     /// Built rather than pointing the tests at this repository, which was the first
-    /// attempt and is wrong: `preflight` reports a dirty tree *before* it looks at
-    /// the branch, so the branch test passed or failed depending on whether the
-    /// person running it had edits open. A test whose result depends on the working
-    /// tree it's run from isn't testing what it claims to.
-    struct TempRepo(std::path::PathBuf);
+    /// attempt and is wrong: a test that creates worktrees and branches must not do
+    /// it in the tree it's being run from, and the old dirty-tree test passed or
+    /// failed depending on whether the person running it had edits open. A test
+    /// whose result depends on the working tree it runs in isn't testing what it
+    /// claims to.
+    ///
+    /// The repository is a *subdirectory* of the temp dir, with worktrees as its
+    /// siblings, so dropping this removes both — a worktree left outside would
+    /// survive the repository that registered it and litter `/tmp`.
+    struct TempRepo {
+        base: std::path::PathBuf,
+        repo: std::path::PathBuf,
+    }
 
     impl TempRepo {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
+            let base = std::env::temp_dir().join(format!(
                 "sacrament-work-{}-{name}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("temp dir");
-            let repo = Self(dir);
+            let _ = std::fs::remove_dir_all(&base);
+            let repo = base.join("repo");
+            std::fs::create_dir_all(&repo).expect("temp dir");
+            let repo = Self { base, repo };
             repo.git(&["init", "-b", "main"]);
             std::fs::write(repo.path().join("README"), "hello").unwrap();
+            // So the "ignored build output doesn't strand a worktree" case has
+            // something to ignore.
+            std::fs::write(repo.path().join(".gitignore"), "target/\n").unwrap();
             repo.git(&["add", "."]);
             repo.commit("first");
             repo
         }
 
         fn path(&self) -> &Path {
-            &self.0
+            &self.repo
+        }
+
+        /// Where a run's worktree goes: outside the repository, one directory per
+        /// branch, mirroring `paths::worktree_dir`.
+        fn worktree(&self, branch: &str) -> std::path::PathBuf {
+            self.base.join("worktrees").join(branch)
+        }
+
+        fn head_branch(&self, at: &Path) -> String {
+            git(at, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .expect("HEAD resolves")
+                .trim()
+                .to_string()
         }
 
         fn git(&self, args: &[&str]) {
             let ok = Command::new("git")
                 .args(args)
-                .current_dir(&self.0)
+                .current_dir(&self.repo)
                 .output()
                 .expect("git runs")
                 .status
@@ -454,7 +745,7 @@ mod tests {
 
     impl Drop for TempRepo {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_dir_all(&self.base);
         }
     }
 }

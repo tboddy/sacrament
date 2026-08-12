@@ -802,8 +802,64 @@ app does not embed an agent loop, it orchestrates the one already installed.** T
 whole feature is a prepared prompt, a shell tab, and a check afterwards.
 
 The flow: `Run` → pre-flight and ticket fetch on a background thread → a confirm
-dialog showing the verified plan → a shell tab in the repo running one line →
-the shell exits → the app reads the repository → alert, and the PR opens.
+dialog showing the verified plan → a **git worktree** created for the run → a shell
+tab in it running one line → the shell exits → the app reads the repository, and
+tidies the worktree away → alert, and the PR opens.
+
+**The agent never works in the checkout you are working in** (`work::add_worktree`,
+`paths::worktree_dir`). Every run gets a worktree of its own, branched from an
+up-to-date base, and its shell opens there rather than in the configured repository.
+
+This replaced a dirty-tree refusal in `preflight`, and the swap is the difference
+between a button that gets pressed and one that doesn't. Starting a ticket is
+supposed to be an *aside* from whatever you are already doing — which is exactly
+when the tree has edits in it, so the guard fired almost every time and the fix it
+demanded was to stash your own work to make room for an agent. The guard was right
+about the danger and wrong about the remedy: uncommitted work in the same tree an
+unattended agent is committing from would be swept into a pull request under a
+ticket number, and hard to unpick once pushed. A separate checkout removes the
+hazard rather than refusing in front of it.
+
+Four things about it:
+
+- **The refs are shared, so nothing downstream changed.** `git worktree` puts a
+  second working tree on one object store, so `work::verify` still asks the *main*
+  repository about the branch and `gh` still sees the same remote. That's why the
+  worktree is an addition to this feature rather than a rewrite of it.
+- **It's created after the dialog, never before** (`Message::JiraRunWorktree`). A
+  worktree is a branch *and* a directory, so making one during the pre-flight would
+  leave both behind every time someone pressed Cancel. `JiraPane::preparing` stays
+  set across it, because a fetch plus a checkout is seconds of nothing on screen and
+  the cell reading `Run` again would invite a second press.
+- **It lives in the cache directory, not the config one** (`paths::worktree_dir` →
+  `~/.cache/sacrament/sacrament2-worktrees/<branch>`), which is the one place this
+  app puts anything outside `~/.config`. A worktree is *derivable* — the commits are
+  on the branch, in the repository, and survive the directory — and it is large,
+  since the agent's own test run builds `target/` or `node_modules/` inside it. The
+  transcript stays under `~/.config` because it is the opposite on both counts: the
+  only record of what an unattended agent did.
+- **The prompt had to be told** (`jira::work_prompt`). It used to instruct
+  `git switch -c`, which now fails: the branch is already checked out. It also says
+  the checkout is fresh, so the agent installs dependencies instead of being baffled
+  by a missing `node_modules` the main checkout has.
+
+**A finished run's worktree is tidied away, unless there's something in it to lose.**
+`work::remove_worktree` never passes `--force`, and that single choice is the whole
+policy: plain `git worktree remove` deletes a clean tree and *refuses* one holding
+modified or untracked files. So a run that committed and pushed everything leaves
+nothing behind, and a run that died mid-thought keeps its checkout — with
+`report_run` naming the path and the command in the alert, since a directory nothing
+on screen has mentioned is one nobody will ever find. Verified rather than assumed:
+ignored files don't block it, so `target/` doesn't strand every worktree.
+
+Removing it never loses work. The commits are on the branch, in the shared object
+store, and the branch is left in place.
+
+An **aborted** run (tab closed) keeps its worktree deliberately, matching how it
+keeps its branch: the agent process is still being killed as the tab goes, and a run
+someone stopped by hand is the one they most want to look at. It's discovered again
+by `preflight`, which refuses a leftover worktree and prints the `git worktree
+remove` line for it.
 
 **The app dictates the branch name** (`jira::branch_name` — `TFE-954-kebab-summary`),
 and that is what makes the run checkable rather than merely started. Because the
@@ -847,10 +903,11 @@ everything around it, and removing any one of these changes the trade:
 |---|---|
 | Status not in `run_statuses` → no control at all | An agent turned loose on a ticket nobody has specified yet |
 | No repo configured for the project → no control at all | An agent working in the wrong tree |
-| `preflight` refuses a dirty tree | Someone's unrelated work in progress swept into the agent's commits |
+| The agent runs in a worktree of its own (`work::add_worktree`) | Your uncommitted work swept into an agent's commits — and having to stash it to start a ticket |
 | `preflight` refuses an existing branch, local or remote | Building on a previous run nobody remembers |
+| `preflight` refuses a leftover worktree | A second agent in the checkout a previous run kept |
 | `preflight` checks `gh auth status` | Ten minutes of work, then a login prompt at `gh pr create` |
-| One run per repo (`State::runs`) | Two agents editing and branching over each other |
+| One run per repo (`State::runs`) | Two test suites at once against one development database — worktrees separate the *git* state, not the ports and fixtures around it |
 | `JiraPane::preparing` covers pre-flight *and* the dialog | A second dialog for the same ticket, and two agents from two answers |
 | Confirm dialog, with `Show prompt` | A push and a PR from a pointer graze — and the prompt is readable first |
 | The PR is a draft | Unreviewed agent output in a colleague's queue |
@@ -912,13 +969,18 @@ the table above it, so a plain key written after it lands in `repos` instead.
 Deliberately **not** persisted: `State::runs` describes live agents, and a restored
 record would name shells that a restart already killed. The branch and any commits
 are in the repository, which is where the state that survives belongs. A restart
-re-spawns a plain shell in the repo directory — it does not restart the agent.
+re-spawns a plain shell in the worktree directory — it does not restart the agent,
+and it does not clean up: a run killed by a restart leaves its worktree, which
+`preflight` then refuses by name if the ticket is started again.
 
-**Untested end to end.** Everything pure is covered — branch names against invalid
-refs, the prompt's contents, `Outcome::describe` for each failure shape, `preflight`
-against a purpose-built temp repo — but no run has been driven against a live Jira
-instance and a real remote. `RUN_BASE` is `main` and `RUN_AGENT` is a constant; both
-are one-line changes.
+**Untested end to end.** Everything pure is covered, and the git half is now driven
+against real repositories — branch names against invalid refs, the prompt's contents,
+`Outcome::describe` for each failure shape, and against a purpose-built temp repo:
+`preflight`'s refusals, a worktree created beside a *dirty* main checkout leaving it
+untouched, a clean worktree removed while a dirty one keeps itself, ignored build
+output not counting as work, and a hand-deleted worktree not poisoning its path. What
+has still never been driven is a whole run against a live Jira instance and a real
+remote. `RUN_BASE` is `main` and `RUN_AGENT` is a constant; both are one-line changes.
 
 **Shell tabs made PTY identity dynamic.** `ShellKey { pane, serial }` replaced the
 fixed two-variant enum, and `subscription()` builds one `run_with(key, …)` per live
@@ -1881,8 +1943,9 @@ so v2 would restore v1's tabs and shells over its own, and both would then
 contend for one socket. `/tmp/sacrament2-$USER.sock` belonging to a binary called
 `sacrament` is the cost of not doing that.
 
-339 tests (`cargo test --workspace`): 116 in `core`, 223 in the gui — buffer
-mutation and undo, terminal reflow, the key map, fonts, block geometry, and
+346 tests (`cargo test --workspace`): 122 in `core`, 224 in the gui — buffer
+mutation and undo, terminal reflow, the key map, fonts, block geometry,
+`work`'s worktrees against real git repositories, and
 `theme_guard`. v1 has
 none, and getting any would mean standing up a `Buffer` first. Still untested and
 worth covering next, all pure functions: `git::parse_hunks`, `lint::parse_output`,

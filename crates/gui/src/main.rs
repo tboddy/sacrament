@@ -355,9 +355,17 @@ enum Message {
     JiraRunPrepared(Result<Box<RunPlan>, String>),
     /// The confirm dialog closed.
     JiraRunConfirmed(Box<RunPlan>, RunAnswer),
+    /// The run's worktree has been created — or couldn't be. Only sent for an
+    /// answer of `Start`, so nothing exists before the user has agreed to it.
+    JiraRunWorktree(Result<Box<RunPlan>, String>),
     /// A run's shell exited and its repository has been read. Carries the issue
-    /// key, because by then the run record is gone.
-    JiraRunFinished(String, Box<sacrament_core::work::Outcome>),
+    /// key, because by then the run record is gone, and the run's checkout when it
+    /// survived being tidied away — see `State::report_run`.
+    JiraRunFinished(
+        String,
+        Box<sacrament_core::work::Outcome>,
+        Option<KeptWorktree>,
+    ),
 }
 
 /// One pane's identity. Only `Shell` exists in the spike; `Editor` is the point
@@ -525,22 +533,42 @@ const RUN_BASE: &str = "main";
 /// **Unattended, by explicit choice.** The whole value of the button is that one
 /// click produces a pull request, and a run that stops to ask permission halfway
 /// through — in a tab nobody is watching — reads as a hang. What makes that
-/// acceptable is everything around it: `work::preflight` refuses to start in a
-/// dirty or already-branched tree, the confirm dialog shows the plan and offers
-/// the prompt to read first, the pull request is a draft, and `work::verify`
-/// reports what actually happened rather than what the agent claimed.
+/// acceptable is everything around it: the agent works in a **worktree of its own**
+/// and never enters the user's checkout, `work::preflight` refuses an
+/// already-branched repository, the confirm dialog shows the plan and offers the
+/// prompt to read first, the pull request is a draft, and `work::verify` reports
+/// what actually happened rather than what the agent claimed.
 const RUN_AGENT: &str = "claude --dangerously-skip-permissions";
 
 /// A ticket run in flight: which agent shell is working on what, and where.
 struct JiraRun {
     /// Issue key, e.g. `TFE-954`. Identifies the run everywhere the user sees it.
     key: String,
+    /// The repository the run belongs to — the user's own checkout, which the agent
+    /// never enters. Kept because it owns the refs: `work::verify` and
+    /// `work::remove_worktree` are both asked here, not in the worktree, and the
+    /// worktree may be gone by the time they are.
     repo: std::path::PathBuf,
+    /// The checkout the agent actually works in, created by `work::add_worktree`.
+    worktree: std::path::PathBuf,
     branch: String,
     /// The shell the agent is running in. Its exit is the run's completion signal.
     shell: ShellKey,
     /// Where this run's prompt and transcript are kept.
     dir: std::path::PathBuf,
+}
+
+/// A finished run's checkout that couldn't be tidied away, because the agent left
+/// uncommitted changes in it.
+///
+/// **Both paths, because removing it needs both.** `git worktree remove` is a
+/// command about a worktree that has to be *run in its repository* — you cannot
+/// stand inside a worktree and remove it — so an alert naming only the directory
+/// tells the user where the problem is and not how to end it.
+#[derive(Debug, Clone)]
+struct KeptWorktree {
+    repo: std::path::PathBuf,
+    worktree: std::path::PathBuf,
 }
 
 /// Everything decided before a run starts.
@@ -553,6 +581,9 @@ struct RunPlan {
     key: String,
     summary: String,
     repo: std::path::PathBuf,
+    /// Where the agent will work. Checked as free by the pre-flight, created only
+    /// after the dialog is answered — see `Message::JiraRunWorktree`.
+    worktree: std::path::PathBuf,
     branch: String,
     /// The generated instructions, on disk. Shown on request before starting, and
     /// read by the shell command below.
@@ -830,11 +861,27 @@ fn run_dir_for(branch: &str) -> Option<std::path::PathBuf> {
     sacrament_core::paths::run_dir(sacrament_core::APP_GUI, branch)
 }
 
+/// Where one run's *checkout* lives — the git worktree the agent works in.
+///
+/// Keyed by branch and derived in one function for the same reason `run_dir_for` is:
+/// the run creates it, and `report_run` has to name it again after the record has
+/// been dropped. Deliberately a different root from the transcript — see
+/// `paths::worktree_dir`.
+fn worktree_for(branch: &str) -> Option<std::path::PathBuf> {
+    sacrament_core::paths::worktree_dir(sacrament_core::APP_GUI, branch)
+}
+
 /// Everything that has to succeed before an agent is allowed to start.
 ///
 /// Blocking, and run on a thread-pool thread through `Task::perform` — it shells
 /// out to git several times and makes an HTTP request. Ordered so the cheap local
 /// checks refuse before the network is touched.
+///
+/// **It checks, and writes only what a Cancel can leave behind.** The prompt file is
+/// written here because an abandoned prompt in the run directory costs nothing; the
+/// *worktree* is not created here, because that is a branch and a checkout, and
+/// making one before the dialog is answered would leave both behind every time
+/// someone said no. See `Message::JiraRunWorktree`.
 ///
 /// The error is a sentence for an alert. Each one names what to do about it,
 /// because "the run can't start" with no reason is a button that appears broken.
@@ -847,7 +894,9 @@ fn prepare_run(
     use sacrament_core::jira;
 
     let branch = jira::branch_name(&key, &summary);
-    sacrament_core::work::preflight(&repo, &branch)?;
+    let worktree = worktree_for(&branch)
+        .ok_or_else(|| "Couldn't work out where to put this run's worktree.".to_string())?;
+    sacrament_core::work::preflight(&repo, &branch, &worktree, RUN_BASE)?;
 
     let Some(token) = sacrament_core::secret::lookup(
         JIRA_TOKEN_ENV,
@@ -877,6 +926,7 @@ fn prepare_run(
         key,
         summary: detail.summary,
         repo,
+        worktree,
         branch,
         command: run_command(&prompt_path),
         prompt_path,
@@ -921,12 +971,15 @@ fn confirm_run(plan: Box<RunPlan>) -> Task<Message> {
             "{}\n\n\
              Repository:  {}\n\
              Branch:      {} (from {RUN_BASE})\n\
+             Worktree:    {}\n\
              Pull request: draft, targeting {RUN_BASE}\n\n\
              Claude Code will run unattended in a shell tab and will commit, push \
-             and open the pull request without asking again.",
+             and open the pull request without asking again. It works in the \
+             worktree above, so the repository you have open is untouched.",
             plan.summary,
             plan.repo.display(),
             plan.branch,
+            plan.worktree.display(),
         ))
         .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
             "Start".into(),
@@ -1935,9 +1988,15 @@ impl State {
             ));
             return Task::none();
         };
-        // **One run per working tree.** Two agents in one checkout would edit,
-        // stage and branch over each other, and the damage isn't obvious until
-        // something is pushed.
+        // **One run per repository**, still — but for a different reason than
+        // before. Worktrees mean two agents no longer share a checkout, so they
+        // can't stage or branch over each other; what they do still share is
+        // everything *outside* git. Two runs in one repository would run its test
+        // suite twice at once, against the same development database, the same
+        // fixture files and the same ports, and a run that fails because another
+        // run was also running is the least debuggable failure this feature could
+        // produce. Lifting it is a one-line change if the repositories in play turn
+        // out not to care.
         if let Some(other) = self.runs.iter().find(|r| r.repo == repo) {
             self.alert(format!(
                 "{} is already running in {}. Wait for it to finish, or close its \
@@ -2000,12 +2059,17 @@ impl State {
         page.issues.iter().find(|i| i.key == key).cloned()
     }
 
-    /// Start the agent: a shell tab in the repository, running one command.
+    /// Start the agent: a shell tab in the run's worktree, running one command.
+    ///
+    /// **In the worktree, not the repository** — that one argument is what keeps the
+    /// run to itself. `work::add_worktree` has already created and checked it out by
+    /// the time this runs, so the shell opens straight into it and the agent has no
+    /// reason to go looking for the main checkout.
     fn begin_run(&mut self, plan: RunPlan) {
         // The bottom pane, always, rather than whichever pane has focus. A run is
         // something to keep an eye on, and a predictable place to look for it beats
         // one that depends on what was clicked last.
-        let shell_key = self.spawn_shell_in(PaneId::Bottom, Some(plan.repo.clone()));
+        let shell_key = self.spawn_shell_in(PaneId::Bottom, Some(plan.worktree.clone()));
         if let Some(shell) = self.shell_by_key(shell_key) {
             shell.on_attach = Some(plan.command.clone());
             // The tab reads `TFE-954` for the life of the run. Every run in a repo
@@ -2015,6 +2079,7 @@ impl State {
         self.runs.push(JiraRun {
             key: plan.key,
             repo: plan.repo,
+            worktree: plan.worktree,
             branch: plan.branch,
             shell: shell_key,
             dir: plan.dir,
@@ -2028,6 +2093,12 @@ impl State {
     /// the last moment it exists — whether the shell exited on its own or the user
     /// closed the tab to stop it. Losing the transcript on the second one would be
     /// backwards: a run someone aborted is the one they most want to read.
+    ///
+    /// **The worktree is deliberately not removed here**, so it survives an abort.
+    /// The same reasoning one step further: a run the user stopped by hand is one
+    /// whose half-finished state they want to look at, and the agent is still being
+    /// killed as this runs — so this is the wrong moment to delete the directory it
+    /// is writing into. `run_finished` removes it on the natural-exit path instead.
     ///
     /// `None` for every shell that isn't a run, which is nearly all of them.
     fn take_run(&mut self, shell: ShellKey) -> Option<JiraRun> {
@@ -2043,20 +2114,34 @@ impl State {
         Some(run)
     }
 
-    /// A run's shell exited on its own. Go and look at what it left in the repo.
+    /// A run's shell exited on its own. Go and look at what it left in the repo,
+    /// then tidy its worktree away.
     ///
     /// Deliberately *not* reached when the user closed the tab: `close_shell` takes
     /// the record first, so a run someone abandoned halfway is not reported as
-    /// though it had finished — its repository state is expected to be partial.
+    /// though it had finished — its repository state is expected to be partial, and
+    /// its worktree is left where it is for the same reason.
+    ///
+    /// **Verify before removing, and both in the background.** `verify` asks the main
+    /// repository, which owns the refs, so the order doesn't strictly matter — but
+    /// reading first and cleaning second means a change to either can't quietly make
+    /// the report describe a checkout that's already gone. Both shell out to git, and
+    /// removing a worktree is a directory tree's worth of deletion, so neither
+    /// belongs on the UI thread.
     fn run_finished(&mut self, shell: ShellKey) -> Option<Task<Message>> {
         let run = self.take_run(shell)?;
-        let (key, repo, branch) = (run.key, run.repo, run.branch);
+        let (key, repo, branch, worktree) = (run.key, run.repo, run.branch, run.worktree);
         Some(Task::perform(
             async move {
                 let outcome = sacrament_core::work::verify(&repo, &branch, RUN_BASE);
-                (key, Box::new(outcome))
+                // `remove_worktree` never forces, so this is `false` exactly when
+                // the agent left uncommitted work in it — which is the one case
+                // worth telling the user where to look.
+                let kept = (!sacrament_core::work::remove_worktree(&repo, &worktree))
+                    .then_some(KeptWorktree { repo, worktree });
+                (key, Box::new(outcome), kept)
             },
-            |(key, outcome)| Message::JiraRunFinished(key, outcome),
+            |(key, outcome, kept)| Message::JiraRunFinished(key, outcome, kept),
         ))
     }
 
@@ -2065,8 +2150,33 @@ impl State {
     /// Success and failure both get an alert, and both then open the thing worth
     /// looking at next — the pull request, or the transcript of what went wrong.
     /// An alert alone would leave the user with a message and nowhere to go.
-    fn report_run(&mut self, key: &str, outcome: &sacrament_core::work::Outcome) {
-        self.alert(format!("{key}\n\n{}", outcome.describe()));
+    ///
+    /// `kept` is the run's worktree when it survived being tidied away, meaning the
+    /// agent left uncommitted changes in it. Naming it — with the command to remove
+    /// it — is what stops a checkout sitting in the cache directory that nothing on
+    /// screen has ever mentioned, and it's the same message `preflight` will give if
+    /// the ticket is run again with it still there.
+    fn report_run(
+        &mut self,
+        key: &str,
+        outcome: &sacrament_core::work::Outcome,
+        kept: Option<&KeptWorktree>,
+    ) {
+        let worktree = kept.map(|kept| {
+            format!(
+                "\n\nIts worktree was kept, because there are uncommitted changes in \
+                 it:\n{}\n\nLook at them, then remove it with:\n\ngit -C {} worktree \
+                 remove {}",
+                kept.worktree.display(),
+                kept.repo.display(),
+                kept.worktree.display()
+            )
+        });
+        self.alert(format!(
+            "{key}\n\n{}{}",
+            outcome.describe(),
+            worktree.unwrap_or_default()
+        ));
         if let Some(pr) = &outcome.pr {
             open_url(&pr.url);
             return;
@@ -2891,29 +3001,62 @@ impl State {
                 open_url(&url);
             }
             Message::JiraStartRun(key) => return self.start_run(key),
-            // `preparing` deliberately stays set across the dialog — it's cleared
-            // when the dialog is answered, not when it opens.
+            // `preparing` deliberately stays set across the dialog, and past it for
+            // an answer of `Start` — it's cleared when the run either exists or
+            // definitely won't, never merely because a step finished.
             Message::JiraRunPrepared(Ok(plan)) => return confirm_run(plan),
             Message::JiraRunPrepared(Err(e)) => {
                 self.jira.preparing = None;
                 self.alert(e);
             }
             Message::JiraRunConfirmed(plan, answer) => {
-                self.jira.preparing = None;
                 match answer {
-                    RunAnswer::Start => self.begin_run(*plan),
+                    // `preparing` deliberately survives this arm: creating the
+                    // worktree is a fetch plus a checkout, which on a large
+                    // repository is seconds of nothing happening on screen. Left
+                    // cleared, the cell would go back to reading `Run` and invite a
+                    // second press that would find the branch it is halfway through
+                    // creating.
+                    RunAnswer::Start => {
+                        let plan = *plan;
+                        return Task::perform(
+                            async move {
+                                sacrament_core::work::add_worktree(
+                                    &plan.repo,
+                                    &plan.branch,
+                                    &plan.worktree,
+                                    RUN_BASE,
+                                )
+                                .map(|()| Box::new(plan))
+                            },
+                            Message::JiraRunWorktree,
+                        );
+                    }
                     RunAnswer::ShowPrompt => {
                         // Reading the prompt starts nothing — see
                         // `RunAnswer::ShowPrompt`.
+                        self.jira.preparing = None;
                         self.show_editor();
                         if let Err(e) = self.open_path(&plan.prompt_path, None, None, false) {
                             self.alert(e);
                         }
                     }
-                    RunAnswer::Cancel => {}
+                    // Nothing to undo: a Cancel is why the worktree isn't created
+                    // until the answer is `Start`.
+                    RunAnswer::Cancel => self.jira.preparing = None,
                 }
             }
-            Message::JiraRunFinished(key, outcome) => self.report_run(&key, &outcome),
+            Message::JiraRunWorktree(Ok(plan)) => {
+                self.jira.preparing = None;
+                self.begin_run(*plan);
+            }
+            Message::JiraRunWorktree(Err(e)) => {
+                self.jira.preparing = None;
+                self.alert(e);
+            }
+            Message::JiraRunFinished(key, outcome, kept) => {
+                self.report_run(&key, &outcome, kept.as_ref())
+            }
             Message::JiraLoaded(result) => {
                 self.jira.loading = false;
                 match result {
@@ -5650,6 +5793,22 @@ mod run_tests {
         assert_ne!(first, second);
         // Namespaced like everything else the app owns, so v1 can't collide.
         assert!(first.to_string_lossy().contains("sacrament2"));
+    }
+
+    #[test]
+    fn a_runs_worktree_is_per_branch_and_never_inside_the_repository() {
+        // Two properties, both load-bearing. Per branch, so a second attempt at a
+        // ticket gets its own checkout rather than finding the first one's. And
+        // *outside* every repository, which is the whole point: a worktree under the
+        // repo would be visible to its own tooling — searched by ripgrep, walked by
+        // cargo, and offered to git as something to commit.
+        let first = worktree_for("TFE-954-first-attempt").expect("a cache dir");
+        let second = worktree_for("TFE-954-second-attempt").expect("a cache dir");
+        assert_ne!(first, second);
+        assert!(first.to_string_lossy().contains("sacrament2"));
+        // And a different root from the transcript, which outlives it — see
+        // `paths::worktree_dir`.
+        assert_ne!(first, run_dir_for("TFE-954-first-attempt").expect("a config dir"));
     }
 
     #[test]

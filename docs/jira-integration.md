@@ -267,7 +267,7 @@ first — not a button that can be grazed with the pointer.
 | 1 — read-only dashboard | **built, untested against a live instance** | See "What step 1 landed" |
 | 2 — ticket detail + spec | **half built** | `fetch_issue` reads summary + description through v2, for the prompt. No Confluence, no detail view |
 | 3 — cheap writes | not started | Still nothing writes to Jira |
-| 4 — branch and link | **partly, differently** | The app *names* the branch (`jira::branch_name`) and the agent creates it. No remote issue link |
+| 4 — branch and link | **partly, differently** | The app names *and* creates the branch — `jira::branch_name`, then `work::add_worktree` checks it out in a worktree of the run's own. No remote issue link |
 | 5 — the button | **built, untested end to end** | See "What step 5 landed" |
 
 ## What step 1 landed
@@ -375,8 +375,8 @@ loop: it is a prepared prompt, a shell tab, and a check afterwards.
 | File | Contents |
 |---|---|
 | `core/src/jira.rs` | `repos` map + `repo_for`, `run_statuses` + `runnable`, `project_key`, `branch_name`, `IssueDetail` / `fetch_issue` / `parse_issue` (API **v2**), `work_prompt` |
-| `core/src/work.rs` | New. `preflight`, `verify`, `Outcome::describe`, `PullRequest` |
-| `core/src/paths.rs` | `run_dir` — `<app>-runs/<branch>/`, holding `prompt.md` and `transcript.txt` |
+| `core/src/work.rs` | New. `preflight`, `add_worktree`, `remove_worktree`, `verify`, `Outcome::describe`, `PullRequest` |
+| `core/src/paths.rs` | `run_dir` — `<app>-runs/<branch>/`, holding `prompt.md` and `transcript.txt`; `worktree_dir` — the run's checkout, under the *cache* directory |
 | `gui/src/term.rs` | `Terminal::transcript` — the whole grid plus scrollback as text |
 | `gui/src/main.rs` | `Run` column, `RunPlan` / `JiraRun` / `RunAnswer`, `prepare_run`, `confirm_run`, `begin_run`, `take_run`, `run_finished`, `report_run`; `Shell::on_attach` and `label_override` |
 
@@ -386,6 +386,25 @@ pull request opened in the browser at the end.
 
 ### Decisions taken while building
 
+- **Each run gets a git worktree of its own.** Added after the first version was
+  used: `preflight` refused to start whenever the configured repository had
+  uncommitted changes, which is most of the time, because the whole appeal of the
+  button is starting a ticket as an *aside* from what you are already doing. The
+  guard was right about the danger — your work in progress swept into an agent's
+  commits under a ticket number — and wrong about the remedy, which was to stash
+  your own work to make room for an agent. A worktree removes the hazard instead of
+  refusing in front of it, and costs almost nothing downstream: `git worktree` shares
+  the object store and refs, so `verify` still asks the main repository and `gh` still
+  sees the same remote.
+  - Created **after** the confirm dialog, not during the pre-flight: it is a branch
+    and a directory, so a Cancel would otherwise leave both behind.
+  - Kept under `~/.cache`, the only thing this app puts outside `~/.config`. A
+    worktree is derivable (the commits are on the branch) and large (the agent's own
+    test run builds in it). The transcript is neither, and stays put.
+  - Removed when the run ends, **never with `--force`** — so git itself decides:
+    a clean tree goes, a tree holding uncommitted work stays and the alert says
+    where it is. Ignored files don't count, or `target/` would strand every one.
+  - The prompt had to be told. It used to instruct `git switch -c`, which now fails.
 - **Only a ready-to-build status offers a run** (`run_statuses`, default
   `Specified` / `New`). Configurable rather than fixed for the same reason this
   document already gives about JQL: status names are per-project. `statusCategory`
@@ -415,16 +434,19 @@ pull request opened in the browser at the end.
   exit is reported, though — `close_shell` takes the record first.
 - **`JiraPane::preparing` spans the dialog, not just the fetch.** Between the two
   there is no run record and nothing else says a start is under way, so a second
-  press would open a second dialog and answering both would put two agents in one
-  working tree.
+  press would open a second dialog and answering both would put two agents on one
+  ticket. It now spans the worktree creation too, which is a fetch plus a checkout
+  and therefore the longest silent stretch in the flow.
 
 ### Against the three hard problems this document recorded
 
 - *"Nothing in step 5 is reversible by the app."* The confirm dialog shows a
-  **verified** plan — the branch doesn't exist, the tree is clean, `gh` is
-  authenticated, the ticket was fetched — and its third button opens the generated
-  prompt as an editor tab, so the specification handed to an unattended agent can be
-  read before agreeing to it.
+  **verified** plan — the branch doesn't exist, the worktree path is free, the base
+  resolves, `gh` is authenticated, the ticket was fetched — and its third button opens
+  the generated prompt as an editor tab, so the specification handed to an unattended
+  agent can be read before agreeing to it. The one thing that *is* reversible is now
+  reversed automatically: the run's checkout is removed when it ends, unless it holds
+  uncommitted work.
 - *"Seven steps means six places to die."* `verify` reports the state actually
   found rather than a pass/fail. What is **not** built is the idempotence half:
   there is no resuming a partial run, and re-running is refused because the branch
@@ -442,7 +464,15 @@ pull request opened in the browser at the end.
 - No run record surviving a restart, and no resume.
 - No preview-environment URL — the PR page is what comes back.
 - No second run queued behind a live one; it's refused, not queued.
-- **Untested end to end.** Everything pure is covered by tests — branch names
-  against invalid refs, the prompt's contents, `Outcome::describe` for each failure
-  shape, `preflight` against a purpose-built temp repo — but no run has been driven
-  against a live Jira instance and a real remote.
+- **One run per repository, still.** Worktrees make two agents safe as far as *git*
+  is concerned, but they still share everything around it — one development database,
+  one set of fixture files, one set of ports. Two test suites at once would produce
+  the least debuggable failure this feature could have. It's a one-line change if the
+  repositories in play turn out not to care.
+- **Untested end to end.** Everything pure is covered by tests, and the git half now
+  runs against real repositories — branch names against invalid refs, the prompt's
+  contents, `Outcome::describe` for each failure shape, and against a purpose-built
+  temp repo: `preflight`'s refusals, a worktree created beside a dirty main checkout
+  leaving it untouched, the clean/dirty removal split, ignored build output not
+  counting as work, and a hand-deleted worktree not poisoning its path. No whole run
+  has been driven against a live Jira instance and a real remote.

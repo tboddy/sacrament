@@ -443,12 +443,17 @@ pub fn parse_issue(body: &str) -> Result<IssueDetail, String> {
 /// with no UI in it, and because it's the part most worth testing: the prompt is
 /// the entire specification handed to something that will push code.
 ///
-/// Three properties it has to keep:
+/// Four properties it has to keep:
 ///
 /// - **The branch and base are stated, not left to judgement.** The app has already
 ///   committed to them — `preflight` refused if the branch existed and `verify`
 ///   will look for a PR on exactly this branch. An agent that picks its own name
 ///   leaves the app unable to check its work.
+/// - **The branch already exists, and the prompt says so.** The run starts in a git
+///   worktree the app created ([`crate::work::add_worktree`]), already checked out
+///   on `branch`. This used to instruct a `git switch -c`, which now fails —
+///   telling the agent to do something impossible costs it a confused detour before
+///   it works out where it is.
 /// - **The PR is a draft.** A run nobody watched must not land in a colleague's
 ///   review queue on its own.
 /// - **It never asks a question.** The run is unattended; a prompt waiting for an
@@ -475,17 +480,21 @@ pub fn work_prompt(detail: &IssueDetail, branch: &str, base: &str, ticket_url: &
          \n\
          ## What to do\n\
          \n\
-         1. Read this repository's own conventions first — its CLAUDE.md, its \
+         1. You are **already on the branch `{branch}`**, in a git worktree of its \
+            own that was created for this run from an up-to-date `{base}`. Do not \
+            create or switch branches, and do not run `git worktree` yourself.\n\
+         2. This worktree is a fresh checkout: dependencies and build artifacts are \
+            absent even where the main checkout has them. Install what the \
+            repository needs before you run its tests.\n\
+         3. Read this repository's own conventions first — its CLAUDE.md, its \
             existing code — and follow them over any habit of your own.\n\
-         2. Create the branch `{branch}` from an up-to-date `{base}`:\n\
-            `git fetch origin && git switch -c {branch} origin/{base}`\n\
-         3. Do the work the ticket asks for, and only that. Leave unrelated \
+         4. Do the work the ticket asks for, and only that. Leave unrelated \
             problems you notice alone; mention them in the PR body instead.\n\
-         4. Run the repository's tests and linters, and get them passing.\n\
-         5. Commit with a message that explains why, not just what. Reference \
+         5. Run the repository's tests and linters, and get them passing.\n\
+         6. Commit with a message that explains why, not just what. Reference \
             {key}.\n\
-         6. Push: `git push -u origin {branch}`\n\
-         7. Open a **draft** pull request:\n\
+         7. Push: `git push -u origin {branch}`\n\
+         8. Open a **draft** pull request:\n\
             `gh pr create --draft --base {base} --title \"{key} {summary}\" --body \"...\"`\n\
             The body should say what changed, how you verified it, and link \
             {ticket_url}.\n\
@@ -497,6 +506,9 @@ pub fn work_prompt(detail: &IssueDetail, branch: &str, base: &str, ticket_url: &
          - Do not force-push, do not rewrite existing history, and do not merge \
            anything.\n\
          - Do not touch any branch other than `{branch}`.\n\
+         - This worktree shares the repository's history, remote and configuration, \
+           so `git`, `gh` and pushing all behave normally. Someone else is working \
+           in the main checkout — stay in this directory and leave theirs alone.\n\
          - The pull request must be a draft. It is reviewed by a person before it \
            goes anywhere.\n\
          - If the ticket turns out to be unworkable, stop and leave a clear \
@@ -1048,6 +1060,10 @@ mod tests {
         // The run is unattended, so the prompt has to say so — otherwise a
         // clarifying question just sits there looking like a hang.
         assert!(prompt.contains("unattended"));
+        // The branch is already checked out in the run's own worktree, so telling
+        // the agent to create it is an instruction that now fails.
+        assert!(prompt.contains("already on the branch"), "got: {prompt}");
+        assert!(!prompt.contains("switch -c"), "got: {prompt}");
     }
 
     #[test]

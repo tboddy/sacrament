@@ -50,6 +50,26 @@ pub fn run_dir(app: &str, name: &str) -> Option<PathBuf> {
     Some(config_dir()?.join(format!("{app}-runs")).join(name))
 }
 
+/// `$XDG_CACHE_HOME/sacrament/<app>-worktrees/<name>/` — the checkout one ticket
+/// run works in, so it never touches the tree the user is working in.
+///
+/// **Cache, not config, and the distinction is the point.** Everything else here
+/// lives under the config directory because it is state the app owns and cannot
+/// reproduce — a session, a scratchpad, a transcript. A worktree is the opposite
+/// on both counts: it is *derivable* (the commits live on the branch, in the
+/// repository's own object store, and survive the directory being deleted) and it
+/// is *large* — a full checkout, plus whatever `target/` or `node_modules/` the
+/// agent's own test run builds inside it. Putting gigabytes of build output under
+/// `~/.config` would also feed it to anything that syncs or backs that directory
+/// up.
+///
+/// Keyed by branch, like [`run_dir`], and safe to key that way because the branch
+/// name begins with the project key and `[jira.repos]` maps one project key to one
+/// repository — so two runs cannot want the same directory in different trees.
+pub fn worktree_dir(app: &str, name: &str) -> Option<PathBuf> {
+    Some(cache_dir()?.join(format!("{app}-worktrees")).join(name))
+}
+
 /// `$XDG_CONFIG_HOME/sacrament/<app>-scratchpad.txt` — the Scratchpad section's
 /// one permanent document.
 ///
@@ -83,6 +103,18 @@ fn config_dir() -> Option<PathBuf> {
     Some(base.join("sacrament"))
 }
 
+/// The XDG cache root, for things the app can rebuild — currently only worktrees.
+///
+/// `~/.cache` on macOS is not an Apple convention, but neither is `~/.config`, and
+/// this app already chose the XDG layout; a second scheme for one directory would
+/// be worse than being consistently unconventional.
+fn cache_dir() -> Option<PathBuf> {
+    let base = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("sacrament"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +135,23 @@ mod tests {
         assert_ne!(socket_path(crate::APP_TUI), socket_path(crate::APP_GUI));
         assert_ne!(session_path(crate::APP_TUI), session_path(crate::APP_GUI));
         assert!(session_path(crate::APP_GUI).unwrap().to_string_lossy().contains("sacrament2"));
+    }
+
+    #[test]
+    fn a_worktree_is_a_cache_and_a_transcript_is_not() {
+        // The two live under different roots on purpose: the transcript is the only
+        // record of what an unattended agent did, and the worktree is a checkout
+        // that can be recreated from the branch. Landing a full checkout — and the
+        // build output the agent's own test run leaves in it — under the config
+        // directory is what this asserts against.
+        let tree = worktree_dir(crate::APP_GUI, "TFE-954-fix-it").expect("resolves");
+        let run = run_dir(crate::APP_GUI, "TFE-954-fix-it").expect("resolves");
+        assert!(tree.to_string_lossy().contains(".cache"), "got: {}", tree.display());
+        assert!(run.to_string_lossy().contains(".config"), "got: {}", run.display());
+        assert!(tree.ends_with("TFE-954-fix-it"));
+        assert_ne!(
+            worktree_dir(crate::APP_TUI, "TFE-1-x"),
+            worktree_dir(crate::APP_GUI, "TFE-1-x")
+        );
     }
 }
