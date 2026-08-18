@@ -63,6 +63,20 @@ says otherwise, and is accurate for it. Treat it as the spec to port from,
 including the "Dead ends and sharp edges" section — that's the list of things
 *not* to carry forward.
 
+### Companion documents (`docs/`)
+
+This file is the map. Four subsystems keep their full write-ups beside it, because
+each is long and each is mostly a list of bugs that were diagnosed once and are
+expensive to rediscover. **A summary here always points at the doc; the doc is the
+authority.**
+
+| doc | covers |
+|---|---|
+| `docs/gui-rendering.md` | `grid_view.rs`, `blocks.rs`, `term.rs`, `pty.rs` — pixel snapping, block geometry, terminal reflow, shell spawning and sizing, mouse gestures |
+| `docs/gui-chrome.md` | tab strips, markers, drag-reorder, pane chrome and the divider — and the approaches that were tried and failed at scale 1 |
+| `docs/jira-runs.md` | the Jira dashboard and the Run button, including the guard-rail table for unattended runs |
+| `docs/jira-integration.md` | the forward-looking build plan the Jira work came from |
+
 ### v2 spike (crates/gui)
 
 Deliberately a spike, not a foundation: it exists to answer whether iced can host
@@ -181,215 +195,27 @@ editor buffer logic is work, not risk; it ports from a known-good v1.
   inside the text `Paragraph`, which forced `render_gutter`, `gutter_width`, and
   the click hit-test to agree on column arithmetic by hand. As a widget, iced's
   layout owns the width and that whole class of drift is gone.
-- `grid_view.rs` — the custom `iced::advanced::Widget`. Two decisions carry the
-  performance: **run batching** (adjacent cells sharing fg+flags coalesce into
-  one `fill_text`, so a screen costs tens of draw calls instead of thousands —
-  the same trick as v1's `build_display_line`) and **`Shaping::Basic`** (no font
-  fallback, no complex-script shaping; we control the font, and iced documents
-  `Advanced` as expensive). Cell metrics are *measured* from the font once via
-  `Paragraph::min_bounds` over a repeated glyph, not derived from an assumed
-  monospace ratio, because every position downstream (background quads, cursor,
-  eventual mouse hit-testing) is computed from them.
-
-  **Every drawn position goes through `col_x` / `row_y`, which round.** Neither
-  the advance (`size * 0.537`) nor the row pitch (`size * line_height`) is a whole
-  number of pixels at any usable size, so a cell boundary lands mid-pixel — and
-  two shapes meeting there each contribute partial coverage, which source-over
-  composites *sequentially* rather than summing: `0.5 + 0.5(1 - 0.5)` is 0.75, so
-  a quarter of the background shows through as a hairline. At scale 1 there is no
-  supersampling to hide it, and because the fractional part accumulates across the
-  grid it appears in slow bands rather than uniformly, which reads as a rendering
-  glitch rather than as arithmetic.
-
-  Rounding a **shared** boundary fixes it by construction: cell `k`'s right edge
-  and cell `k+1`'s left edge are the same expression, so they cannot disagree.
-  Cells come out 7px or 8px wide instead of a uniform 7.5. That is invisible for a
-  solid fill, and for glyphs it's an improvement — a glyph on a fractional
-  baseline is blurry at 1x.
-
-  **The `bounds` handed to `fill_text` is the run's natural advance width, not the
-  distance between its snapped ends.** Snapping can leave that distance a pixel
-  short of the content, and a text bounds a pixel short **drops the last glyph
-  onto a second line inside the same text object** — which lands a row down the
-  screen. `Wrapping::None` does not prevent it. The symptom is unmistakable once
-  seen and baffling until then: `struct Foo` renders as `struc  Fo` with a stray
-  `t` on the line below, on roughly half the runs, so a syntax-highlighted screen
-  comes apart into confetti. A pixel of slack is added on top: with left/top
-  alignment and no wrapping this bounds governs only overflow, and the real
-  clipping is `clip`.
-- `blocks.rs` — **U+2580..259F are drawn as rectangles, not glyphs.** The seam
-  above is worst where it matters most: a run of `█` is *supposed* to be one
-  unbroken bar, and no font can make it one, because the gap is between the glyphs
-  rather than inside them. Envy Code R already gives its blocks a 6-unit
-  horizontal overhang for exactly this and it isn't close to enough. Every serious
-  terminal (Alacritty, kitty, WezTerm, Ghostty) draws these procedurally.
-
-  `blocks::rects(c)` is pure geometry — fractions of a cell — and `blocks::edge`
-  maps a fraction onto a pair of already-snapped boundaries, leaving the endpoints
-  untouched so an edge that *is* a cell boundary keeps the exact value its
-  neighbour will use. Four things about it:
-
-  - **Snapping is what removes the seam; merging is only an optimisation.**
-    Adjacent cells abut exactly whether or not they're coalesced, so
-    `merges_horizontally` exists to turn an 80-cell bar into one quad, not to make
-    it correct. It answers `Some` only for a single full-width rect, since that's
-    the only shape that tiles into one rectangle.
-  - **The shades `░▒▓` (U+2591..2593) stay glyphs, deliberately.** They're 25/50/75%
-    stipple, so a rect version needs either a real dot pattern or a blended
-    colour — and a blend is a colour the user's `[theme]` doesn't contain, which
-    `theme_guard` fails on. They also seam far less visibly, not being solid.
-  - **Returning `Some` is the run-breaker.** The text pass skips any cell with
-    rects, and because extending a run requires contiguous columns, skipping breaks
-    the run for free — the same mechanism blanks already rely on.
-  - **The caret redraws rects, not a glyph.** Reverse video over a block means
-    painting its shape back in `background`; drawing the glyph instead would lose
-    the shape, and drawing nothing would leave a solid cursor block.
-
-  A thin part of a small cell can round to zero, so every quad is floored at 1px —
-  a vanished eighth is worse than one drawn a pixel wide. Tests are pure geometry:
-  `▀`+`▄` tile to exactly `█`, the eighths step evenly to 1.0, no character's rects
-  overlap or leave the cell, and `right(k) == left(k+1)` for a fractional advance.
-
-  Free with it: fonts that lack these glyphs now render them correctly anyway
-  (Envy Code R covers only 48 of the 160 codepoints in U+2500..259F). **Not**
-  covered — box drawing U+2500..257F, which still seams at its joins, and braille
-  U+2800..28FF.
-- `term.rs` — `alacritty_terminal::Term` replacing v1's `vt100::Parser`. More of
-  the VT spec, damage tracking, and `renderable_content()` already applies the
-  scrollback display offset.
-
-  **Shell selection uses alacritty's own `Selection`**, not a hand-rolled one, and
-  that's load-bearing: it works in *grid* coordinates, so a selection survives
-  scrolling, and `SelectionType::{Semantic, Lines}` give word and line selection
-  for free on double and triple click. `selection_to_string()` handles the grid
-  walk including wrapped lines and scrollback. `grid_point` converts a viewport
-  cell to a grid `Point` by subtracting `display_offset` — the one place the two
-  coordinate systems meet.
-
-  `grid_point` clamps the row to `last_content_row()`, so dragging into the blank
-  region below a short prompt stops at the content instead of selecting a
-  screenful of nothing — matching the editor, where `visible_rows` simply stops at
-  the last line. A terminal grid is always full-height, so unlike the editor there
-  is no natural end of content to fall off; it has to be found.
-
-  `Size::total_lines()` returns `screen_lines()`, mirroring `alacritty_terminal`'s
-  own `TermSize`. Reporting `rows + SCROLLBACK` there double-counts, since
-  scrollback depth is configured on `Term` via `Config::scrolling_history`.
-
-  **`Ctrl+C` in a shell must stay SIGINT**, which the Cmd-only binding scheme
-  gives for free: nothing in the app claims plain `Ctrl` at all, so copying is
-  `Cmd+C` and every control code reaches the PTY untouched. See "Keybindings".
-
-  **`Shift+click` opens a URL** (`Terminal::url_at` → `open_url`), the terminal
-  convention, and it falls through to a normal selection when there's no URL under
-  the pointer so the gesture is never dead. Three things it gets right:
-
-  - **It reads the whole logical line, not the screen row.** A URL long enough to
-    be worth clicking is exactly the kind that wraps, so scanning one row would
-    find `https://example.com/a` and miss the `/b/c` that continued below.
-    `WRAPLINE` on a row's last cell joins them, and the walk follows it both ways.
-  - **Only `http`/`https` are ever returned, and that's a security boundary.**
-    macOS `open` launches a registered handler for *any* scheme, and terminal
-    output is routinely attacker-influenced — any file you `cat`, any repo you
-    clone. The allowlist means the worst a hostile line can do is open a web page.
-    `file://`, `vscode://` and friends are refused, with a test pinning it.
-  - **It does not use `grid_point`'s row clamping.** That clamp is right for a drag
-    (pulling below a short prompt should stop at the content) and wrong here: it
-    made a click on empty space resolve to the last line's link.
-
-  Trailing sentence punctuation and wrapping brackets are peeled off the candidate
-  — `see https://example.com/x.` must not include the full stop — but only from the
-  *end*, since `?`, `=` and `#` are ordinary inside a query string.
-
-  **Modifier state is tracked in `GridView::State`**, because iced's
-  `mouse::Event::ButtonPressed` carries no modifiers; a shift-click is only
-  recognisable by remembering the last `keyboard::Event::ModifiersChanged`. That's
-  why `GridMouse::Press` carries `shift`.
-- `pty.rs` — the non-obvious plumbing. `Subscription::run_with` takes a bare
-  `fn(&D) -> S` with no captures, so the PTY must be built *inside* the stream,
-  which leaves the app with no way to write to it. The stream's first item
-  (`Event::Attached`) therefore hands a `Handle` back out. Reader bytes cross the
-  thread→async boundary via `futures::channel::mpsc::unbounded`, whose receiver
-  *is* a `Stream` — so output is genuinely push-driven, unlike v1's
-  `event::poll(20ms)`.
-
-  **The shell is not spawned until the real pane size is known.** `openpty` runs,
-  `Event::Attached` hands the input side out, and only after the first
-  `Msg::Resize` arrives (or `SIZE_WAIT` elapses) does `spawn_command` run.
-
-  This is not tidiness — spawning first is visibly broken. The grid can only
-  report its size after layout, which is after the PTY exists, so the shell drew
-  its prompt at the 24×80 placeholder and then took a `SIGWINCH`. zsh's redraw
-  scattered fragments of the prompt across the row and left a reverse-video `%`
-  behind (its partial-line marker). Writes arriving before the size are stashed and
-  replayed rather than dropped.
-
-  The bound on the wait matters too: an unconditional wait would hang forever if a
-  size never came. A shell at the placeholder size beats no shell.
-
-  **The measured size is a property of the pane, not of the shell**
-  (`ShellPane::size`), and that is what makes the deferred spawn work for more
-  than one tab. `view` builds a `GridView` for `active()` only, so an *inactive*
-  tab never lays out and never reports a size — so on a restored session its PTY
-  waited out `SIZE_WAIT` and spawned zsh at 24x80, which is what the tab was still
-  showing when you switched to it. Measured on a 5-shell session: only the 2 active
-  shells were sized before spawn.
-
-  `GridResized` therefore applies the size to **every shell in the reporting
-  shell's pane**, and `Event::Attached` reads the size from the pane rather than
-  from its own terminal. Tabs in a pane all share the pane's geometry, so one
-  measurement is the correct answer for all of them. This replaced `Shell::sized`,
-  which asked a per-shell question that only the active shell could answer.
-
-  **A new tab must be *constructed* at the pane's size too** (`Shell::in_dir`'s
-  `size`), and that is a third distinct hole rather than a restatement of the two
-  above. `GridView` publishes a size only when it **changes** (`State::reported`),
-  and iced reuses one widget state for a pane's grid however many tabs come and
-  go — so a tab added to an already-measured pane receives no `GridResized` at
-  all, ever. Its PTY is still told the truth by `Event::Attached`, and that gap is
-  exactly what's visible: zsh writes `COLUMNS` cells into a grid still 24x80, they
-  wrap, and its reverse-video partial-line marker (`%`, from `PROMPT_SP`) is
-  stranded on the row above the prompt. Reproducible by opening a shell tab in any
-  pane wider than 80 columns, which is every pane on a large display.
-
-  Note the marker is the *honest* rendering of a wrapped line, not a stray glyph —
-  which is why it looks like the spawn-ordering bug this file records under
-  `pty.rs` and isn't one. `shell_tests` pins the constructor from both directions.
-
-  **The shell is spawned as a *login* shell** —
-  `CommandBuilder::new_default_prog()`, which resolves `$SHELL` (falling back to
-  the password database rather than `/bin/sh`) and sets argv0 to `-zsh`, the
-  leading dash being how a shell knows. This is what every terminal emulator does,
-  and getting it wrong is why `docker`, `brew` and MacPorts couldn't be found:
-  without the dash zsh reads `~/.zshrc` and nothing else — no `/etc/zprofile`, so
-  `/usr/libexec/path_helper` never runs and `/etc/paths.d` is never read, and no
-  `~/.zprofile`, where `brew shellenv` and credential helpers usually live.
-
-  **It's invisible when the app is started from a terminal**, which is why it
-  survived the whole spike: the full `PATH` is inherited from the launching shell,
-  so only a Dock launch shows it — there the parent environment is launchd's
-  `/usr/bin:/bin:/usr/sbin:/sbin`. Measured, Dock-launched: the non-login `PATH`
-  had no `/usr/local/bin` (where Docker Desktop puts its CLI *and*
-  `docker-credential-osxkeychain`) and no `/opt/local/bin`; the login one had both,
-  plus everything `path_helper` contributes. `ps -axo comm` is the quick check —
-  the children should read `-zsh`, not `/bin/zsh`. v1 never had the bug because it
-  only ever ran inside an emulator.
-
-  **Two shells means two subscriptions**, distinguished by hashing a `ShellId`
-  through `run_with` — plain `run` would identify them by function pointer alone
-  and collapse both panes onto one PTY. Three details there cost real time and
-  will again if undone:
-
-  1. `stream` returns `UnboundedReceiver<..>` **concretely**, not `impl Stream`.
-     `run_with` wants `fn(&D) -> S` for a single `S`, and an opaque return type
-     can't unify with that higher-ranked signature; the error is an unhelpful
-     "one type is more general than the other".
-  2. Events are tagged with their `ShellId` **inside** the stream, not by
-     `.map()` on the subscription — `Subscription::map` panics at compile time on
-     a capturing closure, and one that captures the id captures.
-  3. Verify two PTYs actually spawned by counting child processes, not by looking
-     at the window. Subscription deduplication is silent: you get one shell in two
-     panes and it looks like a rendering bug.
+- `grid_view.rs` — the custom `iced::advanced::Widget`. **Run batching** (adjacent
+  cells sharing fg+flags coalesce into one `fill_text`) and **`Shaping::Basic`**
+  are what carry the performance; cell metrics are *measured* from the font once,
+  never derived from an assumed monospace ratio. Every drawn position goes through
+  `col_x` / `row_y`, **which round** — at scale 1 a cell boundary on a fractional
+  pixel composites into a visible hairline seam.
+- `blocks.rs` — **U+2580..259F are drawn as rectangles, not glyphs.** That seam is
+  worst exactly where it matters most: a run of `█` is *supposed* to be one
+  unbroken bar and no font can make it one, because the gap is between the glyphs
+  rather than inside them. The shades `░▒▓` stay glyphs, deliberately.
+- `term.rs` — `alacritty_terminal::Term` replacing v1's `vt100::Parser`. Shell
+  selection uses alacritty's own `Selection`, which works in *grid* coordinates,
+  so a selection survives scrolling and word/line selection come for free.
+  `Shift+click` opens a URL, allowlisted to `http`/`https` — a security boundary,
+  since terminal output is routinely attacker-influenced.
+- `pty.rs` — the non-obvious plumbing. `Subscription::run_with` can't capture, so
+  the PTY is built *inside* the stream and hands a `Handle` back out; reader bytes
+  cross the thread→async boundary over an `unbounded` channel, so output is
+  genuinely push-driven. **The shell is not spawned until the real pane size is
+  known**, and it is spawned as a **login *and* interactive** shell — without
+  that, `brew`, `docker` and MacPorts are unfindable from a Dock launch.
 - `palette.rs` — where v1's "terminal palette is the theme" rule is formally
   retired. The 16 slots now come from `[theme]` in `config.toml`, and indexed
   16-255 plus truecolor resolve faithfully instead of collapsing to the default
@@ -401,97 +227,21 @@ editor buffer logic is work, not risk; it ports from a known-good v1.
   `SACRAMENT_METRICS`, mirrored to stderr, never drawn. It's diagnostics, not
   UI.
 
-**Grid and shell resize in lockstep, every frame — no throttling.** Both
-`Terminal::resize` and the PTY `SIGWINCH` happen in the same `GridResized` handler.
-
-There was a debounce here and it was removed, which is worth recording because the
-reasoning looked sound and was wrong twice over:
-
-1. It was added to fix prompt fragments appearing after a shrink/grow drag, on the
-   theory that a `SIGWINCH` per frame meant the shell's redraw for one width landed
-   after we'd moved to another. Plausible, and real terminals do resize per frame
-   without corrupting — which should have been the tell.
-2. Debouncing *both* the reflow and the `SIGWINCH` made the text visibly trail the
-   splitter. Debouncing only the `SIGWINCH` fixed the lag but caused a *new*
-   symptom: fragments of adjacent lines flickering at narrow widths. That one isn't
-   a rendering bug at all — it's the honest state of a grid that has reflowed while
-   the shell still believes the old width. The delay *created* the artifact it was
-   supposed to prevent.
-
-The original corruption is most likely explained by the two spawn-ordering fixes
-made around the same time (deferred spawn, and `Attached` not pushing a placeholder
-size), not by resize frequency.
-
-Four tests in `term.rs` now cover this ground, and a regression should start by
-checking which of them breaks:
-
-- `content_survives_shrink_then_grow` / `content_survives_a_drag_sized_sequence` —
-  reflow down to 4 columns and back is lossless.
-- `a_resize_never_invents_characters` — renders through the real `TerminalSource` at
-  every width from 2 up, *including* layout widths that disagree with the
-  terminal's own, and asserts nothing appears that wasn't written.
-- `no_row_mixes_content_from_two_source_lines` — feeds `AAA`/`BBB`/`CCC` lines and
-  asserts no rendered row ever contains two of them. Written specifically because
-  the previous test used a single line of content and so could not detect cross-row
-  leakage at all.
-
-Note what these deliberately do **not** assert: that everything written stays
-visible. Narrowing wraps lines, and rows that no longer fit move into scrollback
-above the viewport, so seeing less mid-drag is correct. An earlier version of
-`a_resize_never_invents_characters` failed on exactly that, and the test was wrong,
-not the code.
+**Grid and shell resize in lockstep, every frame — no throttling.** A debounce
+was added here and removed; it *created* the artifact it was meant to prevent.
 
 **Mouse gestures** come out of the grid as one `GridMouse` enum
 (`Press{row,col,count}` / `Drag` / `Release` / `Scroll`) rather than four
-callbacks, since the app has to correlate them as a gesture anyway. Four details
-that matter:
+callbacks, since the app has to correlate them as a gesture anyway. Scroll
+deltas leave the widget in **pixels** and the app draws the sub-row remainder,
+which is what makes scrolling smooth.
 
-- **Scrolling leaves the widget in pixels, and the app draws the remainder.**
-  `GridMouse::Scroll` carries `dy` in **pixels**; the app accumulates it, spends
-  whole rows on the buffer or terminal, and keeps the sub-row remainder for the
-  renderer to draw at. That is what makes scrolling smooth: the widget used to
-  truncate every event to a whole row, so the view stepped a full row (~16px) at a
-  time however gently you scrolled.
-
-  The two `ScrollDelta` kinds still mean different things — a wheel notch is a
-  stepped unit and becomes `ROWS_PER_NOTCH * cell_height`, while `Pixels` already
-  *is* a distance. Scaling both by the notch factor made trackpad scrolling fly.
-
-  **The offset lives in app state, not widget state** (`State::editor_scroll_px`,
-  `Shell::scroll_px`), and that is forced: the gutter is a separate widget that
-  must shift by exactly the same amount or the line numbers desync from their
-  text, and no widget can read another's state. It is **rounded to a whole pixel**
-  when drawing — at 1x a glyph at a fractional y is blurry, and a pixel is already
-  ~16x finer than a row.
-
-  Three consequences:
-
-  - **The grid draws one row more than fits** while mid-row, so the bottom shows
-    the next line arriving rather than a band of background. Every quad and
-    `fill_text` is clipped to the viewport, so both partial rows are trimmed.
-  - **A clamped row move zeroes the offset.** At either end of the content there is
-    no partial row to show, so the view sits exactly on the boundary rather than
-    leaving a sliver nothing can scroll away. Detected by comparing the scroll
-    position before and after, since `scroll_by`/`scroll_read` clamp internally.
-  - **Shells only get it inside scrollback.** The extra row comes from the grid line
-    *below* the viewport, which exists only when `display_offset > 0`; at the live
-    screen the offset is forced to zero — where it also belongs, since live output
-    should not sit half a row out of line. `TerminalSource::fill` fills that row
-    through `convert_cell`, the one shared cell converter — a second copy of that
-    logic drifted immediately, re-enabling bold, which the app drops everywhere.
-
-- **Drag coordinates aren't required to be inside the widget.** `Press` uses
-  `cursor.position_in`, but `Drag` uses `cursor.position()` and clamps into the
-  grid, so dragging past an edge extends the selection to that edge instead of
-  freezing.
-- **`dragging` lives in widget state, not the app.** A drag can't then be confused
-  across panes.
-- **Every gesture calls `shell.capture_event()`.** Without it `pane_grid` reads
-  the press as a splitter grab and the two fight.
-
-Double-click detection is the widget's own (`last_press` + a 400ms window) because
-iced's `ButtonPressed` carries no click count.
-
+**All of this is in `docs/gui-rendering.md`**: pixel snapping and why a
+fractional `fill_text` bounds drops a glyph onto a row of its own, block
+geometry, the removed debounce and the four reflow tests that cover that ground,
+the three separate shell-sizing holes, the scroll-offset rules, and URL
+detection. Nearly every entry there is a bug that was diagnosed once, at cost —
+read the relevant one before changing any of it.
 **Widget-size reporting**: the grid derives rows/cols from its real layout bounds
 and publishes them via `shell.publish` in `update`. It can't resize the PTY
 itself (no handle, and `layout` has no `Shell`), so it reports and the app acts.
@@ -521,16 +271,13 @@ source (`Box<dyn GridSource>`) rather than borrowing one.
 **Every tab strip is built from one `State::tab_strip`** so they read as the same
 control. There are four: the editor pane's *section* strip, the file strip below
 it, and one per shell pane. The three holding things the user opened carry a
-trailing `+`, and it means the same in each: one more of these. In a shell pane
-that's a new shell; in the editor a new empty buffer, the same as `Cmd+N`. Opening
-an existing file is `Cmd+O` — a `+` on a tab strip isn't "go find me a file". The
-section strip has no `+`, because the set of sections is the app's.
-
+trailing `+`, and it means the same in each — one more of these. The section
+strip has none, because the set of sections is the app's.
 #### Sections — the editor pane is not just the editor (`State::section`)
 
 The editor pane holds several **sections**, chosen by an outer tab strip:
 `Section::Editor` (the file tabs and the text surface, i.e. everything the pane
-used to be), `Section::Jira` (the ticket dashboard — see "The Jira section") and
+used to be), `Section::Jira` (the ticket dashboard — see "Jira and the Run button") and
 `Section::Scratchpad` (one permanent plain-text document — see below). The file
 tabs are *subtabs of the editor section*, not chrome the pane always carries —
 switch section and they go with it, because they describe that section's contents.
@@ -684,554 +431,71 @@ the session file. That is state the app owns and rewrites without being asked,
 which is the session's category and the opposite of a file the user chose; a
 documents folder would imply a name they picked and a lifetime they control.
 
-#### The Jira section (`core::jira`, `core::secret`, `State::jira`)
+#### Jira and the Run button (`core::jira`, `core::secret`, `core::work`)
 
-A read-only ticket dashboard. The full build plan for the Jira work — including
-the four steps after this one — is `docs/jira-integration.md`; this section covers
-only what shipped and the seams it established.
+A read-only ticket dashboard, and a `Run` link on each row that starts Claude Code
+on that ticket in a shell pane: branch, do the work, commit, push, open a **draft**
+PR.
 
-**The dashboard is real widgets, not the markdown renderer** — and that was a
-reversal. It began as generated markdown fed through `read::ReadSource`, which
-cost no new drawing code, but at the time `markdown::emit_table` scaled its
-columns down when they didn't fit and *never* made a cell honour the result, so
-at a narrower width every row overflowed by a different amount and no column
-lined up with the one above it. A character budget on the summary bought
-alignment at one width and lost it at every other.
+**The detail is in `docs/jira-runs.md`**; the plan it came from is
+`docs/jira-integration.md`. What has to be known here:
 
-That renderer bug has since been fixed (see "Tables"), so the original reason no
-longer holds — a markdown table now stays aligned at every width. The dashboard
-stays widgets anyway, for a reason the fix doesn't touch: its refresh control is
-a real clickable widget, which a cell grid has no way to express.
+- **The app does not embed an agent loop, it orchestrates the one already
+  installed.** The whole feature is a prepared prompt, a shell tab, and a check
+  afterwards.
+- **The dashboard is real widgets, not the markdown renderer.** Its refresh
+  control and its clickable issue key are things a cell grid has no way to
+  express. Every column is a `FillPortion`, which is what keeps rows aligned.
+- **The agent never works in the checkout you are working in.** Every run gets a
+  `git worktree` of its own (`work::add_worktree`, `paths::worktree_dir`), so
+  starting a ticket is an aside rather than something you stash your own work for.
+  A finished run's worktree is tidied away unless there's something in it to lose.
+- **The agent's account of its own work is not evidence.** `work::verify` asks git
+  whether the branch exists, how far it got and whether it was pushed, then asks
+  `gh` for the PR. This is why the app dictates the branch name.
+- **Secrets do not go in `config.toml`** — that file is plaintext, hand-edited and
+  shared with v1. `core::secret::lookup` reads the environment variable, then the
+  macOS Keychain via the `security` CLI.
+- **Everything outside the base system runs through a login *and interactive*
+  shell.** A Dock-launched app inherits launchd's minimal `PATH`, and `~/.zshrc`
+  is read only for *interactive* shells — so both flags are needed to find
+  `claude` and `gh`, and omitting either is invisible in development and total in
+  production.
+- **Unattended is a deliberate choice** (`--dangerously-skip-permissions`), and
+  the guard rails are what pay for it. `docs/jira-runs.md` has the table of each
+  guard against what it prevents; removing any one of them changes the trade.
 
-So `core::jira` hands over structured `Issue`s and `jira_tables` lays them out.
-**Every column is a `FillPortion`** (`JIRA_COLUMNS`), which is what keeps rows
-aligned: each row is its own widget, so a `Shrink` column would size independently
-per row and the table would come out ragged. Portions give every row the same
-proportional split at whatever width the pane has, and summaries wrap instead of
-being truncated.
-
-The section still draws its two headings as chrome (see below) and still takes
-its heading colours from `core::markdown`, so it matches rendered markdown
-elsewhere. What it no longer does is render *through* it.
-
-**The issue key opens the ticket in the browser** (`issue_key_cell` →
-`Message::JiraOpenIssue` → `core::jira::issue_url` → `open_url`), which is the
-second thing widgets buy that the grid couldn't: a cell grid reports a row and a
-column, not "you clicked TFE-954". Four things about it:
-
-- **The hot area is the text, not the column.** Every other cell is a `text`
-  filling its `FillPortion`, and doing that here would arm the whole blank
-  remainder of the Key column — a wide band of screen that launches an app when
-  clicked. So the `mouse_area` wraps a `Shrink` text and a `container` carries the
-  portion instead.
-- **The message carries the key, not a URL.** `issue_url(base, key)` derives it in
-  `update` from the configured site, so the URL's shape lives in `core` beside
-  `Issue::url` rather than being built at a call site — and a refresh that
-  reordered or dropped rows can't leave a stale URL in flight.
-- **The scheme is https by construction, and that's the security boundary.**
-  `JiraConfig::base_url` strips whatever form the site was pasted in and
-  re-prefixes it, and the key only ever reaches the path — so `open`, which
-  launches a registered handler for *any* scheme, can only ever get a web page.
-  Same rule `Terminal::url_at` enforces for a shell click, pinned here by
-  `an_issue_url_is_https_whatever_form_the_site_was_pasted_in`.
-- **Colour is the affordance and the cursor stays an arrow**, as it is for
-  "Refresh" and for shift-clicking a URL in a shell. `LINK_SLOT` / `LINK_HOVER_SLOT`
-  (blue → bright_blue) are shared by both controls, so the section has one look for
-  clickable text; bright_blue is also what `core::markdown` renders a link in.
-
-`JiraPane::hovered` went from a `bool` to `Option<JiraHover>` for this — one field
-for the section, since exactly one thing can be under the pointer. With more than
-one hoverable control the tab strips' tree-order hazard is back, so
-`Message::JiraUnhovered` carries **which** thing left and clears only that:
-widgets publish in tree order, so moving from one key to the one above it emits
-that key's `on_enter` before the departed key's `on_exit`.
-
-`Buffer::markdown_view` was built for the earlier approach and removed with it. If
-a future section wants generated prose in the grid, that constructor — a path-less
-buffer forced into read mode — is the shape to bring back; it's in the history.
-
-`read_target()` is **the single decision of which buffer scrolls.** The editor pane
-hosts two read-mode surfaces now — a markdown file and the dashboard — and both the
-key handler (`read_key`) and the wheel handler ask it. Two independent answers to
-"which one moved" is the bug they would otherwise take turns having.
-
-**Secrets do not go in `config.toml`.** That file is plaintext, hand-edited, and
-*shared with v1*, so an API token in it would sit in the file users paste into
-issue reports. `core::secret::lookup` reads the environment variable first (the
-scriptable override) then the macOS Keychain via the `security` CLI — no crate
-needed, and the allow prompt is the system's own. A Dock-launched app inherits
-launchd's environment rather than a shell's, so the Keychain is the path that
-matters in practice and the env var is for development. Non-secret settings
-(`site`, `email`, `query`) stay in `[jira]` where they can be seen and edited.
-
-Three smaller decisions:
-
-- **`Task::perform`, not a subscription.** A fetch is one request and one
-  response, unlike the PTY's stream, so it needs none of the channel machinery
-  `pty`/`watch`/`ipc` share. The blocking `ureq` call holds one thread-pool thread
-  for the request; iced's executor here is `thread-pool`, so **no tokio** — which
-  `reqwest`'s async stack would have dragged in.
-- **Setup instructions are the dashboard; failures are both.** An unconfigured
-  integration is a normal state, not an error, and setup text is something to read
-  and copy from — which a dialog with an OK button is bad at. A *fetch failure*
-  raises an alert **and** leaves the text in the pane, so it survives being
-  acknowledged rather than leaving a stale dashboard behind.
-- **The first fetch is on first show, not at startup,** gated on
-  `JiraPane::attempted` so a failure doesn't re-fire on every visit. An app
-  launched to edit a file shouldn't make a network request nobody asked for.
-
-**Untested against a live instance.** `parse` is covered against captured JSON and
-tolerates missing fields throughout (Jira omits what an account can't see, so one
-thin issue must not lose the other forty-nine). `SEARCH_PATH` points at
-`/rest/api/3/search/jql`, which replaced the deprecated `/rest/api/{2,3}/search`;
-if an instance disagrees the 404 message names the older path, and the constant is
-a one-line change.
-
-**Issue bodies are read through API v2** (`ISSUE_PATH_V2`, `fetch_issue`), and the
-version split is the whole point: on v3 a description arrives as an ADF document
-tree — nested JSON needing a renderer — while v2 returns the same content as wiki
-markup in a plain string. The search stays on v3 because it asks for no bodies.
-One ticket is fetched when a run is about to start, never fifty on the dashboard.
-
-#### The Run button — one click does the ticket (`core::work`, `State::runs`)
-
-A `Run` link on each dashboard row starts Claude Code on that ticket in a shell
-pane: branch, do the work, commit, push, open a **draft** PR. This is step 5 of
-`docs/jira-integration.md`, and that document's load-bearing decision holds — **the
-app does not embed an agent loop, it orchestrates the one already installed.** The
-whole feature is a prepared prompt, a shell tab, and a check afterwards.
-
-The flow: `Run` → pre-flight and ticket fetch on a background thread → a confirm
-dialog showing the verified plan → a **git worktree** created for the run → a shell
-tab in it running one line → the shell exits → the app reads the repository, and
-tidies the worktree away → alert, and the PR opens.
-
-**The agent never works in the checkout you are working in** (`work::add_worktree`,
-`paths::worktree_dir`). Every run gets a worktree of its own, branched from an
-up-to-date base, and its shell opens there rather than in the configured repository.
-
-This replaced a dirty-tree refusal in `preflight`, and the swap is the difference
-between a button that gets pressed and one that doesn't. Starting a ticket is
-supposed to be an *aside* from whatever you are already doing — which is exactly
-when the tree has edits in it, so the guard fired almost every time and the fix it
-demanded was to stash your own work to make room for an agent. The guard was right
-about the danger and wrong about the remedy: uncommitted work in the same tree an
-unattended agent is committing from would be swept into a pull request under a
-ticket number, and hard to unpick once pushed. A separate checkout removes the
-hazard rather than refusing in front of it.
-
-Four things about it:
-
-- **The refs are shared, so nothing downstream changed.** `git worktree` puts a
-  second working tree on one object store, so `work::verify` still asks the *main*
-  repository about the branch and `gh` still sees the same remote. That's why the
-  worktree is an addition to this feature rather than a rewrite of it.
-- **It's created after the dialog, never before** (`Message::JiraRunWorktree`). A
-  worktree is a branch *and* a directory, so making one during the pre-flight would
-  leave both behind every time someone pressed Cancel. `JiraPane::preparing` stays
-  set across it, because a fetch plus a checkout is seconds of nothing on screen and
-  the cell reading `Run` again would invite a second press.
-- **It lives in the cache directory, not the config one** (`paths::worktree_dir` →
-  `~/.cache/sacrament/sacrament2-worktrees/<branch>`), which is the one place this
-  app puts anything outside `~/.config`. A worktree is *derivable* — the commits are
-  on the branch, in the repository, and survive the directory — and it is large,
-  since the agent's own test run builds `target/` or `node_modules/` inside it. The
-  transcript stays under `~/.config` because it is the opposite on both counts: the
-  only record of what an unattended agent did.
-- **The prompt had to be told** (`jira::work_prompt`). It used to instruct
-  `git switch -c`, which now fails: the branch is already checked out. It also says
-  the checkout is fresh, so the agent installs dependencies instead of being baffled
-  by a missing `node_modules` the main checkout has.
-
-**A finished run's worktree is tidied away, unless there's something in it to lose.**
-`work::remove_worktree` never passes `--force`, and that single choice is the whole
-policy: plain `git worktree remove` deletes a clean tree and *refuses* one holding
-modified or untracked files. So a run that committed and pushed everything leaves
-nothing behind, and a run that died mid-thought keeps its checkout — with
-`report_run` naming the path and the command in the alert, since a directory nothing
-on screen has mentioned is one nobody will ever find. Verified rather than assumed:
-ignored files don't block it, so `target/` doesn't strand every worktree.
-
-Removing it never loses work. The commits are on the branch, in the shared object
-store, and the branch is left in place.
-
-An **aborted** run (tab closed) keeps its worktree deliberately, matching how it
-keeps its branch: the agent process is still being killed as the tab goes, and a run
-someone stopped by hand is the one they most want to look at. It's discovered again
-by `preflight`, which refuses a leftover worktree and prints the `git worktree
-remove` line for it.
-
-**The app dictates the branch name** (`jira::branch_name` — `TFE-954-kebab-summary`),
-and that is what makes the run checkable rather than merely started. Because the
-name is known before anything runs, `work::preflight` can refuse when it already
-exists and `work::verify` can find the pull request afterwards without believing
-anything the agent said. An agent choosing its own name leaves the app unable to
-tell "done" from "did nothing".
-
-**The agent's account of its own work is not evidence.** `work::verify` asks git
-whether the branch exists, how many commits are on it, and whether it was pushed,
-then asks `gh` for the PR — and `Outcome::describe` names *how far it got*, because
-that decides what the user does next. "Pushed but no PR" needs `gh pr create`;
-"branch never created" needs the whole thing again.
-
-**Everything outside the base system runs through a login *and interactive* shell**,
-and this is the same trap `pty.rs` records. A Dock-launched app inherits launchd's
-`/usr/bin:/bin:/usr/sbin:/sbin`, so `gh` (Homebrew) and `claude` (`~/.local/bin`)
-are simply not findable — while the identical binary run from a terminal finds
-both, which makes it invisible in development and total in production. `git` is
-called directly, as `core::git` already does: `/usr/bin/git` is on the minimal
-`PATH` regardless.
-
-**`-i` is half the fix, and leaving it out fails in a way that accuses the wrong
-thing.** `zsh -l -c` reads `/etc/zprofile` and `~/.zprofile` but **not `~/.zshrc`**,
-which zsh sources only for interactive shells — and `.zshrc` is where a great many
-people, including this repo's author, actually set `PATH`. So a login-but-not-
-interactive shell found neither `claude` nor `gh`, and the pre-flight refused with
-"`claude` isn't installed" while `claude` ran perfectly in the shell pane two inches
-below the dialog. That pane is the proof rather than a contradiction: a PTY shell is
-login *and* interactive, so the check was stricter than the thing it was checking.
-
-Reproducing it needs no Dock launch, just an empty environment:
-
-```text
-env -i HOME=$HOME PATH=/usr/bin:/bin /bin/zsh -l    -c 'command -v claude'   # nothing
-env -i HOME=$HOME PATH=/usr/bin:/bin /bin/zsh -l -i -c 'command -v claude'   # found
-```
-
-Interactive brings one cost with it: `.zshrc` files print things, and that output
-would be read as the script's answer — a startup `echo` would make every tool check
-report "couldn't run a login shell", and one in front of `gh`'s JSON would make a
-real pull request parse as none. So `login_shell` prints `OUTPUT_MARKER` first and
-keeps only what follows it. `after_marker` is split out to be tested, because
-arranging for a real shell to be chatty means writing dotfiles into a fake `HOME`
-and setting `SHELL` process-wide, which is flaky under a threaded test runner.
-Measured at ~0.3s with no tty and no `TERM`, which is what a Dock launch has.
-
-**The prompt is a file the shell reads, not text on the command line**
-(`run_command` → `claude … "$(cat <path>)"; exit`). A ticket description is
-thousands of characters, and putting it on the line means zsh echoing and
-re-wrapping all of it in a tab you're watching, every shell metacharacter in the
-ticket needing correct escaping, and history expansion seeing any `!` in the text.
-Inside `$(cat …)` none of that is true, and the only thing needing quoting is a
-path this app generated (via `shell_escaped`, already there for dropped files).
-
-**`; exit` is the completion signal.** The shell ends when the agent does, which
-fires `pty::Event::Exited` — the event that already removes a dead tab — so the run
-reports itself with no polling, no timer and no new plumbing.
-
-**Unattended is a deliberate choice, and the guard rails are what pay for it.**
-`--dangerously-skip-permissions` is the point of the button: a run that stops to
-ask in a tab nobody is watching reads as a hang. What makes it acceptable is
-everything around it, and removing any one of these changes the trade:
-
-| Guard | What it prevents |
-|---|---|
-| Status not in `run_statuses` → no control at all | An agent turned loose on a ticket nobody has specified yet |
-| No repo configured for the project → no control at all | An agent working in the wrong tree |
-| The agent runs in a worktree of its own (`work::add_worktree`) | Your uncommitted work swept into an agent's commits — and having to stash it to start a ticket |
-| `preflight` refuses an existing branch, local or remote | Building on a previous run nobody remembers |
-| `preflight` refuses a leftover worktree | A second agent in the checkout a previous run kept |
-| `preflight` checks `gh auth status` | Ten minutes of work, then a login prompt at `gh pr create` |
-| One run per repo (`State::runs`) | Two test suites at once against one development database — worktrees separate the *git* state, not the ports and fixtures around it |
-| `JiraPane::preparing` covers pre-flight *and* the dialog | A second dialog for the same ticket, and two agents from two answers |
-| Confirm dialog, with `Show prompt` | A push and a PR from a pointer graze — and the prompt is readable first |
-| The PR is a draft | Unreviewed agent output in a colleague's queue |
-
-**The transcript is saved on *both* ways a run ends** (`State::take_run`). The grid
-is dropped with the tab, so that is the last moment the record exists — and losing
-it when the user *closes* the tab would be backwards, since a run someone aborted
-is the one they most want to read. Only a shell that exited on its own is
-*reported*, though: `close_shell` takes the record first, so an abandoned run isn't
-verified as if it had finished.
-
-`Terminal::transcript` walks the grid rather than reusing `selection_to_string`,
-which would mean installing a select-all over the user's own live selection.
-Wrapped rows are rejoined, or every command longer than the pane comes back with a
-newline through it.
-
-Two smaller pieces this needed, both general rather than Jira-specific:
-
-- **`Shell::on_attach`** — a command typed in once the PTY is live. `Attached`
-  `take`s it, so it can't replay on a shell the user has since made their own.
-  `SACRAMENT_SPIKE_CMD` now goes through it too, rather than a branch beside it.
-- **`Shell::label_override`** — a run's tab reads `TFE-954` for its life.
-  `refresh_cwd` leaves it alone; without it every run in a repo shares one tab
-  label, the directory basename.
-
-**Only a ticket that's ready to build gets the control** (`JiraConfig::runnable`,
-`run_statuses`, defaulting to `Specified` and `New`). This is *configurable rather
-than fixed, because status names are per-project* — the same warning this file's
-JQL note gives. `statusCategory` is identical on every instance but far too coarse
-here: "To Do" covers a ticket nobody has written up as well as one ready to build,
-and the whole premise of an unattended run is a description good enough to work
-from. Only the workflow's own names can tell those apart, and two projects on one
-instance can disagree.
-
-Matched case-insensitively and trimmed, because it's a display string typed into a
-config file by hand and the failure mode is a button that silently never appears.
-An empty list runs nothing; there is deliberately no "any status" value, since
-that's the one setting that turns the check off and it should have to be spelled
-out as a list.
-
-It costs nothing to read, because **the dashboard is already grouped by status** —
-the whole `Specified` table carries the control and the whole `In Progress` one
-doesn't, so it reads as a rule rather than as rows behaving differently.
-
-Configuration, in `[jira]`. The repo map is keyed by project key because a
-dashboard built from `assignee = currentUser()` spans whatever projects you're on:
-
-```toml
-[jira]
-run_statuses = ["Specified", "New"]
-
-[jira.repos]
-TFE = "~/code/truefire"
-```
-
+Configuration lives in `[jira]`, with `[jira.repos]` keyed by project key.
 `[jira.repos]` must be the **last** thing in `[jira]`: a sub-table header closes
-the table above it, so a plain key written after it lands in `repos` instead.
+the table above it, so a plain key written after it lands in `repos`.
 
-Deliberately **not** persisted: `State::runs` describes live agents, and a restored
-record would name shells that a restart already killed. The branch and any commits
-are in the repository, which is where the state that survives belongs. A restart
-re-spawns a plain shell in the worktree directory — it does not restart the agent,
-and it does not clean up: a run killed by a restart leaves its worktree, which
-`preflight` then refuses by name if the ticket is started again.
+**Untested end to end.** Everything pure is covered and the git half is driven
+against real repositories, but a whole run against a live Jira instance and a
+real remote has never been driven.
 
-**Untested end to end.** Everything pure is covered, and the git half is now driven
-against real repositories — branch names against invalid refs, the prompt's contents,
-`Outcome::describe` for each failure shape, and against a purpose-built temp repo:
-`preflight`'s refusals, a worktree created beside a *dirty* main checkout leaving it
-untouched, a clean worktree removed while a dirty one keeps itself, ignored build
-output not counting as work, and a hand-deleted worktree not poisoning its path. What
-has still never been driven is a whole run against a live Jira instance and a real
-remote. `RUN_BASE` is `main` and `RUN_AGENT` is a constant; both are one-line changes.
+**Shell tabs made PTY identity dynamic.** `ShellKey { pane, serial }` replaced a
+fixed two-variant enum, and `subscription()` builds one `run_with(key, …)` per
+live shell. Because the list is derived from state each frame, **adding a key
+spawns a PTY and removing one stops it** — there are no imperative spawn/kill
+calls. `serial` is never reused, and `pty::run` kills the child before `wait`.
 
-**Shell tabs made PTY identity dynamic.** `ShellKey { pane, serial }` replaced the
-fixed two-variant enum, and `subscription()` builds one `run_with(key, …)` per live
-shell. Because the list is derived from state each frame, **adding a key spawns a
-PTY and removing one stops it** — there are no imperative spawn/kill calls. Two
-things that follow:
-
-- `serial` is never reused. A recycled serial would let a closed shell's
-  subscription be mistaken for a new one's and hand back the dead stream.
-- `pty::run` **kills the child** before `wait`. The reader loop also exits when the
-  subscription is dropped (tab closed), and there the shell is still alive — without
-  the kill it would keep running unread and `wait` would block that thread forever.
-  Verify with `ps -o ppid=` after quitting: orphans reparent to launchd (ppid 1).
-
-`Cmd+T` spawns in the focused pane and `Cmd+W` closes there — see "Keybindings".
-A shell pane is allowed to be empty — closing the last tab leaves it blank until
-`+`, which is v1's behavior, not a missing case.
-
-**Shell tabs are labelled by the shell's cwd basename**, following `cd`
-(`core::proc::cwd_of`). v1 had two mechanisms and its own notes concluded only one
-was reliable, so v2 ports only that one: polling the child process. OSC 7 parsing was
-per-chunk and stateless, so a sequence split across two PTY reads was missed
-entirely, and its percent-decoding mangled non-ASCII paths.
-
-Two things about it:
-
-- **The pid rides on `Event::Started`, not `Event::Attached`.** `Attached` fires
-  *before* `spawn_command` — the spawn waits for a size — so there's no pid yet.
-- **The cwd check is deliberately not throttled.** A 150ms throttle looked obviously
-  right and silently broke it: a `cd` whose only output landed inside the window had
-  its update *dropped*, and nothing re-checked afterwards. The PTY coalescer already
-  bounds `Output` to roughly one message per frame, so the syscall runs at frame rate
-  at worst.
-
-The macOS offset in `cwd_of` (152 into `proc_vnodepathinfo`) is verified, not
-inherited: a throwaway program searched the returned buffer for the known cwd. The
-`our_own_cwd_is_readable` test keeps it honest — a label-only feature would otherwise
-hide the syscall silently returning `None` forever.
+**Shell tabs are labelled by the shell's cwd basename**, from polling the child
+process (`core::proc::cwd_of`). v1's OSC 7 path was per-chunk and stateless, so
+it isn't ported.
 
 **Tab markers** are `•` when the buffer is unsaved and `◇` when an external tool
-touched it and you haven't looked since, matching v1 exactly: bright yellow
-(`ansi_slot(11)`) and bright cyan (`ansi_slot(14)`).
+touched it and you haven't looked since, as *separate* `text` widgets so they
+keep their own colour rather than the tab's.
 
-They are **separate `text` widgets, not part of the label string**. Baking them
-into the name would tint them with the tab's own active/inactive/hover color,
-which defeats the point of having a color at all.
+**Tabs reorder by dragging**, and the strip reorders **live** — the movement is
+the feedback. That makes oscillation possible, and the fix is **direction, not
+geometry**.
 
-**The marker glyph has to survive a font that lacks it.** `◇` (U+25C7) is absent
-from Envy Code R, and `text` defaults to `Shaping::Basic` — so it would draw as
-*nothing*, and an invisible unreviewed marker is strictly worse than none, since
-it silently reports "reviewed". `State::marker` consults `FontSpec::can_draw` and
-shapes with `Advanced` only when needed, the same rule `GridView` applies per
-cell. Verified on screen, not by inspection: the dirty dot's core pixel samples
-`#fabd2f`, the theme's `bright_yellow`.
-
-`Buffer::unreviewed` is set by a `--review` open and cleared by
-`mark_active_reviewed` the moment the tab is made active — viewing is reviewing.
-That's called from the paths where the *user* chose a tab (`select_tab`,
-`cycle_tab`, a non-review open), not from every place `active` moves: closing or
-reordering a tab shifts the index without anyone having read what's in it. A
-review-open of the tab *already* on screen doesn't mark it, since the mark could
-never be cleared without navigating away and back. Not persisted — v1 doesn't
-either, because "unreviewed" is about this sitting, not the file.
-
-**Tabs reorder by dragging** within their own strip, and the strip reorders
-**live** as the pointer moves — the movement is the feedback, so there's no drop
-marker to invent. Press begins the drag (and selects, as a click would); release
-only ends the gesture and writes the session, so a drag across five tabs is one
-file write rather than five. A plain click can't reorder, since nothing moves
-until the pointer crosses into another tab.
-
-**Live movement makes oscillation possible, and it is not hypothetical.** Drag a
-narrow tab past a wide one: the swap puts the narrow tab where the wide one
-began, leaving the pointer still inside the *wide* tab. The next pointer movement
-fires that tab's hover and swaps back, and the two flip-flop for as long as the
-mouse moves.
-
-The fix is **direction, not geometry**: a tab moves forward into a tab ahead of it
-only while the pointer travels right, and backward only while it travels left.
-The rebound asks to move backward during a rightward drag, so it's refused, and
-undoing a move requires actually reversing direction. That's the hysteresis a
-midpoint rule would give, without needing to know where any midpoint is — which
-matters because tab bounds aren't available in `update`.
-
-Two things this rests on, both found by driving the real UI:
-
-- **The decision runs on every pointer move, not when the pointer crosses into a
-  tab.** A crossing publishes exactly one `on_enter`, and on the first one of a
-  drag the direction is still unknown — deciding there meant the refused move was
-  never retried and the tab simply never followed the pointer.
-- **`on_exit` must only clear the hover it owns.** Widgets publish in tree order,
-  so moving *left* onto a neighbour emits the neighbour's `on_enter` **before** the
-  departed tab's `on_exit`; an unconditional `hovered_tab = None` then wiped the
-  hover that had just been set. Rightward moves happened to emit them in the
-  harmless order, so this surfaced as "dragging left does nothing" rather than as a
-  hover bug. Hence `Message::TabExited(group, i)` carries which tab left.
-
-**Hover styling is suppressed for the whole gesture**, and the dragged tab holds
-the *active* look instead. The tabs slide under a stationary pointer, so lighting
-up whichever one it happens to be over is a second highlight competing with the
-one that matters, landing on tabs the pointer never deliberately visited. The
-hover is still *tracked* throughout — it's what tells the drag where the pointer
-is — only the styling is dropped. Measured: the tab under the pointer reads `dim`
-(131) mid-drag and `foreground` (210) once released.
-
-Direction comes from a strip-wide `mouse_area` reporting `p.x`, not from the
-per-tab one: `mouse_area` gives `cursor.position_in(bounds)`, so a per-tab
-position is relative to whichever tab is under the pointer and jumps at every
-boundary — which reads as a direction reversal that never happened.
-
-`move_item` is remove-then-insert, not swap: dragging a tab three places left
-should slide the three it passes one step right. Because `to` indexes the list
-*before* the removal, neither direction needs an adjustment. The dragged tab stays
-active throughout, so the strip moves under a tab that keeps its identity.
-
-**Buffer tabs** (`State::tab_bar`): `buffers: Vec<Arc<Mutex<Buffer>>>` plus an
-`active` index. Built from `button` widgets in a `row`, so hover and hit-testing
-come from iced — it's chrome, and its height is independent of the grid's row
-pitch. `Cmd+1..9` jumps, `Cmd+Shift+[`/`]` and `Cmd+Tab` cycle, `Cmd+W` and
-middle-click close. Every command-line path opens as a tab.
-
-**Distinction is text color, not backgrounds**, and that's forced rather than
-stylistic. Sixteen theme colors with no blending doesn't provide a "slightly
-lighter than the background" to raise the active tab with — `black` equals
-`background` in most dark schemes. Filling the strip with `dim` instead made
-inactive tabs *invisible*, since their text was `dim` too. v1 reached the same
-answer: active is `foreground`, inactive is `dim`, strip shares the pane
-background.
-
-Separators sit *between* tabs, so there's none after the trailing `+` — a rule
-there would be dividing the `+` from empty space.
-
-**Separators run the full height of the strip and never go through `cell`.** The
-separator is a tab's side border, and the strip's bottom pixel is part of it — so a
-separator that stops at `TAB_BAR_HEIGHT - TAB_BORDER` leaves the border visibly 1px
-short at *both* bottom corners of *every* tab.
-
-They also don't need to cover the underline: at a separator's column the rule and
-the underline are the same colour, so a full-height rule hides the line by painting
-over it identically. That is what makes the active tab's break read correctly — it
-is bounded by two divider columns rather than by a stub of underline.
-
-Two ways of handling the separator near the active tab were tried and both were
-wrong, in ways worth remembering:
-
-- **Removing it.** The active tab loses its side borders entirely, and because the
-  row loses a child the whole strip shifts every time the selection moves. **The
-  cell count must not depend on which tab is active.**
-- **Making it cover, with its rule wrapped to the short height.** Keeps the layout
-  stable, but the covering cell is full height while the rule is one pixel shorter,
-  so the bottom pixel of the border becomes background — the missing corner above,
-  now on every tab.
-
-The strip's underline and the separators between tabs are `rule` widgets, not a
-`Border`: `iced::Border` applies to all four sides at once, so there's no way to
-ask it for "bottom only" or "right only". A 1px rule per edge is how you get a
-single side. Both use `Palette::dim()`, the same slot as the pane divider and the
-inactive line numbers, so every chrome line shares one color.
-
-**The underline breaks under the active tab**, so that tab reads as joined to the
-pane below it while every other tab and the empty space past them stay fenced off.
-
-It is still **one rule**, not one per tab: a `stack!` puts a single full-width
-`rule::horizontal` at the bottom of the strip and the tabs on top of it. A cell
-either covers its slice or doesn't — the active tab is `Length::Fill` tall and
-paints over the line, every other cell stops `TAB_BORDER` short and lets it
-through. The empty space past the last tab needs no filler, because the rule
-already spans the full width underneath.
-
-**Two per-cell approaches were tried first and both were wrong**, which is worth
-recording because each looked obviously correct:
-
-1. **A `rule` inside each cell's column.** `rule::horizontal` is `width: Fill`, so
-   every cell demanded the whole strip and the row split itself evenly between
-   them — all the tabs came out the same width.
-2. **A background-plus-padding border per cell** (outer container painted the line
-   colour, content inset 1px at the bottom). This sized correctly but introduced
-   **subpixel blur**: tab widths come from measured text and land on fractional
-   positions, so where two cell backgrounds abut, rounding leaves a sliver of
-   whatever is behind — and a line-coloured backdrop bled through those seams as
-   hairlines, crisp at boundaries that happened to fall on whole pixels and blurry
-   at the ones that didn't. It also filled the whole negative space with the line
-   colour, because the filler's content painted no background over it.
-
-**`snap: true` does nothing on this build, and that is worth knowing before
-trusting it.** `renderer::Quad::snap` is consumed *only* by `iced_wgpu` — there
-are zero references to it in `iced_tiny_skia`, `iced_graphics`, or
-`iced_renderer`, and we build with tiny-skia. iced's `crisp` feature is no help
-either: all it does is default that same dead field to `true`. The rule styles in
-this file set `snap: true` because it is correct intent and costs nothing, not
-because it protects anything.
-
-What actually keeps a rule crisp is `Rule::draw` rounding **its own** position
-(`bounds.x.round()` for a vertical, `bounds.y.round()` for a horizontal). Nothing
-rounds anything else.
-
-**Which is why cells don't paint.** This display runs at **scale 1** — a logical
-pixel is a physical pixel, with no supersampling to hide anything. Tab widths come
-from measured text, so cell edges land on fractional x, and a filled rect with a
-fractional edge is antialiased across the neighbouring column — exactly where the
-1px separator sits. Every per-cell background therefore painted over part of the
-rule next to it, and the separators rendered as less than a full pixel. Only the
-active tab paints a background now (it has to, to break the underline), so there
-is one fractional fill in the strip instead of one per cell.
-
-The general rule: **anything that must be a hairline is a `rule`, and nothing else
-gets a fill it doesn't need** — at scale 1 every extra filled rect is a chance to
-antialias over one.
-
-**The tabs live in a horizontal `scrollable`, which is doing two jobs.** It
-**clips** — nothing in iced clips a child to its parent by default, so once the
-tabs were wider than the pane the strip drew straight over the pane beside it,
-with editor tab names appearing on top of a shell. And it makes the overflow
-reachable, which v1 had (`tabs_scroll`) and v2 had lost; the wheel over a strip
-scrolls it. The scrollbar is suppressed to zero width, as in the Jira pane — a bar
-under a 26px strip would be most of its height.
-
-Because `tab_strip` is shared, all of this applies to all four strips at once —
-the section strip, the file strip, and both shell panes.
-
-Tab text uses `font.size` — the same size as the editor and the shells, so the
-chrome doesn't read as a different app.
-
-`close_tab` refuses to discard a dirty buffer and says so, and closing the last tab
-leaves an empty untitled one — so `buf()` never has to handle an empty list.
-
+**All of this is in `docs/gui-chrome.md`**, along with the four strips, the
+underline that breaks under the active tab, why separators are `rule` widgets and
+why cells mostly don't paint a background at scale 1, and why tabs are not
+`button`s. Read it before changing a tab strip: several obvious-looking
+implementations are recorded there as failures, each having been tried.
 #### Live config reload (`State::reload_config`, `config::load_result`)
 
 **`config.toml` is watched like an open file, so editing it takes effect without a
@@ -1292,47 +556,16 @@ output — loading syntect's syntax set is the cost the option exists to avoid.
 Deliberately unread: `status_timeout_ms` (v2 has no status line at all — see
 "Alerts") and `[lint]` (v2 does no linting).
 
+#### Pane chrome and the window
+
 **Pane chrome** (`PANE_PADDING` / `PANE_BORDER` in `main.rs`): each pane's content
-is wrapped in a `container` carrying the padding, background, and border. The grid
-derives rows/cols from its own layout bounds, so it shrinks to fit automatically —
-nothing else needs to know the chrome exists.
-
-**The divider between panes is the gap behind them, not a border on each.** Panes
-carry no border at all. `pane_grid`'s `spacing` leaves a `PANE_DIVIDER`-wide gap,
-and the container *behind* the grid is painted `Palette::dim()`, so that gap shows
-through as one permanent line. Two reasons it's done this way rather than with
-borders: a border outlines every pane (four sides, including the window edges),
-and `pane_grid::Style` draws its own split line only on hover or drag with no
-always-visible option.
-
-`Palette::dim()` (the theme's `bright_black`) is the same slot the inactive line
-numbers use, so chrome stays one family. It's also the only one of the 16 that
-reliably reads against the background: in most dark schemes `black` *is* the
-background — in Gruvbox both are `#282828` — so a divider drawn from it would be
-invisible.
-
-`hovered_split` and `picked_split` are overridden to width `0.0`, which iced draws
-as a zero-area quad, i.e. nothing. The divider is permanent and the resize mouse
-cursor already signals grabbability, so the highlight was redundant motion. Width
-zero rather than a transparent color — transparency isn't a theme color, and
-`theme_guard` enforces that. `hovered_region` keeps iced's default: it belongs to
-pane *dragging*, which is a separate interaction.
-
-Divider width is independent of the drag target — `on_resize`'s leeway is what you
-grab, so a 1px line is still easy to hit.
-
-The one thing padding does complicate: clicks in the inset band. The grid captures
-clicks on cells, so a `mouse_area` around the padded container catches the rest
-and emits `FocusPane` (focus moves, cursor doesn't). Without it the band would be
-dead to clicks, which reads as the pane ignoring you.
-
-**No status bar at all.** The window is the grid, edge to edge. The bottom row
-exists only while a *prompt* is open, and a prompt is an input, not a message.
-Throughput and memory counters are *not* UI: run with `SACRAMENT_METRICS=1` and
-they go to stderr every 200 chunks. `Cmd+Shift+R` resets them.
-`SACRAMENT_SPIKE_CMD='<cmd>'` auto-runs a command on attach, so a scripted perf
-run needs no typing.
-
+is wrapped in a `container` carrying the padding and background, and the grid
+derives rows/cols from its own layout bounds, so it shrinks to fit and nothing
+else needs to know the chrome exists. **The divider between panes is the gap
+behind them, not a border on each.** **There is no status bar at all** — the
+window is the grid, edge to edge, and the bottom row exists only while a prompt is
+open. Metrics go to stderr under `SACRAMENT_METRICS`, never to the screen. Details
+in `docs/gui-chrome.md`.
 #### Alerts (`State::alert`)
 
 **Everything the app has to *say* is a native alert with an OK button.** There was
@@ -1897,17 +1130,6 @@ numbers actually taught us:
 Already gone versus v1, and not to be reintroduced: kitty-protocol negotiation,
 the `apply_shift` US-layout table (iced hands over composed text with IME and
 dead keys already applied), and the CSI leak guard.
-
-**Tabs are not `button`s, deliberately.** `iced::widget::button` returns
-`mouse::Interaction::Pointer` whenever it's hovered and has an `on_press`, and
-that isn't reachable from a style function — so a `button` tab always shows the
-hand cursor, which is wrong for a tab strip. `State::tab_strip` therefore builds
-each tab as `mouse_area(container(text(..)))`: a `container` reports no
-interaction, so the pointer stays the normal arrow, and `mouse_area` supplies
-`on_press` / `on_middle_press` (close) / `on_enter` / `on_exit`. The cost is that
-`button::Status::Hovered` is gone, so hover state lives in `State::hovered_tab`
-(`Option<(TabGroup, usize)>`, with `usize::MAX` standing in for the `+` button).
-If a tab ever becomes a `button` again, the hand cursor comes back with it.
 
 ## Overview
 
