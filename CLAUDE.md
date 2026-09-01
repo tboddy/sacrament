@@ -1190,7 +1190,7 @@ so v2 would restore v1's tabs and shells over its own, and both would then
 contend for one socket. `/tmp/sacrament2-$USER.sock` belonging to a binary called
 `sacrament` is the cost of not doing that.
 
-347 tests (`cargo test --workspace`): 123 in `core`, 224 in the gui — buffer
+352 tests (`cargo test --workspace`): 123 in `core`, 229 in the gui — buffer
 mutation and undo, terminal reflow, the key map, fonts, block geometry,
 `work`'s worktrees against real git repositories, and
 `theme_guard`. v1 has
@@ -1536,7 +1536,30 @@ back to the default monospace and says so, in an alert raised from `State::new`'
 returned `Task` — a bad font is a config error, and it's the one message that has
 nothing to queue behind it.
 
-**A resolved family still isn't enough — glyph coverage is separate.** Validating
+**A resolved family still isn't enough — the weight has to be one the family
+ships.** cosmic-text honours a *named* family only through a face whose weight
+matches the request **exactly**: `fallback/mod.rs` filters candidates on
+`font_weight_diff == 0` before it even looks for the family, so a mismatch
+doesn't fall back to a nearby weight of the same font — it leaves the family
+entirely and lands on the *system* font, which is proportional. On a grid built
+for fixed cells that draws each word tight inside a much wider cell stride, so
+the words look normally set and the gaps look enormous. Nothing warns, because
+the *name* resolved perfectly.
+
+Measured, not theorised: Cozette Vector declares weight 500 (Medium). Asking it
+for `Weight::Normal` drew `.SF NS` at 21.6px per cell against a 12px grid, and
+`Weight::Bold` drew Menlo at 15.7px.
+
+So `SystemFonts::weights` reads the weight off the face fontdb resolves, and
+`FontSpec::with_weights` adopts it; `variant(bold, ..)` asks for the family's own
+bold face or keeps the base weight, never `Weight::Bold` on spec. A face
+declaring a weight `iced::font::Weight` can't name exactly (450, say) is
+*reported* rather than rounded — rounding is how the wrong font gets on screen.
+The consequence for a single-weight font like Cozette is that bold cells render
+at regular weight, which is the honest outcome; the alternative was a different
+typeface at a different width.
+
+**And glyph coverage is separate again.** Validating
 the *name* says nothing about whether the face has the *characters*, and with no
 fallback a missing glyph draws as nothing. This is not hypothetical: Envy Code R
 covers 48 of the 160 codepoints in U+2500..259F, having the light single-line set

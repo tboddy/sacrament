@@ -54,11 +54,29 @@
 //! The colour test is structural, not a name list: a face carrying `COLR`,
 //! `CBDT`, `sbix` or `SVG` is refused. Adding an emoji family to the chain
 //! therefore can't reintroduce emoji.
+//!
+//! ## The weight has to be one the family actually ships
+//!
+//! Validating the family *name* is not enough, and the gap is not cosmetic:
+//! cosmic-text will only honour a named family through a face whose weight
+//! matches the request **exactly**. `fallback/mod.rs` filters candidates on
+//! `font_weight_diff == 0` before looking for the family at all, so asking a
+//! 500-weight family for weight 400 finds nothing and drops through to the
+//! system font — a *proportional* one, on a grid built for fixed cells.
+//!
+//! That is not a hypothetical. Cozette Vector declares weight 500 (Medium);
+//! asking it for `Weight::Normal` drew `.SF NS` at 21.6px per cell while the
+//! grid stepped 12px, and asking for `Weight::Bold` drew Menlo. Nothing warned,
+//! because the *name* resolved perfectly.
+//!
+//! So the weight is read from the face fontdb resolves ([`SystemFonts::weights`])
+//! rather than assumed, and a bold cell asks for the family's own bold face or
+//! keeps the base weight. Never a weight nobody has.
 
 use std::collections::HashSet;
 
 use iced::Font;
-use iced::font::Family;
+use iced::font::{Family, Weight};
 use sacrament_core::font::FontConfig;
 
 /// Which characters the resolved font can draw, from its `cmap`.
@@ -231,6 +249,11 @@ pub struct FontSpec {
     /// monochrome chain, leaving cosmic-text's own fallback — which is what
     /// produces the emoji this exists to prevent.
     pub fallback: Option<&'static Fallback>,
+    /// The family's own bold face, if it has one. `None` means bold cells keep
+    /// the base weight: asking for a weight the family doesn't ship doesn't get
+    /// a heavier version of this font, it gets a *different font* — see the
+    /// module docs.
+    bold_weight: Option<Weight>,
 }
 
 impl FontSpec {
@@ -272,13 +295,28 @@ impl FontSpec {
         self
     }
 
+    /// Adopt the weights the family actually ships, from [`SystemFonts::weights`].
+    ///
+    /// `base` is the weight of the face a normal query resolves to — requesting
+    /// anything else by name silently lands in another font entirely.
+    pub fn with_weights(mut self, base: Option<Weight>, bold: Option<Weight>) -> Self {
+        if let Some(base) = base {
+            self.font.weight = base;
+        }
+        self.bold_weight = bold;
+        self
+    }
+
     /// Same font at a different weight/style, for bold and italic cells.
+    ///
+    /// A bold cell gets the family's own bold face, or the base weight when it
+    /// has none. It never gets `Weight::Bold` on spec: an unmatched weight is not
+    /// a near miss, it's a different family — see the module docs.
     pub fn variant(&self, bold: bool, italic: bool) -> Font {
         Font {
-            weight: if bold {
-                iced::font::Weight::Bold
-            } else {
-                iced::font::Weight::Normal
+            weight: match (bold, self.bold_weight) {
+                (true, Some(bold)) => bold,
+                _ => self.font.weight,
             },
             style: if italic {
                 iced::font::Style::Italic
@@ -305,6 +343,7 @@ pub fn resolve(cfg: &FontConfig, available: &[String]) -> (FontSpec, Option<Stri
             line_height: cfg.line_height,
             coverage: None,
             fallback: None,
+            bold_weight: None,
         },
         warning,
     )
@@ -348,16 +387,8 @@ impl SystemFonts {
     pub fn coverage(&self, family: &Family) -> Option<Coverage> {
         // Query the same way cosmic-text will, so coverage describes the face
         // that actually gets used rather than a different one in the family.
-        let name = match family {
-            Family::Name(n) => fontdb::Family::Name(n),
-            Family::Monospace => fontdb::Family::Monospace,
-            Family::SansSerif => fontdb::Family::SansSerif,
-            Family::Serif => fontdb::Family::Serif,
-            Family::Cursive => fontdb::Family::Cursive,
-            Family::Fantasy => fontdb::Family::Fantasy,
-        };
         let id = self.db.query(&fontdb::Query {
-            families: &[name],
+            families: &[db_family(family)],
             ..Default::default()
         })?;
         // `with_face_data` returns `Option<T>` for "no such face", and the closure
@@ -387,6 +418,65 @@ impl SystemFonts {
         })?
     }
 
+    /// The weights this family actually ships: `(base, bold)`.
+    ///
+    /// `base` is the weight of the face a normal query resolves to — the one
+    /// cosmic-text will draw with — and it must be requested exactly or the
+    /// family is skipped entirely (see the module docs). `bold` is the family's
+    /// own bold face, preferring a true 700 and otherwise the heaviest upright
+    /// face above `base`; `None` when it has nothing heavier.
+    ///
+    /// The third value is a warning for a face declaring a weight `iced::font`
+    /// can't name (say 450). Those exist, and the honest answer is to say so —
+    /// silently rounding to the nearest nameable weight is exactly the
+    /// wrong-font-on-screen bug this function exists to prevent.
+    pub fn weights(&self, family: &Family) -> (Option<Weight>, Option<Weight>, Option<String>) {
+        let Some(id) = self.db.query(&fontdb::Query {
+            families: &[db_family(family)],
+            ..Default::default()
+        }) else {
+            return (None, None, None);
+        };
+        let Some(face) = self.db.face(id) else {
+            return (None, None, None);
+        };
+        let base_raw = face.weight.0;
+        let Some(name) = face.families.first().map(|(n, _)| n.clone()) else {
+            return (None, None, None);
+        };
+
+        let Some(base) = iced_weight(base_raw) else {
+            return (
+                None,
+                None,
+                Some(format!(
+                    "font \"{name}\" declares weight {base_raw}, which can't be requested \
+                     exactly — using normal weight, which may draw a different font"
+                )),
+            );
+        };
+
+        // Only upright faces: a bold cell keeps its own style, and an italic-only
+        // heavy face would be the wrong shape for it.
+        let heavier: Vec<u16> = self
+            .db
+            .faces()
+            .filter(|f| f.style == fontdb::Style::Normal)
+            .filter(|f| f.families.iter().any(|(n, _)| *n == name))
+            .map(|f| f.weight.0)
+            .filter(|w| *w > base_raw)
+            .collect();
+        // A true 700 first, since that's what "bold" means; otherwise the
+        // heaviest thing available, which is better than nothing.
+        let bold = heavier
+            .contains(&700)
+            .then_some(700)
+            .or_else(|| heavier.iter().copied().max())
+            .and_then(iced_weight);
+
+        (Some(base), bold, None)
+    }
+
     /// Resolve [`FALLBACK_CHAIN`] against what's installed.
     ///
     /// Consumes `self` because the database has to outlive startup: the chain's
@@ -408,6 +498,42 @@ impl SystemFonts {
             cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
+}
+
+/// The same family, as `fontdb` spells it.
+///
+/// Shared by [`SystemFonts::coverage`] and [`SystemFonts::weights`] so both ask
+/// the database the question cosmic-text will ask, in one place.
+fn db_family<'a>(family: &'a Family) -> fontdb::Family<'a> {
+    match family {
+        Family::Name(n) => fontdb::Family::Name(n),
+        Family::Monospace => fontdb::Family::Monospace,
+        Family::SansSerif => fontdb::Family::SansSerif,
+        Family::Serif => fontdb::Family::Serif,
+        Family::Cursive => fontdb::Family::Cursive,
+        Family::Fantasy => fontdb::Family::Fantasy,
+    }
+}
+
+/// A numeric OS/2 weight as an `iced::font::Weight`, or `None` when iced has no
+/// name for it.
+///
+/// Exact only, deliberately. iced maps its enum onto cosmic-text's numbers
+/// one-for-one (`iced_graphics::text`), so a name here reaches the shaper as the
+/// same number the face declares — which is the only thing that resolves.
+fn iced_weight(raw: u16) -> Option<Weight> {
+    Some(match raw {
+        100 => Weight::Thin,
+        200 => Weight::ExtraLight,
+        300 => Weight::Light,
+        400 => Weight::Normal,
+        500 => Weight::Medium,
+        600 => Weight::Semibold,
+        700 => Weight::Bold,
+        800 => Weight::ExtraBold,
+        900 => Weight::Black,
+        _ => return None,
+    })
 }
 
 /// Match a requested family against what's installed, case-insensitively.
@@ -475,6 +601,60 @@ mod tests {
         assert!(warn.unwrap().contains("Nonexistent Mono"));
     }
 
+    /// The bug this whole mechanism exists for: asking a family for a weight it
+    /// doesn't ship doesn't get a heavier version of that font, it gets a
+    /// different font — a proportional one, on a fixed-cell grid.
+    #[test]
+    fn variant_keeps_the_base_weight_when_the_family_has_no_bold() {
+        let (spec, _) = resolve(&FontConfig::default(), &installed());
+        let spec = spec.with_weights(Some(Weight::Medium), None);
+        assert_eq!(spec.font.weight, Weight::Medium);
+        assert_eq!(spec.variant(true, false).weight, Weight::Medium);
+        assert_eq!(spec.variant(false, false).weight, Weight::Medium);
+    }
+
+    #[test]
+    fn variant_uses_the_family_bold_face_when_it_has_one() {
+        let (spec, _) = resolve(&FontConfig::default(), &installed());
+        let spec = spec.with_weights(Some(Weight::Normal), Some(Weight::Bold));
+        assert_eq!(spec.variant(true, false).weight, Weight::Bold);
+        assert_eq!(spec.variant(false, false).weight, Weight::Normal);
+    }
+
+    /// Italic is a separate axis and must not disturb the weight, or a bold
+    /// italic cell asks for a combination nothing has.
+    #[test]
+    fn italic_does_not_change_the_weight() {
+        let (spec, _) = resolve(&FontConfig::default(), &installed());
+        let spec = spec.with_weights(Some(Weight::Medium), None);
+        assert_eq!(spec.variant(false, true).weight, Weight::Medium);
+        assert_eq!(spec.variant(true, true).weight, Weight::Medium);
+    }
+
+    /// Exactness is the whole point — a "close enough" mapping here would put the
+    /// wrong font on screen with nothing to say why.
+    #[test]
+    fn iced_weight_names_only_exact_standard_weights() {
+        assert_eq!(super::iced_weight(400), Some(Weight::Normal));
+        assert_eq!(super::iced_weight(500), Some(Weight::Medium));
+        assert_eq!(super::iced_weight(700), Some(Weight::Bold));
+        assert_eq!(super::iced_weight(450), None);
+        assert_eq!(super::iced_weight(0), None);
+    }
+
+    /// Against the real database, since the failure mode was that our own view of
+    /// a font disagreed with the one that draws it.
+    #[test]
+    fn a_real_family_reports_a_nameable_base_weight() {
+        let fonts = super::SystemFonts::load();
+        let (base, _bold, warning) = fonts.weights(&Family::Monospace);
+        assert!(
+            base.is_some(),
+            "the default monospace family must report a weight we can request"
+        );
+        assert!(warning.is_none(), "unexpected warning: {warning:?}");
+    }
+
     #[test]
     fn degenerate_size_is_clamped_before_use() {
         let cfg = FontConfig {
@@ -510,12 +690,16 @@ mod tests {
         assert!(!spec.can_draw('b'), "ascii is not special-cased into coverage");
     }
 
+    /// Note the bold case needs a family that *has* a bold face. It used to read
+    /// `variant(true, ..) == Bold` unconditionally, which is precisely the bug:
+    /// on a family shipping one weight that request leaves the family entirely.
     #[test]
     fn variant_switches_weight_and_style() {
         let (spec, _) = resolve(&FontConfig::default(), &installed());
-        assert_eq!(spec.variant(true, false).weight, iced::font::Weight::Bold);
+        let spec = spec.with_weights(Some(Weight::Normal), Some(Weight::Bold));
+        assert_eq!(spec.variant(true, false).weight, Weight::Bold);
         assert_eq!(spec.variant(false, true).style, iced::font::Style::Italic);
-        assert_eq!(spec.variant(false, false).weight, iced::font::Weight::Normal);
+        assert_eq!(spec.variant(false, false).weight, Weight::Normal);
     }
 }
 

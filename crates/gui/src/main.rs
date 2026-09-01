@@ -1562,13 +1562,20 @@ impl State {
         let coverage = fonts
             .coverage(&font.font.family)
             .map(|c| &*Box::leak(Box::new(c)));
+        // The weight has to come from the face itself. cosmic-text honours a
+        // named family only through a face whose weight matches the request
+        // exactly, so asking a 500-weight family for 400 draws the *system* font
+        // — proportional, on a grid built for fixed cells — and warns about
+        // nothing, because the name resolved. See `font`'s module docs.
+        let (base_weight, bold_weight, weight_warning) = fonts.weights(&font.font.family);
         // The chain that draws what the configured font can't. Leaked for the same
         // reason, and it consumes `fonts` because its lookups happen at draw time
         // rather than here — see `font::Fallback`.
         let fallback: &'static font::Fallback = Box::leak(Box::new(fonts.into_fallback()));
         let font = font
             .with_coverage(coverage)
-            .with_fallback(Some(fallback));
+            .with_fallback(Some(fallback))
+            .with_weights(base_weight, bold_weight);
 
         // Open a file if one was given on the command line, else an empty
         // buffer. Real argument parsing and the client/server open flow come
@@ -1695,6 +1702,7 @@ impl State {
             .unwrap_or(true);
         let mut warnings: Vec<String> = config_error.into_iter().collect();
         warnings.extend(font_warning);
+        warnings.extend(weight_warning);
         if scratchpad_failed {
             warnings.push(format!(
                 "The scratchpad couldn't be opened{}. The section still works, but \
